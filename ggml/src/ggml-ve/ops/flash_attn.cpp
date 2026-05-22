@@ -29,34 +29,47 @@ namespace ggml_ve {
 namespace ops {
 
 bool flash_attn_supports(const ggml_tensor * op) {
-
-    if (op->op != GGML_OP_FLASH_ATTN_EXT || op->type != GGML_TYPE_F32) return false;
+    static const bool dbg = std::getenv("GGML_VE_DEBUG_FA") != nullptr;
+    auto reject = [&](const char * why) {
+        if (dbg) fprintf(stderr, "[VE-FA-reject] %s : %s\n",
+                         op->name[0] ? op->name : "(noname)", why);
+        return false;
+    };
+    if (op->op != GGML_OP_FLASH_ATTN_EXT || op->type != GGML_TYPE_F32) return reject("op/type");
     const ggml_tensor * q    = op->src[0];
     const ggml_tensor * k    = op->src[1];
     const ggml_tensor * v    = op->src[2];
     const ggml_tensor * mask = op->src[3];
-    if (!q || !k || !v) return false;
+    if (!q || !k || !v) return reject("missing q/k/v");
 
-    // No attention-sinks (gpt-oss style) for now.
-    if (op->src[4] != nullptr) return false;
-
-    // Mask currently required for the kernels we wrap (the F32 / BF16 KV HBM
-    // kernels assume mask != NULL).
-    if (mask == nullptr) return false;
-    if (mask->type != GGML_TYPE_F16) return false;
+    if (op->src[4] != nullptr) return reject("attention-sinks");
+    // The wrapped kernels assume mask != NULL with strides on src[3];
+    // passing null would dereference garbage. Until we add an explicit
+    // no-mask kernel path the safe gate is mask-must-exist-and-be-F16.
+    if (mask == nullptr) return reject("no mask");
+    if (mask->type != GGML_TYPE_F16) return reject("mask type != F16");
+    if (dbg) {
+        fprintf(stderr, "[VE-FA-shape] %s q=%s[%ld,%ld,%ld,%ld] k=%s[%ld,%ld,%ld,%ld] v=%s[%ld,%ld,%ld,%ld] mask=%s\n",
+                op->name[0] ? op->name : "(noname)",
+                ggml_type_name(q->type), q->ne[0], q->ne[1], q->ne[2], q->ne[3],
+                ggml_type_name(k->type), k->ne[0], k->ne[1], k->ne[2], k->ne[3],
+                ggml_type_name(v->type), v->ne[0], v->ne[1], v->ne[2], v->ne[3],
+                ggml_type_name(mask->type));
+    }
 
     // Type combinations we have a kernel for.
     const bool combo_f32  = (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
     const bool combo_bf16kv = (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_BF16 && v->type == GGML_TYPE_BF16);
     const bool combo_bf16 = (q->type == GGML_TYPE_BF16 && k->type == GGML_TYPE_BF16 && v->type == GGML_TYPE_BF16);
-    if (!(combo_f32 || combo_bf16kv || combo_bf16)) return false;
+    if (!(combo_f32 || combo_bf16kv || combo_bf16)) return reject("qkv dtype combo");
 
     // Soft-cap and max-bias must be zero for the basic dispatch.
     float scale = 0.0f, max_bias = 0.0f, softcap = 0.0f;
     std::memcpy(&scale,    (const float *) op->op_params + 0, sizeof(float));
     std::memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
     std::memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
-    if (max_bias != 0.0f || softcap != 0.0f) return false;
+    if (max_bias != 0.0f) return reject("max_bias != 0");
+    if (softcap  != 0.0f) return reject("softcap != 0");
 
     return true;
 }

@@ -1,4 +1,5 @@
 #include "device.hpp"
+#include "colmajor_cache.hpp"
 
 #include <array>
 #include <cstdlib>
@@ -51,6 +52,8 @@ const kernel_meta & meta(kernel_id id) {
         /* K_F32_MATMUL_HBM_OMP                       */ { "ve_f32_matmul_hbm_omp",                    KMOD_SGEMV  },
         /* K_F32_MATMUL_HBM_OMP_V2                    */ { "ve_f32_matmul_hbm_omp_v2",                 KMOD_SGEMV  },
         /* K_F32_MATMUL_HMEM                          */ { "ve_f32_matmul_hmem",                       KMOD_SGEMV  },
+        /* K_F32_SGEMM_BATCHED_CBLAS_HBM              */ { "ve_f32_sgemm_batched_cblas_hbm",           KMOD_SGEMV  },
+        /* K_F32_SGEMM_BATCHED_CBLAS_HBM_NOTRANS      */ { "ve_f32_sgemm_batched_cblas_hbm_notrans",   KMOD_SGEMV  },
 
         /* K_CBLAS_SGEMV_HBM_HMEM                     */ { "ve_cblas_sgemv_hbm_hmem",                  KMOD_SGEMV  },
         /* K_CBLAS_SGEMM_HBM_HMEM                     */ { "ve_cblas_sgemm_hbm_hmem",                  KMOD_SGEMV  },
@@ -257,6 +260,8 @@ void init_one_device(int i) {
 
     GGML_LOG_INFO("ggml-ve: VE%d: %s (%.2f GiB HBM)\n",
                   i, dev.name, total_mem / (1024.0 * 1024.0 * 1024.0));
+    dev.colmajor = new colmajor_weight_cache();
+    dev.colmajor->set_context(dev.context);
     dev.initialized = true;
 }
 

@@ -37,6 +37,8 @@ enum kernel_id {
     K_F32_MATMUL_HBM_OMP,
     K_F32_MATMUL_HBM_OMP_V2,
     K_F32_MATMUL_HMEM,
+    K_F32_SGEMM_BATCHED_CBLAS_HBM,         // row-major CBLAS
+    K_F32_SGEMM_BATCHED_CBLAS_HBM_NOTRANS, // column-major CBLAS (fast prompt eval)
 
     K_CBLAS_SGEMV_HBM_HMEM,
     K_CBLAS_SGEMM_HBM_HMEM,
@@ -168,6 +170,9 @@ enum kernel_module {
 // Module that owns each kernel, also defined in device.cpp.
 kernel_module kernel_owner(kernel_id id);
 
+// Forward decl: defined in colmajor_cache.hpp
+class colmajor_weight_cache;
+
 struct device {
     int          ve_device   = 0;     // VE device ID (0..3 on a 4-card system)
     int          ref_count   = 0;     // backend instances using this device
@@ -186,6 +191,12 @@ struct device {
     char    description[128] = {};
 
     bool    initialized  = false;
+
+    // Per-device F32 column-major weight cache. Shared across all backend
+    // instances on this device so the on-VE transpose only runs once per
+    // weight tensor for the entire process lifetime. Lazily heap-allocated
+    // in init_devices_once() to keep this header free of the cache impl.
+    colmajor_weight_cache * colmajor = nullptr;
 
     // Convenience accessor with bounds check.
     VEDAfunction fn(kernel_id id) const {

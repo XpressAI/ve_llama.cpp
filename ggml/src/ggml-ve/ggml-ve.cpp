@@ -84,6 +84,25 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
 
     ctx->set_cgraph(cgraph);
 
+    // GGML_VE_PROFILE=1 — dump the op-type histogram of the cgraphs that
+    // reach this backend. Cheap way to see what the ggml scheduler is
+    // actually handing us per token, which directly answers "why are
+    // cgraphs so small" / "what op causes the split".
+    if (std::getenv("GGML_VE_PROFILE") != nullptr) {
+        int counts[GGML_OP_COUNT] = {0};
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_op op = cgraph->nodes[i]->op;
+            if ((int) op < GGML_OP_COUNT) counts[op]++;
+        }
+        fprintf(stderr, "[VE-PROFILE] n_nodes=%d:", cgraph->n_nodes);
+        for (int i = 0; i < GGML_OP_COUNT; ++i) {
+            if (counts[i] > 0) {
+                fprintf(stderr, " %s=%d", ggml_op_name((ggml_op) i), counts[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+
     // --- Compiled-graph fast path (opt-in via GGML_VE_COMPILE_GRAPH=1) ----
     // Only attempt graph compilation for "real" decode graphs (>= this many
     // nodes). Warmup / probe graphs hit during model init are tiny and not

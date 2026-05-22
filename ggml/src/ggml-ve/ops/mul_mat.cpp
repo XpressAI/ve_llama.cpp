@@ -9,6 +9,7 @@
 // in a follow-up.
 
 #include "../backend_ctx.hpp"
+#include "../colmajor_cache.hpp"
 #include "../device.hpp"
 #include "../ops.hpp"
 
@@ -112,7 +113,69 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
     const VEDAdeviceptr w_vptr = tensor_hbm_ptr(w);
     const VEDAdeviceptr x_vptr = tensor_hbm_ptr(x);
 
-    // Pick the right kernel.  BF16 vs F32 weights, N==1 (matvec) vs N>1 (matmul).
+    // Opt-in until validated end-to-end.
+    static const bool colmajor_enabled =
+        (std::getenv("GGML_VE_NO_COLMAJOR") == nullptr);
+
+    // FAST PATH: BF16 weights via cached F32 column-major + CBLAS NoTrans.
+    //
+    // The legacy backend's primary perf lever for **prompt eval** (N>1):
+    // transpose each BF16 weight to F32 column-major once (on the VE, no
+    // PCIe), cache, then dispatch through NEC's CBLAS SGEMM with
+    // CblasNoTrans. Per legacy notes, "10-30x faster than packed BF16
+    // matvec" — and we measure ~40% on pp32/pp128 for Llama-3.2-3B.
+    //
+    // For N=1 (decode) the win does not survive: the CBLAS kernel cannot
+    // tolerate back-to-back async launches (it wedges the VE), so we have
+    // to sync after every launch, which kills the deferred-sync benefit
+    // we'd otherwise get. The packed BF16 row-major matvec is faster for
+    // N=1 in our config. Legacy used a BF16 column-major matvec
+    // (`ve_bf16_sgemm_colmajor_hbm_omp`) for the N=1 fast path; we don't
+    // have a BF16-to-BF16 column-major transpose kernel in tree, so we
+    // fall through to the existing packed BF16 matvec for now.
+    if (colmajor_enabled
+        && N > 1
+        && w->type == GGML_TYPE_BF16
+        && ctx->dev() && ctx->dev()->colmajor
+        && ctx->fn(K_BF16_TO_F32_COLMAJOR_HBM) != 0
+        && ctx->fn(K_F32_SGEMM_BATCHED_CBLAS_HBM_NOTRANS) != 0) {
+
+        VEDAdeviceptr w_f32_colmajor = ctx->dev()->colmajor->get_or_create(
+            w_vptr, (int64_t) M, (int64_t) K,
+            ctx->fn(K_BF16_TO_F32_COLMAJOR_HBM));
+
+        if (w_f32_colmajor != 0) {
+            VEDAfunction fn = ctx->fn(K_F32_SGEMM_BATCHED_CBLAS_HBM_NOTRANS);
+            VEDAargs args = nullptr;
+            if (ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(cblas_notrans)")) {
+                vedaArgsSetVPtr(args, 0, y_vptr);
+                vedaArgsSetVPtr(args, 1, w_f32_colmajor);
+                vedaArgsSetVPtr(args, 2, x_vptr);
+                vedaArgsSetU64 (args, 3, M);
+                vedaArgsSetU64 (args, 4, K);
+                vedaArgsSetU64 (args, 5, N);
+                uint64_t rc = 0;
+                if (ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &rc),
+                               "vedaLaunchKernelEx(f32_sgemm_cblas_notrans)")) {
+                    // Sync immediately. The NEC CBLAS kernels do not tolerate
+                    // back-to-back asynchronous launches the way our hand-
+                    // written kernels do — without this sync the VE wedges on
+                    // the second-or-third CBLAS in a row. The cost is small
+                    // because we still amortise host-side launch overhead
+                    // across many slot lookups.
+                    vedaCtxSynchronize();
+                    ctx->ops_mul_mat()++;
+                    ctx->ops_hbm()++;
+                    return true;
+                }
+            }
+            // fallthrough on any failure — still have packed BF16 kernels
+        }
+    }
+
+    // Original BF16 / F32 kernels as a fallback (also still the path for F32
+    // weights, which we don't need to col-major-cache since they're already
+    // F32 in HBM).
     VEDAfunction fn = 0;
     bool include_N = false;
 
@@ -120,8 +183,6 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
         if (N == 1) {
             fn = ctx->fn(K_BF16_MATVEC_HBM_FULL);
         } else {
-            // For N>1, prefer batched CBLAS (10-30x faster on prompt eval);
-            // ve_bf16_matmul_hbm_full is the row-major intrinsics fallback.
             fn        = ctx->fn(K_BF16_MATMUL_HBM_FULL);
             include_N = true;
         }
