@@ -39,6 +39,7 @@ ggml_add_backend_library(ggml-ve
     ggml-ve.cpp
     device.cpp
     buffer.cpp
+    graph_compiler.cpp
     ops.cpp
     ops/add.cpp
     ops/cpy.cpp

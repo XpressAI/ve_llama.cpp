@@ -21,6 +21,7 @@
 #include "buffer.hpp"
 #include "common.hpp"
 #include "device.hpp"
+#include "graph_compiler.hpp"
 #include "ops.hpp"
 
 #include <array>
@@ -67,6 +68,15 @@ void backend_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Graph-compiler state: one CompiledGraph per backend thread. We compile on
+// the first compute and re-use as long as op-count matches. If the shape
+// changes we drop the cached compiled graph and re-trace next call.
+struct compiled_graph_state {
+    gcomp::CompiledGraph * compiled = nullptr;
+    int                    op_count = -1;
+};
+static thread_local compiled_graph_state g_cg_state;
+
 ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * ctx = (backend_context *) backend->context;
     VEDAContextGuard guard(ctx->dev() ? ctx->dev()->context : nullptr);
@@ -74,6 +84,47 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
 
     ctx->set_cgraph(cgraph);
 
+    // --- Compiled-graph fast path (opt-in via GGML_VE_COMPILE_GRAPH=1) ----
+    // Only attempt graph compilation for "real" decode graphs (>= this many
+    // nodes). Warmup / probe graphs hit during model init are tiny and not
+    // worth the ncc round-trip; the threshold keeps them on the interpreter.
+    static const int gc_min_nodes = []{
+        const char * env = std::getenv("GGML_VE_COMPILE_MIN_NODES");
+        return env ? std::atoi(env) : 32;
+    }();
+    static const bool gc_verbose = (std::getenv("GGML_VE_COMPILE_DEBUG") != nullptr);
+    if (gc_verbose) {
+        fprintf(stderr, "[VE-GC] graph_compute called n_nodes=%d (min=%d)\n",
+                cgraph->n_nodes, gc_min_nodes);
+    }
+    if (gcomp::GraphCompiler::enabled() && cgraph->n_nodes >= gc_min_nodes) {
+        auto & gc = gcomp::get_compiler();
+        if (g_cg_state.compiled && g_cg_state.op_count == cgraph->n_nodes) {
+            if (gc.execute(g_cg_state.compiled, ctx, cgraph)) {
+                ctx->ops_total() += cgraph->n_nodes;
+                return GGML_STATUS_SUCCESS;
+            }
+            g_cg_state.compiled = nullptr;
+            g_cg_state.op_count = -1;
+        }
+        if (gc.trace(cgraph)) {
+            std::string model_hash = "n" + std::to_string(cgraph->n_nodes);
+            gcomp::CompiledGraph * cg2 = gc.compile(model_hash, /*n_ctx=*/ 4096);
+            if (cg2 && gc.execute(cg2, ctx, cgraph)) {
+                g_cg_state.compiled = cg2;
+                g_cg_state.op_count = cgraph->n_nodes;
+                ctx->ops_total() += cgraph->n_nodes;
+                return GGML_STATUS_SUCCESS;
+            }
+            if (gc_verbose) {
+                fprintf(stderr, "[VE-GC] compile/execute failed; falling back to interpreter\n");
+            }
+        } else if (gc_verbose) {
+            fprintf(stderr, "[VE-GC] trace rejected the graph; interpreter\n");
+        }
+    }
+
+    // --- Interpreter path -------------------------------------------------
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (!compute_forward(ctx, node)) {
