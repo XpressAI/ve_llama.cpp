@@ -241,6 +241,10 @@ endif()
 
 target_link_libraries(ggml PUBLIC ggml-base)
 
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    target_link_libraries(ggml PRIVATE stdc++fs)
+endif()
+
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
@@ -462,6 +466,7 @@ ggml_add_backend(OpenCL)
 ggml_add_backend(Hexagon)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
+ggml_add_backend(VE)
 
 foreach (target ggml-base ggml)
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)

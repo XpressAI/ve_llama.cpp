@@ -86,6 +86,10 @@
 #include "ggml-openvino.h"
 #endif
 
+#ifdef GGML_USE_VE
+#include "ggml-ve.h"
+#endif
+
 namespace fs = std::filesystem;
 
 static std::string path_str(const fs::path & path) {
@@ -160,6 +164,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_OPENVINO
         register_backend(ggml_backend_openvino_reg());
+#endif
+#ifdef GGML_USE_VE
+        register_backend(ggml_backend_ve_reg());
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
