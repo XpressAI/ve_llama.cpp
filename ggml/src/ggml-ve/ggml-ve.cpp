@@ -164,6 +164,10 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     // Only attempt graph compilation for "real" decode graphs (>= this many
     // nodes). Warmup / probe graphs hit during model init are tiny and not
     // worth the ncc round-trip; the threshold keeps them on the interpreter.
+    // Default 32 catches the per-layer attention+FFN fragments (n=23..30)
+    // the scheduler hands us today. Once we claim CPU buffers (task #18)
+    // and start receiving whole-token graphs, raise this to ~100 to match
+    // the legacy port.
     static const int gc_min_nodes = []{
         const char * env = std::getenv("GGML_VE_COMPILE_MIN_NODES");
         return env ? std::atoi(env) : 32;
@@ -333,6 +337,17 @@ bool dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) 
         int buft_dev = std::atoi(name + 2);  // "VE0_HBM" -> 0
         return buft_dev == d->ve_device;
     }
+
+    // NOTE: the legacy backend also claimed CPU buffers here to stop the
+    // ggml scheduler from splitting the cgraph around host-side tensors,
+    // and that drops ~56 per-token fragments down to one big decode
+    // graph. We don't do that yet — claiming CPU buffers requires every
+    // op handler to gracefully handle CPU-side tensors (upload weights
+    // via hbm_weight_cache, stage activations via HMEM), which our
+    // handlers don't do — they bail with `tensor_is_hbm()` checks and
+    // the scheduler propagates that as a compute error. See task #18
+    // for the follow-up. Until then, restricting to VE*_HBM is correct
+    // but leaves the fragmentation perf gap on the table.
     return false;
 }
 

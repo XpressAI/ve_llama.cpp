@@ -29,6 +29,8 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
             return ops::scale_supports(op);
         case GGML_OP_UNARY:
             return ops::silu_supports(op);
+        case GGML_OP_GLU:
+            return ops::glu_supports(op);
         case GGML_OP_RMS_NORM:
             return ops::rms_norm_supports(op);
         case GGML_OP_CPY:
@@ -93,6 +95,8 @@ bool compute_forward(backend_context * ctx, ggml_tensor * node) {
             return ops::scale_f32(ctx, node);
         case GGML_OP_UNARY:
             return ops::silu_f32(ctx, node);
+        case GGML_OP_GLU:
+            return ops::glu_f32(ctx, node);
         case GGML_OP_RMS_NORM:
             return ops::rms_norm_f32(ctx, node);
         case GGML_OP_CPY:

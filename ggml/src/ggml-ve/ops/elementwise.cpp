@@ -149,5 +149,60 @@ bool silu_f32(backend_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// ---------------- GGML_OP_GLU ----------------
+// Fused gate activation -- SWIGLU is `out = silu(gate) * up`.
+//
+// Llama-3 / Llama-3.2 GGUFs emit GGML_OP_GLU instead of separate
+// MUL_MAT/SILU/MUL nodes; without claiming it the scheduler splits the
+// FFN cgraph at every GLU node (codex finding #3). We currently only
+// handle the split-mode SWIGLU variant (gate and up in different
+// tensors, both F32, all HBM) -- that's the shape this model uses.
+bool glu_supports(const ggml_tensor * op) {
+    if (op->op != GGML_OP_GLU) return false;
+    const ggml_glu_op glu = ggml_get_glu_op(op);
+    if (glu != GGML_GLU_OP_SWIGLU) return false;            // others not wired yet
+    const ggml_tensor * gate = op->src[0];
+    const ggml_tensor * up   = op->src[1];
+    if (gate == nullptr || up == nullptr) return false;     // single-source not handled
+    if (gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32) return false;
+    if (op->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(gate) || !ggml_is_contiguous(up) || !ggml_is_contiguous(op)) return false;
+    if (gate->ne[0] != up->ne[0] || gate->ne[1] != up->ne[1]) return false;
+    return true;
+}
+
+bool glu_f32(backend_context * ctx, ggml_tensor * dst) {
+    if (!glu_supports(dst)) return false;
+    const ggml_tensor * gate = dst->src[0];
+    const ggml_tensor * up   = dst->src[1];
+    if (!tensor_is_hbm(gate) || !tensor_is_hbm(up) || !tensor_is_hbm(dst)) return false;
+
+    VEDAfunction fn = ctx->fn(K_SWIGLU_HBM_FULL_OMP);
+    if (fn == 0) fn = ctx->fn(K_SWIGLU_HBM_FULL);
+    if (fn == 0) return false;
+
+    // Kernel signature: ve_swiglu_hbm_full_omp(y, gate, up, ne0, ne1)
+    //   nc = elements per row = ne0
+    //   nr = number of rows   = nrows(gate)
+    const uint64_t nc = (uint64_t) gate->ne[0];
+    const uint64_t nr = (uint64_t) ggml_nrows(gate);
+
+    VEDAargs args = nullptr;
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(glu)")) return false;
+    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
+    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(gate));
+    vedaArgsSetVPtr(args, 2, tensor_hbm_ptr(up));
+    vedaArgsSetU64 (args, 3, nc);
+    vedaArgsSetU64 (args, 4, nr);
+
+    uint64_t result = 0;
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+                    "vedaLaunchKernelEx(swiglu_hbm_full)")) {
+        return false;
+    }
+    ctx->mark_sync_pending();
+    return true;
+}
+
 }  // namespace ops
 }  // namespace ggml_ve
