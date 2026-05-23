@@ -45,6 +45,7 @@ const kernel_meta & meta(kernel_id id) {
         /* K_BF16_SGEMM_COLMAJOR_HBM_OMP              */ { "ve_bf16_sgemm_colmajor_hbm_omp",           KMOD_SGEMV  },
         /* K_BF16_SGEMM_BATCHED_CBLAS_HBM             */ { "ve_bf16_sgemm_batched_cblas_hbm",          KMOD_SGEMV  },
         /* K_BF16_TO_F32_COLMAJOR_HBM                 */ { "ve_bf16_to_f32_colmajor_hbm",              KMOD_SGEMV  },
+        /* K_BF16_TO_F32_ROWMAJOR_HBM                 */ { "ve_bf16_to_f32_rowmajor_hbm",              KMOD_SGEMV  },
 
         /* K_F32_MATVEC_HMEM                          */ { "ve_f32_matvec_hmem",                       KMOD_SGEMV  },
         /* K_F32_MATVEC_HBM_OMP                       */ { "ve_f32_matvec_hbm_omp",                    KMOD_SGEMV  },

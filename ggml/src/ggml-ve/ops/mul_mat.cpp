@@ -119,20 +119,21 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
 
     // FAST PATH: BF16 weights via cached F32 column-major + CBLAS NoTrans.
     //
-    // The legacy backend's primary perf lever for **prompt eval** (N>1):
-    // transpose each BF16 weight to F32 column-major once (on the VE, no
-    // PCIe), cache, then dispatch through NEC's CBLAS SGEMM with
-    // CblasNoTrans. Per legacy notes, "10-30x faster than packed BF16
-    // matvec" — and we measure ~40% on pp32/pp128 for Llama-3.2-3B.
+    // The legacy backend's primary perf lever: transpose each BF16 weight
+    // to F32 column-major once (on the VE, no PCIe), cache, then dispatch
+    // through NEC's CBLAS SGEMM with CblasNoTrans. Wins big:
+    //   - prompt eval (N>1): +77% pp32, +89% pp128 measured on Llama-3.2-3B
+    //   - decode (N=1):      profiling showed the packed-BF16 N=1 matvec
+    //                        scalarises and burns ~80ms per call on the
+    //                        FFN gate/up projections; the CBLAS path
+    //                        vectorises with V.OP=99% and demolishes that.
     //
-    // For N=1 (decode) the win does not survive: the CBLAS kernel cannot
-    // tolerate back-to-back async launches (it wedges the VE), so we have
-    // to sync after every launch, which kills the deferred-sync benefit
-    // we'd otherwise get. The packed BF16 row-major matvec is faster for
-    // N=1 in our config. Legacy used a BF16 column-major matvec
-    // (`ve_bf16_sgemm_colmajor_hbm_omp`) for the N=1 fast path; we don't
-    // have a BF16-to-BF16 column-major transpose kernel in tree, so we
-    // fall through to the existing packed BF16 matvec for now.
+    // CBLAS sync caveat: NLC CBLAS hangs the VE if we stack async
+    // launches, so we sync inside the path. The sync adds ~100us per
+    // call but the kernel saves milliseconds, so it's still a huge net
+    // win. The first MUL_MAT for each weight pays a one-time transpose
+    // cost (~25ms for a 3072x3072) — make sure llama-bench warms up so
+    // the cache fills before the timing window opens.
     if (colmajor_enabled
         && N > 1
         && w->type == GGML_TYPE_BF16
@@ -140,6 +141,16 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
         && ctx->fn(K_BF16_TO_F32_COLMAJOR_HBM) != 0
         && ctx->fn(K_F32_SGEMM_BATCHED_CBLAS_HBM_NOTRANS) != 0) {
 
+        // Why colmajor + CblasNoTrans (not rowmajor + CblasTrans):
+        // NEC CBLAS's Trans path is measurably slower (~3-5x on pp) than
+        // its NoTrans path — empirically confirmed by trying the row-
+        // major variant and watching pp128 drop from 143 t/s to 21 t/s.
+        // So we stick with column-major weights. The colmajor dequant
+        // kernel itself doesn't vectorise (strided store kills it; see
+        // aveorun-ftrace data — 76% of VE time in the transpose at
+        // V.OP=0 / MFLOPS=0 when ftrace overhead is included) but it's
+        // a one-time-per-weight cost amortised across all subsequent
+        // matmuls of that weight, so net it's still a huge win.
         VEDAdeviceptr w_f32_colmajor = ctx->dev()->colmajor->get_or_create(
             w_vptr, (int64_t) M, (int64_t) K,
             ctx->fn(K_BF16_TO_F32_COLMAJOR_HBM));
@@ -157,19 +168,12 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
                 uint64_t rc = 0;
                 if (ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &rc),
                                "vedaLaunchKernelEx(f32_sgemm_cblas_notrans)")) {
-                    // Sync immediately. The NEC CBLAS kernels do not tolerate
-                    // back-to-back asynchronous launches the way our hand-
-                    // written kernels do — without this sync the VE wedges on
-                    // the second-or-third CBLAS in a row. The cost is small
-                    // because we still amortise host-side launch overhead
-                    // across many slot lookups.
                     vedaCtxSynchronize();
                     ctx->ops_mul_mat()++;
                     ctx->ops_hbm()++;
                     return true;
                 }
             }
-            // fallthrough on any failure — still have packed BF16 kernels
         }
     }
 

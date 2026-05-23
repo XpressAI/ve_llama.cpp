@@ -24,7 +24,10 @@
 #include "graph_compiler.hpp"
 #include "ops.hpp"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -88,7 +91,8 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     // reach this backend. Cheap way to see what the ggml scheduler is
     // actually handing us per token, which directly answers "why are
     // cgraphs so small" / "what op causes the split".
-    if (std::getenv("GGML_VE_PROFILE") != nullptr) {
+    static const bool profile_enabled = std::getenv("GGML_VE_PROFILE") != nullptr;
+    if (profile_enabled) {
         int counts[GGML_OP_COUNT] = {0};
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_op op = cgraph->nodes[i]->op;
@@ -101,6 +105,59 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
             }
         }
         fprintf(stderr, "\n");
+    }
+
+    // GGML_VE_TIME_GRAPHS=1 — accumulate wall-clock per cgraph, grouped by
+    // a coarse signature (op-type histogram). Prints a totals table at
+    // process exit. This is the easiest way to answer "where is decode
+    // spending its time" without poking the VE-side kernels.
+    struct gtime_entry {
+        std::string sig;
+        int64_t     count = 0;
+        double      ns_total = 0;
+    };
+    static bool time_enabled = std::getenv("GGML_VE_TIME_GRAPHS") != nullptr;
+    static std::vector<gtime_entry> gtimes;
+    static std::once_flag gtime_once;
+    if (time_enabled) {
+        std::call_once(gtime_once, []() {
+            std::atexit([]() {
+                fprintf(stderr, "\n[VE-TIME] graph-compute totals (sig = op-type histogram)\n");
+                fprintf(stderr, "  %-8s %-12s %-12s   %s\n",
+                        "calls", "total_ms", "avg_us", "sig");
+                // bubble sort by total descending — fewer items than 50
+                auto sorted = gtimes;
+                std::sort(sorted.begin(), sorted.end(),
+                          [](const gtime_entry & a, const gtime_entry & b){
+                              return a.ns_total > b.ns_total;
+                          });
+                for (const auto & e : sorted) {
+                    fprintf(stderr, "  %-8ld %-12.3f %-12.3f   %s\n",
+                            (long) e.count, e.ns_total / 1e6,
+                            (e.ns_total / e.count) / 1e3,
+                            e.sig.c_str());
+                }
+            });
+        });
+    }
+    auto gtime_start = std::chrono::steady_clock::now();
+    std::string gtime_sig;
+    if (time_enabled) {
+        char buf[256];
+        int counts[GGML_OP_COUNT] = {0};
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_op op = cgraph->nodes[i]->op;
+            if ((int) op < GGML_OP_COUNT) counts[op]++;
+        }
+        int off = std::snprintf(buf, sizeof(buf), "n=%d", cgraph->n_nodes);
+        for (int i = 0; i < GGML_OP_COUNT && off < (int) sizeof(buf) - 32; ++i) {
+            if (counts[i] > 0) {
+                off += std::snprintf(buf + off, sizeof(buf) - off,
+                                     ",%s=%d",
+                                     ggml_op_name((ggml_op) i), counts[i]);
+            }
+        }
+        gtime_sig = buf;
     }
 
     // --- Compiled-graph fast path (opt-in via GGML_VE_COMPILE_GRAPH=1) ----
@@ -154,6 +211,20 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     }
     // Single sync at the end of the graph — see kb/bugs-lessons/deferred-sync.md.
     ctx->flush("backend_graph_compute");
+
+    if (time_enabled) {
+        auto end = std::chrono::steady_clock::now();
+        double ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - gtime_start).count();
+        // Linear search — there are < 50 distinct cgraph shapes per token.
+        bool found = false;
+        for (auto & e : gtimes) {
+            if (e.sig == gtime_sig) { e.count++; e.ns_total += ns; found = true; break; }
+        }
+        if (!found) {
+            gtime_entry e; e.sig = gtime_sig; e.count = 1; e.ns_total = ns;
+            gtimes.push_back(std::move(e));
+        }
+    }
     return GGML_STATUS_SUCCESS;
 }
 
