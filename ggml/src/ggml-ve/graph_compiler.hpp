@@ -52,6 +52,7 @@ enum class OpType {
 
 enum class BufferKind {
     WEIGHT,           // loaded once, never changes (model weights)
+    WEIGHT_COLMAJOR,  // F32 column-major copy of a BF16 weight (cache populated lazily)
     KV_CACHE,         // persistent across tokens, mutates each step
     INTERMEDIATE,     // scratch, reused inside the kernel
     INPUT,            // pseudo: input embedding row
@@ -72,6 +73,10 @@ struct TracedOp {
     int     src0_idx   = -1;
     int     src1_idx   = -1;
     int     src2_idx   = -1;
+    // For MUL_MAT_BF16 ops opted into the colmajor+CBLAS fast path,
+    // the slot holding the F32 col-major companion of src0. -1 = use
+    // the original BF16 path through `_inner` matvec.
+    int     colmajor_idx = -1;
     BufferKind dst_kind  = BufferKind::INTERMEDIATE;
     BufferKind src0_kind = BufferKind::INTERMEDIATE;
     BufferKind src1_kind = BufferKind::INTERMEDIATE;
@@ -89,6 +94,17 @@ struct TracedOp {
     } p;
 };
 
+// Spec for a colmajor companion slot: at execute time we look up
+// (or create) the F32 col-major copy of the BF16 weight at src0_slot,
+// keyed by its HBM address, and stash the colmajor HBM pointer at
+// companion_slot in the per-call slot array.
+struct ColmajorSpec {
+    int     src0_slot      = -1;
+    int     companion_slot = -1;
+    int64_t M              = 0;
+    int64_t K              = 0;
+};
+
 struct CompiledGraph {
     VEDAmodule   module    = 0;
     VEDAfunction run_func  = 0;
@@ -104,6 +120,11 @@ struct CompiledGraph {
     // Each slot's role; resolved at execute time by walking the current
     // cgraph and matching the same encounter order.
     std::vector<BufferKind> slot_kinds;
+
+    // Colmajor companion slots populated at execute time from
+    // ctx->dev()->colmajor->get_or_create(tptrs[src0_slot], M, K, ...).
+    // Empty when no MUL_MAT in the graph opted into the colmajor path.
+    std::vector<ColmajorSpec> colmajor_specs;
 };
 
 class GraphCompiler {
@@ -145,6 +166,8 @@ private:
     std::vector<std::pair<const ggml_tensor *, size_t>> intermediate_bufs_;
     // Order-of-encounter slot assignment for the unified p[N] array.
     std::vector<std::pair<const ggml_tensor *, BufferKind>> tensor_slot_order_;
+    // Colmajor companion slots created during trace, populated at execute.
+    std::vector<ColmajorSpec>           colmajor_specs_;
 
     bool trace_valid_ = false;
 

@@ -3,6 +3,7 @@
 #include "graph_compiler.hpp"
 
 #include "backend_ctx.hpp"
+#include "colmajor_cache.hpp"
 #include "common.hpp"
 #include "device.hpp"
 #include "hbm_cache.hpp"
@@ -392,6 +393,33 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
             return false;   // unsupported by the compiler — fall back
     }
 
+    // Colmajor companion for BF16 MUL_MAT: allocate a new slot (no tensor
+    // backing it; populated at execute time via
+    // colmajor_weight_cache::get_or_create). The codegen emits a CBLAS
+    // sgemv against the F32 col-major copy instead of the hand-tuned BF16
+    // matvec. Cost: 4x weight memory in HBM, one-time transpose per
+    // weight (~25ms for 3072x3072), and ~2x memory traffic per matvec
+    // (F32 weights vs BF16). Benefit: CBLAS sgemv when N > 1 (no current
+    // compiled-graph caller yet, since we only fuse decode) and a
+    // platform for future GEMM-style fusion.
+    //
+    // Opt-IN with GGML_VE_COMPILE_COLMAJOR=1 — the default off because at
+    // decode-shape N=1 the BF16 _inner matvec (sgemv_packed_bf16_unr) is
+    // ~2-3% faster than colmajor sgemv. The path is wired up so we have
+    // somewhere to land prompt-eval fusion later.
+    static const bool use_colmajor =
+        (std::getenv("GGML_VE_COMPILE_COLMAJOR") != nullptr);
+    if (use_colmajor && op.type == OpType::MUL_MAT_BF16 && op.src0_idx >= 0) {
+        ColmajorSpec sp;
+        sp.src0_slot      = op.src0_idx;
+        sp.M              = op.src0_ne[1];
+        sp.K              = op.src0_ne[0];
+        sp.companion_slot = (int) tensor_slot_order_.size();
+        tensor_slot_order_.push_back({nullptr, BufferKind::WEIGHT_COLMAJOR});
+        colmajor_specs_.push_back(sp);
+        op.colmajor_idx = sp.companion_slot;
+    }
+
     traced_ops_.push_back(op);
     return true;
 }
@@ -405,6 +433,7 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     kv_cache_tensors_.clear();
     intermediate_bufs_.clear();
     tensor_slot_order_.clear();
+    colmajor_specs_.clear();
     trace_valid_ = true;
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -620,12 +649,43 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
         }
 
         case OpType::MUL_MAT_BF16: {
-            // _inner variant uses `#pragma omp for` internally — the implicit
-            // barrier at end-of-for synchronises the team for us.
             int64_t M = op.src0_ne[1], K = op.src0_ne[0];
-            ss << "    ve_bf16_matvec_rowmajor_ptr_inner((float*)" << dst
-               << ", (const uint16_t*)" << src0 << ", (const float*)" << src1
-               << ", " << M << ", " << K << ");\n";
+            if (op.colmajor_idx >= 0) {
+                // Colmajor + CBLAS fast path. W_colmajor is M-by-K stored
+                // column-major (lda=M), so column k is at &W[k*M]. CBLAS
+                // sgemv with CblasColMajor / CblasNoTrans computes
+                //   y[i] = sum_k W[i + k*M] * x[k]   (i in [imin, imax)).
+                // We partition rows ourselves with #pragma omp for so the
+                // outer omp team does the work; otherwise cblas_sgemv runs
+                // single-threaded per-call.
+                std::string cm = "p[" + std::to_string(op.colmajor_idx) + "]";
+                ss << "    {\n";
+                ss << "        int M = " << M << ", K = " << K << ";\n";
+                ss << "        const float* W = (const float*)" << cm << ";\n";
+                ss << "        const float* xv = (const float*)" << src1 << ";\n";
+                ss << "        float* yv = (float*)" << dst << ";\n";
+                ss << "        int nt = omp_get_num_threads();\n";
+                ss << "        int chunk = (M + nt - 1) / nt;\n";
+                ss << "        #pragma omp for\n";
+                ss << "        for (int g = 0; g < nt; g++) {\n";
+                ss << "            int imin = g * chunk;\n";
+                ss << "            int imax = imin + chunk;\n";
+                ss << "            if (imax > M) imax = M;\n";
+                ss << "            if (imin < imax) {\n";
+                ss << "                cblas_sgemv(CblasColMajor, CblasNoTrans,\n";
+                ss << "                            imax - imin, K, 1.0f,\n";
+                ss << "                            W + imin, M, xv, 1, 0.0f,\n";
+                ss << "                            yv + imin, 1);\n";
+                ss << "            }\n";
+                ss << "        }\n";
+                ss << "    }\n";
+            } else {
+                // _inner variant uses `#pragma omp for` internally — the
+                // implicit barrier at end-of-for synchronises the team.
+                ss << "    ve_bf16_matvec_rowmajor_ptr_inner((float*)" << dst
+                   << ", (const uint16_t*)" << src0 << ", (const float*)" << src1
+                   << ", " << M << ", " << K << ");\n";
+            }
             break;
         }
 
@@ -833,6 +893,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
     ss << "#include <string.h>\n";
     ss << "#include <math.h>\n";
     ss << "#include <omp.h>\n";
+    ss << "#include <cblas.h>\n";   // NEC NLC CBLAS — for the colmajor MUL_MAT fast path
     ss << "#include <veda/device.h>\n\n";
 
     // External kernels from libve_sgemv.so. The "_inner" variants assume the
@@ -940,12 +1001,26 @@ bool GraphCompiler::compile_source(const std::string & source, const std::string
                                     : (std::string(std::getenv("HOME") ? std::getenv("HOME") : "/tmp")
                                        + "/claude_workspace/ggml-ve-veda");
 
+    // Link NEC NLC CBLAS so the colmajor MUL_MAT fast path can call
+    // cblas_sgemv from the compiled .so. We use blas_openmp to avoid a
+    // separate thread team — the outer wrapper already pins us inside a
+    // #pragma omp parallel of size 8.
+    const char * nlc_dir = std::getenv("NLC_HOME");  // set by nlcvars.sh
+    std::string nlc_lib;
+    if (nlc_dir && *nlc_dir) {
+        nlc_lib = std::string(nlc_dir) + "/lib";
+    } else {
+        nlc_lib = "/opt/nec/ve/nlc/3.1.0/lib";
+    }
+
     std::ostringstream cmd;
     cmd << "/opt/nec/ve/bin/ncc -O4 -fopenmp -fpic -shared "
         << "-I/opt/nec/ve/share/veoffload-veda/include "
+        << "-I" << nlc_lib << "/../include "
         << "-L" << kdir << " -Wl,-rpath," << kdir << " "
+        << "-L" << nlc_lib << " -Wl,-rpath," << nlc_lib << " "
         << "-o " << so_path << " " << src_path << " "
-        << kdir << "/libve_sgemv.so -lm 2>&1";
+        << kdir << "/libve_sgemv.so -lcblas -lblas_openmp -lm 2>&1";
 
     fprintf(stderr, "[VE-GC] compiling %s ...\n", so_path.c_str());
     FILE * pipe = popen(cmd.str().c_str(), "r");
@@ -996,6 +1071,7 @@ CompiledGraph * GraphCompiler::load_compiled(const std::string & so_path, const 
     for (size_t i = 0; i < tensor_slot_order_.size(); ++i) {
         cg->slot_kinds[i] = tensor_slot_order_[i].second;
     }
+    cg->colmajor_specs = colmajor_specs_;
     return cg;
 }
 
@@ -1083,21 +1159,33 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     // includes the view's start offset). Earlier versions read the
     // *canonical* tensor's data, losing the view offset and producing
     // wrong-address kernel reads.
-    std::vector<VEDAdeviceptr> tptrs;
-    tptrs.reserve(graph->num_slots);
+    std::vector<VEDAdeviceptr> tptrs(graph->num_slots, 0);
     std::set<const ggml_tensor *> seen_canon;
+
+    // Walk the slot table from the front. Colmajor companion slots have
+    // no tensor backing them — they're zero placeholders here, populated
+    // after this loop from the colmajor cache. try_push advances past
+    // such slots so real tensors land at the slot index trace assigned.
+    size_t slot_pos = 0;
+    auto advance_past_colmajor = [&]() {
+        while (slot_pos < (size_t) graph->num_slots
+               && graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_COLMAJOR) {
+            ++slot_pos;
+        }
+    };
 
     auto try_push = [&](const ggml_tensor * raw) {
         if (!raw) return;
         const ggml_tensor * c = canonical(raw);
         if (seen_canon.count(c)) return;
         seen_canon.insert(c);
-        if ((int) tptrs.size() >= graph->num_slots) return;
+        advance_past_colmajor();
+        if (slot_pos >= (size_t) graph->num_slots) return;
         // Prefer the raw tensor's data (includes view offset). If it's a
         // pure metadata tensor with no buffer/data, the slot stays 0.
         const ggml_tensor * src_for_addr = raw->data ? raw : c;
         VEDAdeviceptr hbm = hbm_ptr_for_tensor(src_for_addr);
-        tptrs.push_back(hbm);
+        tptrs[slot_pos++] = hbm;
     };
 
     for (int i = 0; i < current_graph->n_nodes; ++i) {
@@ -1111,10 +1199,47 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         try_push(n->src[2]);
     }
 
-    if ((int) tptrs.size() != graph->num_slots) {
+    // Colmajor companion slots aren't tensors in the cgraph — we resize
+    // tptrs to make room for them, then populate from the colmajor cache.
+    // try_push only filled real tensor slots; the colmajor slots come at
+    // the end of the slot table (allocated during trace, after every real
+    // tensor was seen).
+    if (!graph->colmajor_specs.empty()) {
+        auto * dev = bctx ? bctx->dev() : nullptr;
+        auto * cache = dev ? dev->colmajor : nullptr;
+        VEDAfunction transpose_fn = bctx ? bctx->fn(K_BF16_TO_F32_COLMAJOR_HBM) : 0;
+        if (!cache || transpose_fn == 0) {
+            if (debug_enabled()) {
+                fprintf(stderr, "[VE-GC] colmajor cache or transpose fn unavailable — abort\n");
+            }
+            return false;
+        }
+        for (const auto & sp : graph->colmajor_specs) {
+            if (sp.src0_slot < 0 || sp.src0_slot >= (int) tptrs.size()) continue;
+            if (sp.companion_slot < 0 || sp.companion_slot >= (int) tptrs.size()) continue;
+            VEDAdeviceptr bf16_ptr = tptrs[sp.src0_slot];
+            if (bf16_ptr == 0) continue;
+            VEDAdeviceptr cm_ptr = cache->get_or_create(bf16_ptr, sp.M, sp.K, transpose_fn);
+            if (cm_ptr == 0) {
+                if (debug_enabled()) {
+                    fprintf(stderr, "[VE-GC] colmajor lookup failed for slot %d (M=%ld K=%ld)\n",
+                            sp.src0_slot, (long) sp.M, (long) sp.K);
+                }
+                return false;
+            }
+            tptrs[sp.companion_slot] = cm_ptr;
+        }
+    }
+
+    // After walking the cgraph + populating colmajor slots, slot_pos should
+    // have stepped past every WEIGHT/KV/INTERMEDIATE slot in the table —
+    // anything less means try_push ran out of cgraph tensors before filling
+    // all expected real slots.
+    advance_past_colmajor();
+    if (slot_pos != (size_t) graph->num_slots) {
         if (debug_enabled()) {
-            fprintf(stderr, "[VE-GC] slot-count mismatch: compiled=%d current=%d — abort\n",
-                    graph->num_slots, (int) tptrs.size());
+            fprintf(stderr, "[VE-GC] slot fill stopped at %zu / %d — abort\n",
+                    slot_pos, graph->num_slots);
         }
         return false;
     }
@@ -1124,6 +1249,7 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     // mmap weight). Launching with a null pointer is undefined behaviour
     // on the VE — and almost always SIGSEGVs.
     for (size_t i = 0; i < tptrs.size(); ++i) {
+        if (graph->slot_kinds[i] == BufferKind::WEIGHT_COLMAJOR) continue;  // populated above
         if (tptrs[i] == 0) {
             if (debug_enabled()) {
                 fprintf(stderr, "[VE-GC] slot %zu kind=%d is NULL — abort\n",
