@@ -125,6 +125,15 @@ struct CompiledGraph {
     // ctx->dev()->colmajor->get_or_create(tptrs[src0_slot], M, K, ...).
     // Empty when no MUL_MAT in the graph opted into the colmajor path.
     std::vector<ColmajorSpec> colmajor_specs;
+
+    // Reusable HMEM staging buffers for the kernel's `input` (token id)
+    // and `output` (logits row) args. Allocated lazily on first execute
+    // and reused for every subsequent call of the same graph — the
+    // alternative was acquire-from-pool + release per call, which costs
+    // a syscall pair (codex finding #4). Freed when the CompiledGraph
+    // is destroyed.
+    VEDAhmemptr  in_hmem  = 0;
+    VEDAhmemptr  out_hmem = 0;
 };
 
 class GraphCompiler {

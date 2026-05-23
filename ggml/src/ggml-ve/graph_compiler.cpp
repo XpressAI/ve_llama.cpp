@@ -942,12 +942,57 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
         return ss.str();
     }
 
+    // Slot resolution.
+    //
+    // Weight HBM pointers are stable across calls (the ggml allocator
+    // places weights once at model load), so vedaMemPtr resolutions for
+    // those slots can be cached in a function-local `static` array.
+    // KV cache and intermediate slots can rebind across cgraph computes
+    // (the allocator reuses scratch ranges), so we re-resolve those
+    // every call.
+    //
+    // The legacy backend's graph compiler did the same thing; that's
+    // codex finding #4 — ~10-30 ms/token of vedaMemPtr overhead the
+    // un-cached version pays.
     ss << "    void* p[" << (n_slots > 0 ? n_slots : 1) << "];\n";
-    ss << "    for (int i = 0; i < " << n_slots << "; i++) {\n";
-    ss << "        if (tptr_hbm[i] != 0) {\n";
-    ss << "            if (vedaMemPtr(&p[i], tptr_hbm[i]) != 0) return 1;\n";
-    ss << "        } else p[i] = 0;\n";
+    ss << "    static void*           w_cached[" << (n_slots > 0 ? n_slots : 1) << "];\n";
+    ss << "    static VEDAdeviceptr   w_hbm_cached[" << (n_slots > 0 ? n_slots : 1) << "];\n";
+    ss << "    static int             w_initialized = 0;\n";
+    ss << "    if (!w_initialized) {\n";
+    for (int i = 0; i < n_slots; ++i) {
+        BufferKind k = tensor_slot_order_[i].second;
+        // Weight + colmajor-companion entries are stable; cache them.
+        if (k == BufferKind::WEIGHT || k == BufferKind::WEIGHT_COLMAJOR) {
+            ss << "        w_hbm_cached[" << i << "] = tptr_hbm[" << i << "];\n";
+            ss << "        if (tptr_hbm[" << i << "] != 0) {\n";
+            ss << "            if (vedaMemPtr(&w_cached[" << i << "], tptr_hbm[" << i << "]) != 0) return 1;\n";
+            ss << "        } else w_cached[" << i << "] = 0;\n";
+        }
+    }
+    ss << "        w_initialized = 1;\n";
     ss << "    }\n";
+
+    // Each call: walk slots, re-resolve non-weight ones, copy weight ones
+    // from the static cache. If a weight HBM pointer ever changes (e.g.
+    // ggml allocator re-binds the weight buffer), fall back to a fresh
+    // vedaMemPtr instead of trusting the cache.
+    for (int i = 0; i < n_slots; ++i) {
+        BufferKind k = tensor_slot_order_[i].second;
+        bool cacheable = (k == BufferKind::WEIGHT || k == BufferKind::WEIGHT_COLMAJOR);
+        if (cacheable) {
+            ss << "    if (tptr_hbm[" << i << "] == w_hbm_cached[" << i << "]) {\n";
+            ss << "        p[" << i << "] = w_cached[" << i << "];\n";
+            ss << "    } else if (tptr_hbm[" << i << "] != 0) {\n";
+            ss << "        if (vedaMemPtr(&p[" << i << "], tptr_hbm[" << i << "]) != 0) return 1;\n";
+            ss << "        w_hbm_cached[" << i << "] = tptr_hbm[" << i << "];\n";
+            ss << "        w_cached[" << i << "]     = p[" << i << "];\n";
+            ss << "    } else p[" << i << "] = 0;\n";
+        } else {
+            ss << "    if (tptr_hbm[" << i << "] != 0) {\n";
+            ss << "        if (vedaMemPtr(&p[" << i << "], tptr_hbm[" << i << "]) != 0) return 1;\n";
+            ss << "    } else p[" << i << "] = 0;\n";
+        }
+    }
     ss << "\n";
 
     // One outer #pragma omp parallel for the whole cgraph. Every op inside
@@ -1320,21 +1365,30 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         }
     }
 
-    // Optional HMEM in/out — only needed if the graph reads token id from
-    // `input` or has to publish logits to `output`. Most layer subgraphs use
-    // neither (their data flows entirely through HBM slot pointers).
-    VEDAhmemptr in_hmem  = bctx->pool().acquire(sizeof(int32_t));
-    VEDAhmemptr out_hmem = bctx->pool().acquire(graph->output_bytes ? graph->output_bytes : 16);
-    if (in_hmem == 0 || out_hmem == 0) {
-        if (in_hmem)  bctx->pool().release(in_hmem);
-        if (out_hmem) bctx->pool().release(out_hmem);
-        return false;
+    // HMEM in/out — sized once, reused across every execute() of the same
+    // compiled graph. Most layer subgraphs use neither (their data flows
+    // entirely through HBM slot pointers), but allocating them lazily up
+    // front is cheap and saves the pool acquire/release pair on every
+    // token.
+    if (graph->in_hmem == 0) {
+        if (!ggml_ve_ok(vedaHMemAlloc(&graph->in_hmem, sizeof(int32_t)),
+                        "vedaHMemAlloc(gcomp in)")) {
+            return false;
+        }
     }
+    if (graph->out_hmem == 0) {
+        size_t out_bytes = graph->output_bytes ? graph->output_bytes : 16;
+        if (!ggml_ve_ok(vedaHMemAlloc(&graph->out_hmem, out_bytes),
+                        "vedaHMemAlloc(gcomp out)")) {
+            return false;
+        }
+    }
+    VEDAhmemptr in_hmem  = graph->in_hmem;
+    VEDAhmemptr out_hmem = graph->out_hmem;
+
     if (!ggml_ve_ok(vedaHMemcpy(reinterpret_cast<void *>(in_hmem),
                                  &token_id, sizeof(int32_t)),
                     "vedaHMemcpy(token in)")) {
-        bctx->pool().release(in_hmem);
-        bctx->pool().release(out_hmem);
         return false;
     }
 
@@ -1363,19 +1417,13 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     // after to surface VE-side errors at the right point.
     if (!ggml_ve_ok(vedaLaunchKernel(graph->run_func, 0, args),
                     "vedaLaunchKernel(gcomp)")) {
-        bctx->pool().release(in_hmem);
-        bctx->pool().release(out_hmem);
         return false;
     }
     if (vedaCtxSynchronize() != VEDA_SUCCESS) {
         fprintf(stderr, "[VE-GC] sync after kernel returned non-success\n");
-        bctx->pool().release(in_hmem);
-        bctx->pool().release(out_hmem);
         return false;
     }
 
-    bctx->pool().release(in_hmem);
-    bctx->pool().release(out_hmem);
     return true;
 }
 
