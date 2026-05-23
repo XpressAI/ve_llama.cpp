@@ -245,48 +245,71 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
         op.src2_kind = k;
     }
 
-    // DEFENSIVE: while we get the compiler stable, only handle the
-    // pure-math ops (RMS_NORM + MUL_MAT + ADD + MUL + CPY + SOFT_MAX).
-    // The memory-shaped ops (GET_ROWS / ROPE / SET_ROWS / FLASH_ATTN)
-    // involve view+stride math, position indices and KV-layout details
-    // that the current generator gets wrong in subtle ways and crashes
-    // the VE. Refuse them — the interpreter handles those correctly.
+    // Per-op refusals while we incrementally bring up the codegen.
     switch (node->op) {
         case GGML_OP_GET_ROWS:
-        case GGML_OP_ROPE:
-        case GGML_OP_SET_ROWS:
-        case GGML_OP_FLASH_ATTN_EXT:
+            // Token id lives in a small i32 leaf tensor on the host —
+            // the codegen would need to bring it in via the kernel's
+            // `input` HMEM arg, which is only wired for the first
+            // GET_ROWS in a graph today.
             if (debug_enabled()) {
-                fprintf(stderr, "[VE-GC] refuse: '%s' is %s (memory-shape op not yet compiled)\n",
-                        node->name ? node->name : "?", ggml_op_name(node->op));
+                fprintf(stderr, "[VE-GC] refuse: '%s' is GET_ROWS (not yet compiled)\n",
+                        node->name ? node->name : "?");
             }
             return false;
         default:
             break;
     }
 
-    // DEFENSIVE: only compile decode-shaped ops (N=1 per token). If we
-    // trace a prompt-eval cgraph (ne[1] > 1), we'd bake the prompt size
-    // into the compiled .so via gen_op_code's per_token_n() — then on
-    // decode the kernel walks past the per-token-sized buffer and the
-    // VE SIGSEGVs. Refuse and let the interpreter handle prompt eval.
+    // Reject multi-token (prompt-eval) shapes — the codegen bakes a
+    // per-token element count into the .so and would run off the end
+    // on the subsequent decode call. Shape semantics differ by op:
+    //   - Hidden-state ops carry n_tokens in ne[2].
+    //   - FLASH_ATTN_EXT Q is permuted to [D, N, H, B] — n_tokens is ne[1],
+    //     ne[2] holds heads. K/V grow seq-wise but that's allowed.
+    //   - SET_ROWS dst is the KV-cache view; ne[1..2] are layout, not tokens.
+    //   - ne[3] > 1 is always a real batch dim.
+    auto is_multi_token = [&](const ggml_tensor * t,
+                              ggml_op for_op,
+                              bool is_dst,
+                              int src_slot) {
+        if (!t) return false;
+        if (t->ne[3] > 1) return true;
+        if (for_op == GGML_OP_FLASH_ATTN_EXT) {
+            // FA Q (src[0]): n_tokens=ne[1]. K/V (src[1..2]): n_kv_tokens=ne[1] (always grows; we accept).
+            if (src_slot == 0) return t->ne[1] > 1;
+            return false;
+        }
+        if (for_op == GGML_OP_SET_ROWS && is_dst) {
+            // dst is the KV-cache view; its ne[1..2] are layout, not tokens.
+            return false;
+        }
+        return t->ne[2] > 1;
+    };
     for (int s = 0; s < GGML_MAX_SRC; ++s) {
         const ggml_tensor * src = node->src[s];
         if (!src) continue;
-        if (src->ne[1] > 1 || src->ne[2] > 1 || src->ne[3] > 1) {
+        if (is_multi_token(src, node->op, /*is_dst=*/false, s)) {
             if (debug_enabled()) {
-                fprintf(stderr, "[VE-GC] refuse: '%s' src[%d] has multi-dim shape [%ld,%ld,%ld,%ld] (prompt eval, not decode)\n",
+                fprintf(stderr, "[VE-GC] refuse: '%s' src[%d] is multi-token [%ld,%ld,%ld,%ld]\n",
                         node->name ? node->name : "?", s,
                         src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
             }
             return false;
         }
     }
-    if (node->ne[1] > 1 || node->ne[2] > 1 || node->ne[3] > 1) {
+    if (is_multi_token(node, node->op, /*is_dst=*/true, -1)) {
         if (debug_enabled()) {
-            fprintf(stderr, "[VE-GC] refuse: '%s' dst has multi-dim shape [%ld,%ld,%ld,%ld]\n",
+            fprintf(stderr, "[VE-GC] refuse: '%s' dst is multi-token [%ld,%ld,%ld,%ld]\n",
                     node->name ? node->name : "?",
                     node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+        }
+        return false;
+    }
+    if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] > 1) {
+        if (debug_enabled()) {
+            fprintf(stderr, "[VE-GC] refuse: '%s' is batched MUL_MAT N=%ld (prompt eval)\n",
+                    node->name ? node->name : "?", node->src[1]->ne[1]);
         }
         return false;
     }
@@ -664,8 +687,15 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
         }
 
         case OpType::FLASH_ATTN: {
+            // GGML FLASH_ATTN_EXT Q tensor layout is [D, N, H, B]:
+            //   ne[0]=head_dim, ne[1]=n_tokens, ne[2]=n_heads, ne[3]=batch.
+            // We only compile decode (N=1), so n_q_heads lives in ne[2].
+            // Some old/synthetic shapes had heads collapsed into ne[1]; fall
+            // back to ne[1] when ne[2] is 1 so we don't silently produce a
+            // single-head kernel.
             int head_dim  = (int) op.src0_ne[0];
-            int n_q_heads = (int) op.src0_ne[1];
+            int n_q_heads = (op.src0_ne[2] > 1) ? (int) op.src0_ne[2]
+                                                : (int) op.src0_ne[1];
             int n_kv_heads= (int) op.p.flash_attn.n_kv_heads;
             int seq_len_curr_pos = -1;  // pass position+1 from runtime
             (void) seq_len_curr_pos;
@@ -908,28 +938,20 @@ CompiledGraph * GraphCompiler::compile(const std::string & model_hash, int64_t n
     std::string hash      = compute_hash(source);
 
     std::string dir = cache_dir();
-    std::string so  = dir + "/graph_" + model_hash + "_ctx" + std::to_string(n_ctx) + ".so";
+    // Per-source .so: many cgraphs share n_nodes (every attention block of
+    // every layer hits n=30) but emit different code. Keying only by
+    // n_nodes had them clobber each other's .so on disk and force a fresh
+    // NCC compile per layer, per call.
+    std::string so  = dir + "/graph_" + model_hash + "_ctx"
+                    + std::to_string(n_ctx) + "_" + hash + ".so";
 
-    // Hash-cached: reuse the existing .so when our generated source matches.
-    std::string hash_file = so + ".hash";
     struct stat st;
     if (stat(so.c_str(), &st) == 0) {
-        std::ifstream f(hash_file);
-        if (f) {
-            std::string cached;
-            f >> cached;
-            if (cached == hash) {
-                fprintf(stderr, "[VE-GC] loading cached %s\n", so.c_str());
-                return load_compiled(so, model_hash);
-            }
-        }
+        fprintf(stderr, "[VE-GC] loading cached %s\n", so.c_str());
+        return load_compiled(so, model_hash);
     }
 
     if (!compile_source(source, so)) return nullptr;
-    {
-        std::ofstream f(hash_file);
-        f << hash;
-    }
     return load_compiled(so, model_hash);
 }
 
