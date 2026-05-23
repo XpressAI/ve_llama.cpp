@@ -265,6 +265,32 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
             break;
     }
 
+    // DEFENSIVE: only compile decode-shaped ops (N=1 per token). If we
+    // trace a prompt-eval cgraph (ne[1] > 1), we'd bake the prompt size
+    // into the compiled .so via gen_op_code's per_token_n() — then on
+    // decode the kernel walks past the per-token-sized buffer and the
+    // VE SIGSEGVs. Refuse and let the interpreter handle prompt eval.
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const ggml_tensor * src = node->src[s];
+        if (!src) continue;
+        if (src->ne[1] > 1 || src->ne[2] > 1 || src->ne[3] > 1) {
+            if (debug_enabled()) {
+                fprintf(stderr, "[VE-GC] refuse: '%s' src[%d] has multi-dim shape [%ld,%ld,%ld,%ld] (prompt eval, not decode)\n",
+                        node->name ? node->name : "?", s,
+                        src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+            }
+            return false;
+        }
+    }
+    if (node->ne[1] > 1 || node->ne[2] > 1 || node->ne[3] > 1) {
+        if (debug_enabled()) {
+            fprintf(stderr, "[VE-GC] refuse: '%s' dst has multi-dim shape [%ld,%ld,%ld,%ld]\n",
+                    node->name ? node->name : "?",
+                    node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+        }
+        return false;
+    }
+
     switch (node->op) {
         case GGML_OP_GET_ROWS:
             op.type = OpType::GET_ROWS;
@@ -721,6 +747,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
        << " n_ctx=" << n_ctx << "\n\n";
 
     ss << "#include <stdint.h>\n";
+    ss << "#include <stdio.h>\n";
     ss << "#include <string.h>\n";
     ss << "#include <math.h>\n";
     ss << "#include <omp.h>\n";
@@ -1014,14 +1041,30 @@ bool GraphCompiler::execute(CompiledGraph * graph,
             return false;
         }
     }
-    // Spot-check the value range: VEDA HBM pointers all sit in the
-    // 0x2000000000–0x8000000000 band on our hardware. Anything outside
-    // that is almost certainly a host pointer we mistakenly grabbed.
+    // Optional slot-address dump for diagnosing wrong-address SIGSEGVs.
+    if (debug_enabled()) {
+        static int dumped = 0;
+        if (dumped < 3) {
+            fprintf(stderr, "[VE-GC] slots for n=%d compiled (%d slots):\n",
+                    current_graph->n_nodes, (int) tptrs.size());
+            for (size_t i = 0; i < tptrs.size(); ++i) {
+                fprintf(stderr, "    slot %2zu = 0x%016lx (kind=%d)\n",
+                        i, (unsigned long) tptrs[i],
+                        (int) graph->slot_kinds[i]);
+            }
+            ++dumped;
+        }
+    }
+
+    // Reject obvious host pointers (x86_64 user-space addrs ≥ 0x7000_…).
+    // ggml's allocator gives VE_HBM tensors addresses in the 0x2000_… and
+    // 0x6000_… bands on our hardware. Anything above 0x7000_0000_0000_0000
+    // is host memory and would SIGSEGV inside vedaMemPtr.
     for (size_t i = 0; i < tptrs.size(); ++i) {
         uint64_t p = (uint64_t) tptrs[i];
-        if (p < 0x2000000000ULL || p >= 0x8000000000ULL) {
+        if (p >= 0x7000000000000000ULL) {
             if (debug_enabled()) {
-                fprintf(stderr, "[VE-GC] slot %zu hbm=0x%lx outside VE HBM range — abort\n",
+                fprintf(stderr, "[VE-GC] slot %zu addr=0x%lx looks like a host ptr — abort\n",
                         i, (unsigned long) p);
             }
             return false;
@@ -1078,20 +1121,26 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         return false;
     }
 
-    // Use the legacy's pattern: pass a host-side array of VEDAdeviceptr as
-    // `VEDAdeviceptr` via vedaArgsSetPtr. VEDA copies the buffer to the VE
-    // side and gives the kernel a pointer that can be read as `VEDAdeviceptr *`.
+    // Pass the host-side VEDAdeviceptr array via vedaArgsSetStack with
+    // INTENT_IN — VEDA *copies* the bytes to a VE-side stack buffer and
+    // the kernel receives a pointer it can actually dereference. This is
+    // the bit the old "vedaArgsSetPtr with a (VEDAdeviceptr)(uintptr_t)
+    // host-pointer" pattern silently gets wrong: vedaArgsSetPtr stores
+    // the host address itself, so the kernel reads garbage / SIGSEGVs.
+    // Verified with /tmp/test_launch_min.cpp (modes "read" vs "stack").
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(gcomp)")) {
         bctx->pool().release(in_hmem);
         bctx->pool().release(out_hmem);
         return false;
     }
-    vedaArgsSetPtr (args, 0, (VEDAdeviceptr)(uintptr_t) tptrs.data());
-    vedaArgsSetHMEM(args, 1, in_hmem);
-    vedaArgsSetHMEM(args, 2, out_hmem);
-    vedaArgsSetI64 (args, 3, position);
-    vedaArgsSetI64 (args, 4, /*n_ctx*/ 4096);
+    vedaArgsSetStack(args, 0, tptrs.data(),
+                     VEDA_ARGS_INTENT_IN,
+                     tptrs.size() * sizeof(VEDAdeviceptr));
+    vedaArgsSetHMEM (args, 1, in_hmem);
+    vedaArgsSetHMEM (args, 2, out_hmem);
+    vedaArgsSetI64  (args, 3, position);
+    vedaArgsSetI64  (args, 4, /*n_ctx*/ 4096);
 
     // vedaLaunchKernel (without Ex) auto-destroys args on success. We sync
     // after to surface VE-side errors at the right point.
