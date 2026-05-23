@@ -338,16 +338,18 @@ bool dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) 
         return buft_dev == d->ve_device;
     }
 
-    // NOTE: the legacy backend also claimed CPU buffers here to stop the
-    // ggml scheduler from splitting the cgraph around host-side tensors,
-    // and that drops ~56 per-token fragments down to one big decode
-    // graph. We don't do that yet — claiming CPU buffers requires every
-    // op handler to gracefully handle CPU-side tensors (upload weights
-    // via hbm_weight_cache, stage activations via HMEM), which our
-    // handlers don't do — they bail with `tensor_is_hbm()` checks and
-    // the scheduler propagates that as a compute error. See task #18
-    // for the follow-up. Until then, restricting to VE*_HBM is correct
-    // but leaves the fragmentation perf gap on the table.
+    // Claiming CPU buffers is the right move (the legacy port does it
+    // and gets ~3× decode) but requires every op handler to gracefully
+    // route CPU-side tensors through backend_context::resolve_in/out.
+    // Only GET_ROWS, ROPE, and MUL_MAT are converted so far. Until
+    // RMS_NORM, SET_ROWS, ADD, MUL, FLASH_ATTN_EXT, GLU follow, leaving
+    // the claim default-off keeps the existing (fragmented but
+    // correct) behaviour. Toggle with GGML_VE_CLAIM_CPU_BUFFERS=1 for
+    // incremental testing on op handlers as they get converted.
+    if (std::getenv("GGML_VE_CLAIM_CPU_BUFFERS") != nullptr &&
+        std::strncmp(name, "CPU", 3) == 0) {
+        return true;
+    }
     return false;
 }
 
