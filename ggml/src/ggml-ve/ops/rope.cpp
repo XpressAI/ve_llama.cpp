@@ -45,9 +45,10 @@ bool rope(backend_context * ctx, ggml_tensor * dst) {
     if (!rope_supports(dst)) return false;
     const ggml_tensor * x   = dst->src[0];
     const ggml_tensor * pos = dst->src[1];
-    if (!tensor_is_hbm(x) || !tensor_is_hbm(pos) || !tensor_is_hbm(dst)) {
-        return false;
-    }
+
+    const VEDAdeviceptr x_hbm   = ctx->resolve_in(x);
+    const VEDAdeviceptr dst_hbm = ctx->resolve_out(dst);
+    if (x_hbm == 0 || dst_hbm == 0) return false;
 
     const int32_t * params = (const int32_t *) dst->op_params;
     const int n_dims   = params[1];
@@ -69,13 +70,24 @@ bool rope(backend_context * ctx, ggml_tensor * dst) {
     const uint64_t n_ctx   = (uint64_t) x->ne[2];
     const uint64_t n_batch = (uint64_t) x->ne[3];
 
-    // Stage positions: HBM -> HMEM. Tiny copy (4 * n_tokens bytes).
+    // Stage positions into HMEM, sourcing from HBM (D→H) or host memory
+    // (H→H) depending on where ggml put the i32 leaf. Both go through
+    // vedaH* — VEDAhmemptr is opaque.
     const size_t pos_bytes = ggml_nbytes(pos);
     VEDAhmemptr pos_hmem = ctx->pool().acquire(pos_bytes);
     if (pos_hmem == 0) return false;
-    if (!ggml_ve_ok(vedaHMemcpyDtoX(reinterpret_cast<void *>(pos_hmem),
-                                     tensor_hbm_ptr(pos), pos_bytes),
-                    "vedaHMemcpyDtoX (rope positions: HBM->HMEM)")) {
+    VEDAresult pos_err;
+    if (tensor_is_hbm(pos)) {
+        pos_err = vedaHMemcpyDtoX(reinterpret_cast<void *>(pos_hmem),
+                                   tensor_hbm_ptr(pos), pos_bytes);
+    } else if (pos->data != nullptr) {
+        pos_err = vedaHMemcpy(reinterpret_cast<void *>(pos_hmem),
+                              pos->data, pos_bytes);
+    } else {
+        ctx->pool().release(pos_hmem);
+        return false;
+    }
+    if (!ggml_ve_ok(pos_err, "vedaHMemcpy (rope positions)")) {
         ctx->pool().release(pos_hmem);
         return false;
     }
@@ -85,8 +97,8 @@ bool rope(backend_context * ctx, ggml_tensor * dst) {
         ctx->pool().release(pos_hmem);
         return false;
     }
-    vedaArgsSetVPtr(args,  0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args,  1, tensor_hbm_ptr(x));
+    vedaArgsSetVPtr(args,  0, dst_hbm);
+    vedaArgsSetVPtr(args,  1, x_hbm);
     vedaArgsSetHMEM(args,  2, pos_hmem);
     vedaArgsSetU64 (args,  3, ne0);
     vedaArgsSetU64 (args,  4, (uint64_t) n_dims);

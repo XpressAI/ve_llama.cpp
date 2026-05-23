@@ -32,8 +32,11 @@ bool rms_norm_supports(const ggml_tensor * op) {
 
 bool rms_norm_f32(backend_context * ctx, ggml_tensor * dst) {
     if (!rms_norm_supports(dst)) return false;
-    if (!tensor_is_hbm(dst->src[0]) || !tensor_is_hbm(dst)) return false;
     const ggml_tensor * x = dst->src[0];
+
+    VEDAdeviceptr y_vptr = ctx->resolve_out(dst);
+    VEDAdeviceptr x_vptr = ctx->resolve_in(x);
+    if (y_vptr == 0 || x_vptr == 0) return false;
 
     const int64_t ne00   = x->ne[0];                    // cols to normalise over
     const int64_t n_rows = ggml_nelements(x) / ne00;    // total rows
@@ -42,9 +45,6 @@ bool rms_norm_f32(backend_context * ctx, ggml_tensor * dst) {
     std::memcpy(&eps, dst->op_params, sizeof(float));
     uint64_t eps_bits = 0;
     std::memcpy(&eps_bits, &eps, sizeof(float));
-
-    VEDAdeviceptr y_vptr = tensor_hbm_ptr(dst);
-    VEDAdeviceptr x_vptr = tensor_hbm_ptr(x);
 
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(rms_norm)")) return false;

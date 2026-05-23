@@ -56,10 +56,12 @@ bool mul_mat_id(backend_context * ctx, ggml_tensor * dst) {
     const ggml_tensor * as  = dst->src[0];
     const ggml_tensor * b   = dst->src[1];
     const ggml_tensor * ids = dst->src[2];
-    if (!tensor_is_hbm(as) || !tensor_is_hbm(b) ||
-        !tensor_is_hbm(ids) || !tensor_is_hbm(dst)) {
-        return false;
-    }
+
+    const VEDAdeviceptr dst_hbm = ctx->resolve_out(dst);
+    const VEDAdeviceptr as_hbm  = ctx->resolve_in(as);
+    const VEDAdeviceptr b_hbm   = ctx->resolve_in(b);
+    const VEDAdeviceptr ids_hbm = ctx->resolve_in(ids);
+    if (dst_hbm == 0 || as_hbm == 0 || b_hbm == 0 || ids_hbm == 0) return false;
 
     VEDAfunction fn = ctx->fn(K_MUL_MAT_ID_BF16_F32_HBM_FULL);
     if (fn == 0) return false;
@@ -72,10 +74,10 @@ bool mul_mat_id(backend_context * ctx, ggml_tensor * dst) {
 
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(mul_mat_id)")) return false;
-    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(as));
-    vedaArgsSetVPtr(args, 2, tensor_hbm_ptr(b));
-    vedaArgsSetVPtr(args, 3, tensor_hbm_ptr(ids));
+    vedaArgsSetVPtr(args, 0, dst_hbm);
+    vedaArgsSetVPtr(args, 1, as_hbm);
+    vedaArgsSetVPtr(args, 2, b_hbm);
+    vedaArgsSetVPtr(args, 3, ids_hbm);
     vedaArgsSetU64 (args, 4, M);
     vedaArgsSetU64 (args, 5, K);
     vedaArgsSetU64 (args, 6, n_experts);
@@ -114,10 +116,12 @@ bool add_id(backend_context * ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
-    if (!tensor_is_hbm(src0) || !tensor_is_hbm(src1) ||
-        !tensor_is_hbm(ids)  || !tensor_is_hbm(dst)) {
-        return false;
-    }
+
+    const VEDAdeviceptr dst_hbm  = ctx->resolve_out(dst);
+    const VEDAdeviceptr src0_hbm = ctx->resolve_in(src0);
+    const VEDAdeviceptr src1_hbm = ctx->resolve_in(src1);
+    const VEDAdeviceptr ids_hbm  = ctx->resolve_in(ids);
+    if (dst_hbm == 0 || src0_hbm == 0 || src1_hbm == 0 || ids_hbm == 0) return false;
 
     VEDAfunction fn = ctx->fn(K_ADD_ID_F32_HBM_FULL);
     if (fn == 0) return false;
@@ -128,10 +132,10 @@ bool add_id(backend_context * ctx, ggml_tensor * dst) {
 
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(add_id)")) return false;
-    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(src0));
-    vedaArgsSetVPtr(args, 2, tensor_hbm_ptr(src1));
-    vedaArgsSetVPtr(args, 3, tensor_hbm_ptr(ids));
+    vedaArgsSetVPtr(args, 0, dst_hbm);
+    vedaArgsSetVPtr(args, 1, src0_hbm);
+    vedaArgsSetVPtr(args, 2, src1_hbm);
+    vedaArgsSetVPtr(args, 3, ids_hbm);
     vedaArgsSetU64 (args, 4, ne0);
     vedaArgsSetU64 (args, 5, ne1);
     vedaArgsSetU64 (args, 6, ne2);
@@ -162,7 +166,6 @@ bool argsort_supports(const ggml_tensor * op) {
 bool argsort(backend_context * ctx, ggml_tensor * dst) {
     if (!argsort_supports(dst)) return false;
     const ggml_tensor * src = dst->src[0];
-    if (!tensor_is_hbm(src) || !tensor_is_hbm(dst)) return false;
 
     VEDAfunction fn = ctx->fn(K_ARGSORT_F32_OMP_HMEM);
     if (fn == 0) return false;
@@ -181,9 +184,20 @@ bool argsort(backend_context * ctx, ggml_tensor * dst) {
         return false;
     }
 
-    if (!ggml_ve_ok(vedaHMemcpyDtoX(reinterpret_cast<void *>(src_hmem),
-                                     tensor_hbm_ptr(src), src_bytes),
-                    "vedaHMemcpyDtoX (argsort src)")) {
+    // src may be HBM or host memory; stage either way.
+    VEDAresult src_err;
+    if (tensor_is_hbm(src)) {
+        src_err = vedaHMemcpyDtoX(reinterpret_cast<void *>(src_hmem),
+                                   tensor_hbm_ptr(src), src_bytes);
+    } else if (src->data != nullptr) {
+        src_err = vedaHMemcpy(reinterpret_cast<void *>(src_hmem),
+                              src->data, src_bytes);
+    } else {
+        ctx->pool().release(src_hmem);
+        ctx->pool().release(dst_hmem);
+        return false;
+    }
+    if (!ggml_ve_ok(src_err, "vedaHMemcpy (argsort src)")) {
         ctx->pool().release(src_hmem);
         ctx->pool().release(dst_hmem);
         return false;
@@ -216,9 +230,16 @@ bool argsort(backend_context * ctx, ggml_tensor * dst) {
     // wiring is the same TODO as the K-quant path.)
     vedaCtxSynchronize();
 
-    if (!ggml_ve_ok(vedaHMemcpyXtoD(tensor_hbm_ptr(dst),
-                                     reinterpret_cast<void *>(dst_hmem), dst_bytes),
-                    "vedaHMemcpyXtoD (argsort dst)")) {
+    bool dst_ok = false;
+    if (tensor_is_hbm(dst)) {
+        dst_ok = ggml_ve_ok(vedaHMemcpyXtoD(tensor_hbm_ptr(dst),
+                                             reinterpret_cast<void *>(dst_hmem), dst_bytes),
+                            "vedaHMemcpyXtoD (argsort dst)");
+    } else if (dst->data != nullptr) {
+        std::memcpy(dst->data, reinterpret_cast<void *>(dst_hmem), dst_bytes);
+        dst_ok = true;
+    }
+    if (!dst_ok) {
         ctx->pool().release(src_hmem);
         ctx->pool().release(dst_hmem);
         return false;

@@ -91,91 +91,40 @@ public:
 
     // ---- Tensor → HBM resolution ----
     //
-    // Returns a VEDAdeviceptr addressing `t`'s contents on the VE, uploading
-    // from CPU memory if needed. There are three cases:
+    // Returns a VEDAdeviceptr addressing `t`'s contents on the VE,
+    // uploading from CPU memory if needed.
     //
-    //   1. tensor_is_hbm(t)  → already on the VE; return tensor_hbm_ptr(t).
-    //   2. tensor_is_weight(t) on CPU → the data is stable for the model's
-    //      lifetime; cache via hbm_weight_cache (keyed by host pointer)
-    //      and return the cached HBM ptr. Re-used across every op that
-    //      touches this weight.
-    //   3. otherwise (CPU activation) → allocate a temp HBM, copy host →
-    //      HBM, enqueue the temp for free-after-sync. The caller never
-    //      sees the temp; it just gets a valid HBM ptr.
+    //   1. tensor_is_hbm(t)            → return tensor_hbm_ptr(t).
+    //   2. CPU tensor, WEIGHTS buffer  → cache via hbm_weight_cache
+    //      (keyed by tensor name) and return the cached HBM ptr.
+    //      Re-used across every op that touches the weight.
+    //   3. CPU tensor, transient       → allocate a temp HBM, copy host
+    //      → HBM, enqueue the temp for free-after-sync.
     //
-    // Returns 0 on failure (HBM OOM, ctx not set, etc.). Note: case (3)
-    // marks the context dirty (`needs_sync_=true`), so an immediate
-    // `vedaCtxSynchronize` is the wrong thing to do after — let the
-    // normal flush() at end-of-graph handle it.
-    // Hot path: split the all-HBM short-circuit out so gcc always inlines
-    // it. The slow path (CPU upload) is in resolve_in_slow.
-    __attribute__((always_inline))
-    VEDAdeviceptr resolve_in(const ggml_tensor * t) {
+    // resolve_out is the write-side equivalent.
+    //
+    // Why these are two-function (inline wrapper + out-of-line slow):
+    // an earlier version kept the slow body inline in the class. Even
+    // with __attribute__((always_inline)) on the wrapper, gcc saw the
+    // body could mutate `this` (cache_, deferred_dtoh_, needs_sync_)
+    // and refused to elide work at call sites — measured -28% decode
+    // (8.8 → 6.3 t/s on Llama-3.2-3B BF16) even when the slow path was
+    // unreachable. Hiding the body behind a forward declaration leaves
+    // gcc with a pure-function fast path plus an unconditional call on
+    // the miss branch, which is properly inlined back to the original.
+    inline VEDAdeviceptr resolve_in(const ggml_tensor * t) {
         if (tensor_is_hbm(t)) return tensor_hbm_ptr(t);
         return resolve_in_slow(t);
     }
-
-    VEDAdeviceptr resolve_in_slow(const ggml_tensor * t) {
-        if (t == nullptr || t->data == nullptr) return 0;
-        const size_t size = ggml_nbytes(t);
-        if (tensor_is_weight(t)) {
-            // Key the weight cache by tensor NAME (stable across calls),
-            // not by host pointer: weights sometimes arrive as views into
-            // a larger mmap'd buffer, and the view's `t->data` includes
-            // the offset — different view objects for the same logical
-            // weight can have different `t->data` even though the bytes
-            // they point at are the same. tensor->name (e.g.,
-            // "blk.0.attn_q.weight") is set by the loader once and never
-            // changes. get_or_upload_by_name tries name first, falls back
-            // to host pointer.
-            const char * name = (t->name && t->name[0]) ? t->name : nullptr;
-            return cache_.get_or_upload_by_name(name, t->data, size);
-        }
-        // Transient activation: temp HBM alloc.
-        VEDAdeviceptr tmp = 0;
-        if (vedaMemAllocAsync(&tmp, size, 0) != VEDA_SUCCESS || tmp == 0) {
-            return 0;
-        }
-        if (vedaMemcpyHtoDAsync(tmp, t->data, size, 0) != VEDA_SUCCESS) {
-            vedaMemFreeAsync(tmp, 0);
-            return 0;
-        }
-        enqueue_hbm_free(tmp);
-        return tmp;
-    }
-
-    // Output-side resolver. If `dst` is HBM, returns its ptr directly.
-    // Otherwise allocates a temp HBM that the kernel will write into,
-    // and enqueues a copy-back from temp → dst->data after the next
-    // sync (using a pooled HMEM staging buffer because vedaMemcpyDtoH
-    // can't write straight into arbitrary host memory).
-    //
-    // Returns 0 on failure.
-    __attribute__((always_inline))
-    VEDAdeviceptr resolve_out(ggml_tensor * dst) {
+    inline VEDAdeviceptr resolve_out(ggml_tensor * dst) {
         if (tensor_is_hbm(dst)) return tensor_hbm_ptr(dst);
         return resolve_out_slow(dst);
     }
 
-    VEDAdeviceptr resolve_out_slow(ggml_tensor * dst) {
-        if (dst == nullptr || dst->data == nullptr) return 0;
-        const size_t size = ggml_nbytes(dst);
-        VEDAdeviceptr tmp = 0;
-        if (vedaMemAllocAsync(&tmp, size, 0) != VEDA_SUCCESS || tmp == 0) {
-            return 0;
-        }
-        // Stage HMEM for the deferred D→H bounce.
-        VEDAhmemptr hmem = pool_.acquire(size);
-        if (hmem == 0) {
-            vedaMemFreeAsync(tmp, 0);
-            return 0;
-        }
-        // After the kernel runs, copy tmp → hmem (D→H from VE's side),
-        // then flush() copies hmem → dst->data (H→H), then releases both.
-        deferred_dtoh_.push_back({tmp, hmem, dst->data, size});
-        needs_sync_ = true;
-        return tmp;
-    }
+    // Out-of-line: defined in backend_ctx.cpp. The bodies must NOT be
+    // visible to callers of resolve_in / resolve_out.
+    VEDAdeviceptr resolve_in_slow (const ggml_tensor * t);
+    VEDAdeviceptr resolve_out_slow(ggml_tensor *       dst);
 
     // Single sync for the whole batch of queued ops. After the sync, copy
     // every queued HMEM output back to host, recycle HMEM buffers, free

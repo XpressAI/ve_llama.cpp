@@ -34,21 +34,38 @@ bool get_rows(backend_context * ctx, ggml_tensor * dst) {
     if (!get_rows_supports(dst)) return false;
     const ggml_tensor * src = dst->src[0];
     const ggml_tensor * idx = dst->src[1];
-    if (!tensor_is_hbm(src) || !tensor_is_hbm(idx) || !tensor_is_hbm(dst)) return false;
+
+    // src (embedding table) is typically a CPU-side BF16 weight on first
+    // call; resolve_in uploads it via hbm_weight_cache so subsequent calls
+    // re-use the cached HBM ptr.
+    const VEDAdeviceptr src_hbm = ctx->resolve_in(src);
+    const VEDAdeviceptr dst_hbm = ctx->resolve_out(dst);
+    if (src_hbm == 0 || dst_hbm == 0) return false;
 
     const uint64_t nc      = (uint64_t) dst->ne[0];      // cols / embedding dim
     const uint64_t nr      = (uint64_t) ggml_nelements(idx);  // n indices
     const uint64_t nb_src  = (uint64_t) src->nb[1];
     const uint64_t nb_dst  = (uint64_t) dst->nb[1];
 
-    // Stage indices HBM → HMEM (small buffer, but kernel wants HMEM).
+    // Stage indices into HMEM, sourcing from HBM (D→H) or host memory
+    // (H→H) depending on where ggml put the i32 leaf. Both go through
+    // vedaH* calls — a plain memcpy would crash because VEDAhmemptr is
+    // an opaque handle, not a dereferenceable host pointer.
     const size_t idx_bytes = nr * sizeof(int32_t);
     VEDAhmemptr idx_hmem = ctx->pool().acquire(idx_bytes);
     if (idx_hmem == 0) return false;
-
-    if (!ggml_ve_ok(vedaHMemcpyDtoX(reinterpret_cast<void *>(idx_hmem),
-                                     tensor_hbm_ptr(idx), idx_bytes),
-                    "vedaHMemcpyDtoX (get_rows idx: HBM->HMEM)")) {
+    VEDAresult idx_err;
+    if (tensor_is_hbm(idx)) {
+        idx_err = vedaHMemcpyDtoX(reinterpret_cast<void *>(idx_hmem),
+                                   tensor_hbm_ptr(idx), idx_bytes);
+    } else if (idx->data != nullptr) {
+        idx_err = vedaHMemcpy(reinterpret_cast<void *>(idx_hmem),
+                              idx->data, idx_bytes);
+    } else {
+        ctx->pool().release(idx_hmem);
+        return false;
+    }
+    if (!ggml_ve_ok(idx_err, "vedaHMemcpy (get_rows idx)")) {
         ctx->pool().release(idx_hmem);
         return false;
     }
@@ -67,8 +84,8 @@ bool get_rows(backend_context * ctx, ggml_tensor * dst) {
         ctx->pool().release(idx_hmem);
         return false;
     }
-    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(src));
+    vedaArgsSetVPtr(args, 0, dst_hbm);
+    vedaArgsSetVPtr(args, 1, src_hbm);
     vedaArgsSetHMEM(args, 2, idx_hmem);
     vedaArgsSetU64 (args, 3, nc);
     vedaArgsSetU64 (args, 4, nr);

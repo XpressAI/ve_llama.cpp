@@ -157,15 +157,13 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
     const ggml_tensor * w = dst->src[0];
     const ggml_tensor * x = dst->src[1];
 
-    // Phase 3 requires all tensors in HBM. The CPU-weights/HMEM-IO mix lands
-    // in a later phase alongside the host->HBM weight cache work.
-    if (!tensor_is_hbm(w) || !tensor_is_hbm(x) || !tensor_is_hbm(dst)) return false;
+    const VEDAdeviceptr y_hbm = ctx->resolve_out(dst);
+    const VEDAdeviceptr w_hbm = ctx->resolve_in(w);
+    const VEDAdeviceptr x_hbm = ctx->resolve_in(x);
+    if (y_hbm == 0 || w_hbm == 0 || x_hbm == 0) return false;
 
     const uint64_t M = (uint64_t) w->ne[1];
     const uint64_t K = (uint64_t) w->ne[0];
-    const VEDAdeviceptr y_hbm = tensor_hbm_ptr(dst);
-    const VEDAdeviceptr w_hbm = tensor_hbm_ptr(w);
-    const VEDAdeviceptr x_hbm = tensor_hbm_ptr(x);
 
     bool ok = false;
     if (w->type == GGML_TYPE_Q8_0) {

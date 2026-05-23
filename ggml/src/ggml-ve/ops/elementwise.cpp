@@ -36,10 +36,6 @@ bool single_f32(const ggml_tensor * x, const ggml_tensor * dst) {
     return true;
 }
 
-bool all_hbm(const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * dst) {
-    return tensor_is_hbm(a) && tensor_is_hbm(b) && tensor_is_hbm(dst);
-}
-
 }  // namespace
 
 // ---------------- MUL ----------------
@@ -54,13 +50,16 @@ bool mul_supports(const ggml_tensor * op) {
 bool mul_f32(backend_context * ctx, ggml_tensor * dst) {
     VEDAfunction fn = ctx->fn(K_MUL_HBM_FULL);
     if (fn == 0 || !mul_supports(dst)) return false;
-    if (!all_hbm(dst->src[0], dst->src[1], dst)) return false;
+    const VEDAdeviceptr ya = ctx->resolve_out(dst);
+    const VEDAdeviceptr a0 = ctx->resolve_in(dst->src[0]);
+    const VEDAdeviceptr a1 = ctx->resolve_in(dst->src[1]);
+    if (ya == 0 || a0 == 0 || a1 == 0) return false;
 
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(mul)")) return false;
-    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(dst->src[0]));
-    vedaArgsSetVPtr(args, 2, tensor_hbm_ptr(dst->src[1]));
+    vedaArgsSetVPtr(args, 0, ya);
+    vedaArgsSetVPtr(args, 1, a0);
+    vedaArgsSetVPtr(args, 2, a1);
     vedaArgsSetU64 (args, 3, (uint64_t) ggml_nelements(dst));
 
     uint64_t result = 0;
@@ -91,7 +90,9 @@ bool scale_supports(const ggml_tensor * op) {
 bool scale_f32(backend_context * ctx, ggml_tensor * dst) {
     VEDAfunction fn = ctx->fn(K_SCALE_HBM_FULL);
     if (fn == 0 || !scale_supports(dst)) return false;
-    if (!tensor_is_hbm(dst->src[0]) || !tensor_is_hbm(dst)) return false;
+    const VEDAdeviceptr y = ctx->resolve_out(dst);
+    const VEDAdeviceptr x = ctx->resolve_in(dst->src[0]);
+    if (y == 0 || x == 0) return false;
 
     float params[2] = {0.0f, 0.0f};
     std::memcpy(params, dst->op_params, sizeof(params));
@@ -101,8 +102,8 @@ bool scale_f32(backend_context * ctx, ggml_tensor * dst) {
 
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(scale)")) return false;
-    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(dst->src[0]));
+    vedaArgsSetVPtr(args, 0, y);
+    vedaArgsSetVPtr(args, 1, x);
     vedaArgsSetU64 (args, 2, scale_bits);
     vedaArgsSetU64 (args, 3, (uint64_t) ggml_nelements(dst));
 
@@ -132,12 +133,14 @@ bool silu_supports(const ggml_tensor * op) {
 bool silu_f32(backend_context * ctx, ggml_tensor * dst) {
     VEDAfunction fn = ctx->fn(K_SILU_HBM_FULL);
     if (fn == 0 || !silu_supports(dst)) return false;
-    if (!tensor_is_hbm(dst->src[0]) || !tensor_is_hbm(dst)) return false;
+    const VEDAdeviceptr y = ctx->resolve_out(dst);
+    const VEDAdeviceptr x = ctx->resolve_in(dst->src[0]);
+    if (y == 0 || x == 0) return false;
 
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(silu)")) return false;
-    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(dst->src[0]));
+    vedaArgsSetVPtr(args, 0, y);
+    vedaArgsSetVPtr(args, 1, x);
     vedaArgsSetU64 (args, 2, (uint64_t) ggml_nelements(dst));
 
     uint64_t result = 0;
@@ -175,11 +178,15 @@ bool glu_f32(backend_context * ctx, ggml_tensor * dst) {
     if (!glu_supports(dst)) return false;
     const ggml_tensor * gate = dst->src[0];
     const ggml_tensor * up   = dst->src[1];
-    if (!tensor_is_hbm(gate) || !tensor_is_hbm(up) || !tensor_is_hbm(dst)) return false;
 
     VEDAfunction fn = ctx->fn(K_SWIGLU_HBM_FULL_OMP);
     if (fn == 0) fn = ctx->fn(K_SWIGLU_HBM_FULL);
     if (fn == 0) return false;
+
+    const VEDAdeviceptr y_v  = ctx->resolve_out(dst);
+    const VEDAdeviceptr g_v  = ctx->resolve_in(gate);
+    const VEDAdeviceptr u_v  = ctx->resolve_in(up);
+    if (y_v == 0 || g_v == 0 || u_v == 0) return false;
 
     // Kernel signature: ve_swiglu_hbm_full_omp(y, gate, up, ne0, ne1)
     //   nc = elements per row = ne0
@@ -189,9 +196,9 @@ bool glu_f32(backend_context * ctx, ggml_tensor * dst) {
 
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(glu)")) return false;
-    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(gate));
-    vedaArgsSetVPtr(args, 2, tensor_hbm_ptr(up));
+    vedaArgsSetVPtr(args, 0, y_v);
+    vedaArgsSetVPtr(args, 1, g_v);
+    vedaArgsSetVPtr(args, 2, u_v);
     vedaArgsSetU64 (args, 3, nc);
     vedaArgsSetU64 (args, 4, nr);
 

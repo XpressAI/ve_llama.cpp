@@ -37,6 +37,7 @@ endif()
 
 ggml_add_backend_library(ggml-ve
     ggml-ve.cpp
+    backend_ctx.cpp
     device.cpp
     buffer.cpp
     graph_compiler.cpp

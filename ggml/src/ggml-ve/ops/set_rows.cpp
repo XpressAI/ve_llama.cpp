@@ -18,6 +18,7 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace ggml_ve {
@@ -42,9 +43,10 @@ bool set_rows(backend_context * ctx, ggml_tensor * dst) {
     if (!set_rows_supports(dst)) return false;
     const ggml_tensor * src = dst->src[0];
     const ggml_tensor * idx = dst->src[1];
-    if (!tensor_is_hbm(src) || !tensor_is_hbm(idx) || !tensor_is_hbm(dst)) {
-        return false;
-    }
+
+    const VEDAdeviceptr src_hbm = ctx->resolve_in(src);
+    const VEDAdeviceptr dst_hbm = ctx->resolve_out(dst);
+    if (src_hbm == 0 || dst_hbm == 0) return false;
 
     const uint64_t nc     = (uint64_t) src->ne[0];
     const uint64_t nr     = (uint64_t) ggml_nelements(idx);
@@ -52,33 +54,47 @@ bool set_rows(backend_context * ctx, ggml_tensor * dst) {
     const uint64_t nb_src = (uint64_t) src->nb[1];
 
     // The VE kernel reads indices as int32 with a 4-byte stride.
-    // Stage them into HMEM as int32 — narrowing i64 if needed.
+    // Stage them into HMEM as int32 — narrowing i64 if needed, and
+    // sourcing from either HBM or host memory depending on where ggml
+    // put the i32/i64 leaf tensor.
     const size_t idx32_bytes = nr * sizeof(int32_t);
     VEDAhmemptr idx_hmem = ctx->pool().acquire(idx32_bytes);
     if (idx_hmem == 0) return false;
 
     if (idx->type == GGML_TYPE_I32) {
-        // Direct HBM -> HMEM copy of int32 indices.
-        if (!ggml_ve_ok(vedaHMemcpyDtoX(reinterpret_cast<void *>(idx_hmem),
-                                         tensor_hbm_ptr(idx), idx32_bytes),
-                        "vedaHMemcpyDtoX (set_rows i32 idx)")) {
+        VEDAresult err;
+        if (tensor_is_hbm(idx)) {
+            err = vedaHMemcpyDtoX(reinterpret_cast<void *>(idx_hmem),
+                                   tensor_hbm_ptr(idx), idx32_bytes);
+        } else if (idx->data != nullptr) {
+            err = vedaHMemcpy(reinterpret_cast<void *>(idx_hmem),
+                              idx->data, idx32_bytes);
+        } else {
             ctx->pool().release(idx_hmem);
             return false;
         }
-    } else {  // GGML_TYPE_I64
-        // Read i64 indices from HBM into a host buffer, narrow to i32,
-        // upload to HMEM. nr is small (number of new tokens in this graph).
+        if (!ggml_ve_ok(err, "vedaHMemcpy (set_rows i32 idx)")) {
+            ctx->pool().release(idx_hmem);
+            return false;
+        }
+    } else {  // GGML_TYPE_I64 — narrow on host.
         std::vector<int64_t> host_i64(nr);
-        if (!ggml_ve_ok(vedaMemcpyDtoH(host_i64.data(), tensor_hbm_ptr(idx),
-                                        nr * sizeof(int64_t)),
-                        "vedaMemcpyDtoH (set_rows i64 idx)")) {
+        bool i64_ok = false;
+        if (tensor_is_hbm(idx)) {
+            i64_ok = ggml_ve_ok(vedaMemcpyDtoH(host_i64.data(),
+                                                tensor_hbm_ptr(idx),
+                                                nr * sizeof(int64_t)),
+                                "vedaMemcpyDtoH (set_rows i64 idx)");
+        } else if (idx->data != nullptr) {
+            std::memcpy(host_i64.data(), idx->data, nr * sizeof(int64_t));
+            i64_ok = true;
+        }
+        if (!i64_ok) {
             ctx->pool().release(idx_hmem);
             return false;
         }
         std::vector<int32_t> host_i32(nr);
-        for (uint64_t i = 0; i < nr; ++i) {
-            host_i32[i] = (int32_t) host_i64[i];
-        }
+        for (uint64_t i = 0; i < nr; ++i) host_i32[i] = (int32_t) host_i64[i];
         if (!ggml_ve_ok(vedaHMemcpy(reinterpret_cast<void *>(idx_hmem),
                                      host_i32.data(), idx32_bytes),
                         "vedaHMemcpy (set_rows i32 narrowed idx)")) {
@@ -107,8 +123,8 @@ bool set_rows(backend_context * ctx, ggml_tensor * dst) {
         ctx->pool().release(idx_hmem);
         return false;
     }
-    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(src));
+    vedaArgsSetVPtr(args, 0, dst_hbm);
+    vedaArgsSetVPtr(args, 1, src_hbm);
     vedaArgsSetHMEM(args, 2, idx_hmem);
     vedaArgsSetU64 (args, 3, nc);
     vedaArgsSetU64 (args, 4, nr);

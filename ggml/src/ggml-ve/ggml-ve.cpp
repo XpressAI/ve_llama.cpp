@@ -161,16 +161,15 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     }
 
     // --- Compiled-graph fast path (opt-in via GGML_VE_COMPILE_GRAPH=1) ----
-    // Only attempt graph compilation for "real" decode graphs (>= this many
-    // nodes). Warmup / probe graphs hit during model init are tiny and not
-    // worth the ncc round-trip; the threshold keeps them on the interpreter.
-    // Default 32 catches the per-layer attention+FFN fragments (n=23..30)
-    // the scheduler hands us today. Once we claim CPU buffers (task #18)
-    // and start receiving whole-token graphs, raise this to ~100 to match
-    // the legacy port.
+    // Only attempt graph compilation for "real" decode graphs (>= this
+    // many nodes). With the CPU-buffer claim in dev_supports_buft, a
+    // Llama-3.2-3B decode arrives as one ~400-node graph instead of
+    // ~56 fragments, so the threshold can be relatively high; matching
+    // the legacy port's 100 keeps warmup/probe graphs on the
+    // interpreter (cheap, no ncc roundtrip).
     static const int gc_min_nodes = []{
         const char * env = std::getenv("GGML_VE_COMPILE_MIN_NODES");
-        return env ? std::atoi(env) : 32;
+        return env ? std::atoi(env) : 100;
     }();
     static const bool gc_verbose = (std::getenv("GGML_VE_COMPILE_DEBUG") != nullptr);
     if (gc_verbose) {
@@ -338,15 +337,17 @@ bool dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) 
         return buft_dev == d->ve_device;
     }
 
-    // Claiming CPU buffers is the right move (the legacy port does it
-    // and gets ~3× decode) but requires every op handler to gracefully
-    // route CPU-side tensors through backend_context::resolve_in/out.
-    // Only GET_ROWS, ROPE, and MUL_MAT are converted so far. Until
-    // RMS_NORM, SET_ROWS, ADD, MUL, FLASH_ATTN_EXT, GLU follow, leaving
-    // the claim default-off keeps the existing (fragmented but
-    // correct) behaviour. Toggle with GGML_VE_CLAIM_CPU_BUFFERS=1 for
-    // incremental testing on op handlers as they get converted.
-    if (std::getenv("GGML_VE_CLAIM_CPU_BUFFERS") != nullptr &&
+    // Claim CPU buffers too. Without this the ggml scheduler splits the
+    // cgraph at every host-side tensor (token id, position, mask, ...)
+    // and a Llama-3.2-3B decode arrives as ~56 fragments instead of one
+    // big graph. Every op handler now routes CPU-side tensors through
+    // backend_context::resolve_in/out (weights cached via
+    // hbm_weight_cache, activations staged through temp HBM), so the
+    // scheduler can safely place anything on us.
+    //
+    // Set GGML_VE_NO_CPU_BUFFERS=1 to revert to the old VE-HBM-only
+    // behaviour (useful for bisecting a regression).
+    if (std::getenv("GGML_VE_NO_CPU_BUFFERS") == nullptr &&
         std::strncmp(name, "CPU", 3) == 0) {
         return true;
     }

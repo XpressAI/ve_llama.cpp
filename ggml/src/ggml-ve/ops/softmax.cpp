@@ -58,8 +58,31 @@ bool soft_max_f32(backend_context * ctx, ggml_tensor * dst) {
     if (!soft_max_supports(dst)) return false;
     const ggml_tensor * src  = dst->src[0];
     const ggml_tensor * mask = dst->src[1];
-    if (!tensor_is_hbm(src) || !tensor_is_hbm(dst)) return false;
-    if (mask && !tensor_is_hbm(mask)) return false;
+    // SOFT_MAX uses HMEM-only kernels — every input/output bounces
+    // through pooled HMEM regardless of where ggml put the tensors.
+    // We just vary the *source* of those staging copies (vedaHMemcpyDtoX
+    // from HBM, vedaHMemcpy from host memory).
+    auto stage_in = [&](const ggml_tensor * t, VEDAhmemptr hmem, size_t bytes) -> bool {
+        if (tensor_is_hbm(t)) {
+            return ggml_ve_ok(vedaHMemcpyDtoX(reinterpret_cast<void *>(hmem),
+                                               tensor_hbm_ptr(t), bytes),
+                              "vedaHMemcpyDtoX (softmax stage)");
+        }
+        if (t->data == nullptr) return false;
+        return ggml_ve_ok(vedaHMemcpy(reinterpret_cast<void *>(hmem),
+                                       t->data, bytes),
+                          "vedaHMemcpy (softmax stage)");
+    };
+    auto unstage_out = [&](ggml_tensor * t, VEDAhmemptr hmem, size_t bytes) -> bool {
+        if (tensor_is_hbm(t)) {
+            return ggml_ve_ok(vedaHMemcpyXtoD(tensor_hbm_ptr(t),
+                                               reinterpret_cast<void *>(hmem), bytes),
+                              "vedaHMemcpyXtoD (softmax dst)");
+        }
+        if (t->data == nullptr) return false;
+        std::memcpy(t->data, reinterpret_cast<void *>(hmem), bytes);
+        return true;
+    };
 
     float scale = 0.0f, max_bias = 0.0f;
     unpack_softmax_params(dst, &scale, &max_bias);
@@ -79,9 +102,7 @@ bool soft_max_f32(backend_context * ctx, ggml_tensor * dst) {
         if (dst_hmem) ctx->pool().release(dst_hmem);
         return false;
     }
-    if (!ggml_ve_ok(vedaHMemcpyDtoX(reinterpret_cast<void *>(src_hmem),
-                                     tensor_hbm_ptr(src), src_bytes),
-                    "vedaHMemcpyDtoX (softmax src)")) {
+    if (!stage_in(src, src_hmem, src_bytes)) {
         ctx->pool().release(src_hmem);
         ctx->pool().release(dst_hmem);
         return false;
@@ -96,10 +117,7 @@ bool soft_max_f32(backend_context * ctx, ggml_tensor * dst) {
             ctx->pool().release(dst_hmem);
             return false;
         }
-        if (!ggml_ve_ok(vedaHMemcpyDtoX(reinterpret_cast<void *>(mask_hmem),
-                                         tensor_hbm_ptr(mask),
-                                         mask_bytes),
-                        "vedaHMemcpyDtoX (softmax mask)")) {
+        if (!stage_in(mask, mask_hmem, mask_bytes)) {
             ctx->pool().release(src_hmem);
             ctx->pool().release(dst_hmem);
             ctx->pool().release(mask_hmem);
@@ -157,11 +175,9 @@ bool soft_max_f32(backend_context * ctx, ggml_tensor * dst) {
         return false;
     }
 
-    // sync, copy result back to HBM, release pool entries.
+    // sync, copy result back to HBM (or host memory), release pool entries.
     vedaCtxSynchronize();
-    if (!ggml_ve_ok(vedaHMemcpyXtoD(tensor_hbm_ptr(dst),
-                                     reinterpret_cast<void *>(dst_hmem), dst_bytes),
-                    "vedaHMemcpyXtoD (softmax dst)")) {
+    if (!unstage_out(dst, dst_hmem, dst_bytes)) {
         ctx->pool().release(src_hmem);
         ctx->pool().release(dst_hmem);
         if (mask_hmem) ctx->pool().release(mask_hmem);

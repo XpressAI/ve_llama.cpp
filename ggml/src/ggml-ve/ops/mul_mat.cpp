@@ -103,15 +103,10 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
     const uint64_t K = (uint64_t) w->ne[0];
     const uint64_t N = (uint64_t) x->ne[1];
 
-    const bool full_hbm = tensor_is_hbm(w) && tensor_is_hbm(x) && tensor_is_hbm(dst);
-    if (!full_hbm) {
-        // Mixed CPU-weight / HMEM-IO paths come in a follow-up.
-        return false;
-    }
-
-    const VEDAdeviceptr y_vptr = tensor_hbm_ptr(dst);
-    const VEDAdeviceptr w_vptr = tensor_hbm_ptr(w);
-    const VEDAdeviceptr x_vptr = tensor_hbm_ptr(x);
+    const VEDAdeviceptr w_vptr = ctx->resolve_in(w);
+    const VEDAdeviceptr x_vptr = ctx->resolve_in(x);
+    const VEDAdeviceptr y_vptr = ctx->resolve_out(dst);
+    if (w_vptr == 0 || x_vptr == 0 || y_vptr == 0) return false;
 
     // Opt-in until validated end-to-end.
     static const bool colmajor_enabled =

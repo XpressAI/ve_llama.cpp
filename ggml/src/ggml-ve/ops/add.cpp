@@ -35,9 +35,10 @@ bool add_f32(backend_context * ctx, ggml_tensor * dst) {
         return false;
     }
 
-    VEDAdeviceptr y = (VEDAdeviceptr)(uintptr_t) dst->data;
-    VEDAdeviceptr a = (VEDAdeviceptr)(uintptr_t) dst->src[0]->data;
-    VEDAdeviceptr b = (VEDAdeviceptr)(uintptr_t) dst->src[1]->data;
+    VEDAdeviceptr y = ctx->resolve_out(dst);
+    VEDAdeviceptr a = ctx->resolve_in(dst->src[0]);
+    VEDAdeviceptr b = ctx->resolve_in(dst->src[1]);
+    if (y == 0 || a == 0 || b == 0) return false;
 
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(add)")) return false;

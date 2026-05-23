@@ -36,15 +36,18 @@ bool cpy_supports(const ggml_tensor * op) {
 
 bool cpy_f32(backend_context * ctx, ggml_tensor * dst) {
     if (!cpy_supports(dst)) return false;
-    if (!tensor_is_hbm(dst->src[0]) || !tensor_is_hbm(dst)) return false;
 
     VEDAfunction fn = ctx->fn(K_COPY_HBM_FULL);
     if (fn == 0) return false;
 
+    const VEDAdeviceptr y = ctx->resolve_out(dst);
+    const VEDAdeviceptr x = ctx->resolve_in(dst->src[0]);
+    if (y == 0 || x == 0) return false;
+
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(cpy)")) return false;
-    vedaArgsSetVPtr(args, 0, tensor_hbm_ptr(dst));
-    vedaArgsSetVPtr(args, 1, tensor_hbm_ptr(dst->src[0]));
+    vedaArgsSetVPtr(args, 0, y);
+    vedaArgsSetVPtr(args, 1, x);
     vedaArgsSetU64 (args, 2, (uint64_t) ggml_nbytes(dst));
 
     uint64_t result = 0;
