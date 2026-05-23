@@ -493,13 +493,17 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
     switch (op.type) {
         case OpType::GET_ROWS: {
             // Embedding lookup. Token id is the first i32 of the input HMEM.
-            // The kernel expects BF16 source; we widen to F32 inline.
+            // Whole op runs on a single thread (small: ~3072 elements);
+            // `#pragma omp single` gives an implicit barrier at end so the
+            // next op sees the result.
+            ss << "    #pragma omp single\n";
+            ss << "    {\n";
             if (op.src0_kind != BufferKind::WEIGHT) {
-                ss << "    memcpy(" << dst << ", " << src0 << ", "
+                ss << "        memcpy(" << dst << ", " << src0 << ", "
                    << (op.ne[0] * sizeof(float)) << ");\n";
+                ss << "    }\n";
                 break;
             }
-            ss << "    {\n";
             ss << "        int32_t tok = ((int32_t*)input)[0];\n";
             ss << "        int  edim = " << op.ne[0] << ";\n";
             if (op.src_type == GGML_TYPE_BF16) {
@@ -525,10 +529,12 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             int64_t cols  = op.ne[0];
             int64_t rows  = (op.ne[1] > 1) ? op.ne[1] : 1;
             bool per_head = (cols <= 256 && rows > 1);
-            ss << "    {\n";
             if (per_head) {
+                // Per-row independent; share rows across the team via omp for.
+                ss << "    {\n";
                 ss << "        int rows = " << rows << ", cols = " << cols << ";\n";
                 ss << "        float eps = " << flit(op.p.rms_norm.eps) << ";\n";
+                ss << "        #pragma omp for\n";
                 ss << "        for (int r = 0; r < rows; r++) {\n";
                 ss << "            const float* x = (const float*)" << src0 << " + r * cols;\n";
                 ss << "            float* y = (float*)" << dst << " + r * cols;\n";
@@ -537,17 +543,35 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "            float inv = 1.f / sqrtf(sumsq / cols + eps);\n";
                 ss << "            for (int j = 0; j < cols; j++) y[j] = inv * x[j];\n";
                 ss << "        }\n";
+                ss << "    }\n";
             } else {
+                // Single-row reduction. NCC's openmp doesn't reliably do
+                // a worksharing-reduction when the reduction variable is
+                // declared inside the enclosing parallel region (and the
+                // outer wrapper is `#pragma omp parallel`, so every scope
+                // here IS inside the parallel). We compute the reduction
+                // by hand via a shared array, then the normalize loop is
+                // a normal #pragma omp for.
+                ss << "    {\n";
                 ss << "        int cols = " << cols << ";\n";
                 ss << "        float eps = " << flit(op.p.rms_norm.eps) << ";\n";
                 ss << "        const float* x = (const float*)" << src0 << ";\n";
                 ss << "        float* y = (float*)" << dst << ";\n";
+                ss << "        static float __ssq[8];  /* per-thread partials */\n";
+                ss << "        int tid = omp_get_thread_num();\n";
+                ss << "        int nt  = omp_get_num_threads();\n";
+                ss << "        float local = 0.f;\n";
+                ss << "        #pragma omp for nowait\n";
+                ss << "        for (int j = 0; j < cols; j++) local += x[j] * x[j];\n";
+                ss << "        __ssq[tid] = local;\n";
+                ss << "        #pragma omp barrier\n";
                 ss << "        float sumsq = 0.f;\n";
-                ss << "        for (int j = 0; j < cols; j++) sumsq += x[j] * x[j];\n";
+                ss << "        for (int k = 0; k < nt; k++) sumsq += __ssq[k];\n";
                 ss << "        float inv = 1.f / sqrtf(sumsq / cols + eps);\n";
+                ss << "        #pragma omp for\n";
                 ss << "        for (int j = 0; j < cols; j++) y[j] = inv * x[j];\n";
+                ss << "    }\n";
             }
-            ss << "    }\n";
             break;
         }
 
@@ -556,6 +580,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             if (op.src1_ne[1] > 1 && op.src1_ne[2] > 1) src1_n = op.src1_ne[0] * op.src1_ne[1];
             if (src1_n > 0 && src1_n < n && n % src1_n == 0) {
                 int64_t repeats = n / src1_n;
+                ss << "    #pragma omp for\n";
                 ss << "    for (int64_t r = 0; r < " << repeats << "; r++) {\n";
                 ss << "        for (int64_t i = 0; i < " << src1_n << "; i++) {\n";
                 ss << "            ((float*)" << dst << ")[r*" << src1_n << "+i] = "
@@ -564,6 +589,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "        }\n";
                 ss << "    }\n";
             } else {
+                ss << "    #pragma omp for\n";
                 ss << "    for (int i = 0; i < " << n << "; i++) {\n";
                 ss << "        ((float*)" << dst << ")[i] = "
                    << "((float*)" << src0 << ")[i] * ((float*)" << src1 << ")[i];\n";
@@ -573,6 +599,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
         }
 
         case OpType::ADD:
+            ss << "    #pragma omp for\n";
             ss << "    for (int i = 0; i < " << n << "; i++) {\n";
             ss << "        ((float*)" << dst << ")[i] = "
                << "((float*)" << src0 << ")[i] + ((float*)" << src1 << ")[i];\n";
@@ -580,16 +607,23 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             break;
 
         case OpType::MUL_MAT_F32: {
+            // Single-thread external call. Wrap in omp single so the team
+            // synchronises after.
             int64_t M = op.src0_ne[1], K = op.src0_ne[0];
-            ss << "    ve_f32_matvec_ptr((float*)" << dst << ", (const float*)"
+            ss << "    #pragma omp single\n";
+            ss << "    {\n";
+            ss << "        ve_f32_matvec_ptr((float*)" << dst << ", (const float*)"
                << src0 << ", (const float*)" << src1
                << ", " << M << ", " << K << ");\n";
+            ss << "    }\n";
             break;
         }
 
         case OpType::MUL_MAT_BF16: {
+            // _inner variant uses `#pragma omp for` internally — the implicit
+            // barrier at end-of-for synchronises the team for us.
             int64_t M = op.src0_ne[1], K = op.src0_ne[0];
-            ss << "    ve_bf16_matvec_rowmajor_ptr_omp((float*)" << dst
+            ss << "    ve_bf16_matvec_rowmajor_ptr_inner((float*)" << dst
                << ", (const uint16_t*)" << src0 << ", (const float*)" << src1
                << ", " << M << ", " << K << ");\n";
             break;
@@ -616,6 +650,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             if (neox) {
                 ss << "        int half = head_size / 2;\n";
                 ss << "        float theta_scale = powf(freq_base, -2.f / head_size);\n";
+                ss << "        #pragma omp for\n";
                 ss << "        for (int h = 0; h < n_heads; h++) {\n";
                 ss << "            float theta = (float)pos_i * freq_scale;\n";
                 ss << "            for (int i = 0; i < half; i++) {\n";
@@ -630,6 +665,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "            }\n";
                 ss << "        }\n";
             } else {
+                ss << "        #pragma omp for\n";
                 ss << "        for (int h = 0; h < n_heads; h++) {\n";
                 ss << "            for (int i = 0; i < head_size; i += 2) {\n";
                 ss << "                float freq = 1.f / powf(freq_base, (float)i / (float)head_size);\n";
@@ -661,28 +697,36 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 case GGML_TYPE_F16:  elem_bytes = 2; break;
                 default:             elem_bytes = 4; break;
             }
-            ss << "    {\n";
-            ss << "        int64_t idx0 = (int64_t) pos;\n";
+            (void) elem_bytes;
             (void) src1;
-            ss << "        int cols = " << cols << ";\n";
-            ss << "        const float* src = (const float*)" << src0 << ";\n";
-            ss << "        char* base = (char*)" << dst << ";\n";
-            ss << "        char* row = base + idx0 * " << dst_row_bytes << ";\n";
             if (op.dst_type == GGML_TYPE_F32) {
-                ss << "        memcpy(row, src, cols * 4);\n";
+                ss << "    #pragma omp single\n";
+                ss << "    {\n";
+                ss << "        int64_t idx0 = (int64_t) pos;\n";
+                ss << "        const float* src = (const float*)" << src0 << ";\n";
+                ss << "        char* base = (char*)" << dst << ";\n";
+                ss << "        memcpy(base + idx0 * " << dst_row_bytes << ", src, "
+                   << cols << " * 4);\n";
+                ss << "    }\n";
             } else if (op.dst_type == GGML_TYPE_BF16) {
+                ss << "    {\n";
+                ss << "        int64_t idx0 = (int64_t) pos;\n";
+                ss << "        int cols = " << cols << ";\n";
+                ss << "        const float* src = (const float*)" << src0 << ";\n";
+                ss << "        char* row = (char*)" << dst << " + idx0 * " << dst_row_bytes << ";\n";
                 ss << "        uint16_t* drow = (uint16_t*)row;\n";
-                ss << "        #pragma _NEC ivdep\n";
+                ss << "        #pragma omp for\n";
                 ss << "        for (int j = 0; j < cols; j++) {\n";
                 ss << "            uint32_t u; memcpy(&u, &src[j], 4);\n";
                 ss << "            drow[j] = (uint16_t)(u >> 16);\n";
                 ss << "        }\n";
-            } else {  // F16 — kept for completeness but we reject in supports
+                ss << "    }\n";
+            } else {
+                ss << "    #pragma omp single\n";
+                ss << "    {\n";
                 ss << "        // F16 SET_ROWS not in compiled path\n";
-                ss << "        (void)src; (void)cols;\n";
+                ss << "    }\n";
             }
-            (void) elem_bytes;
-            ss << "    }\n";
             break;
         }
 
@@ -712,13 +756,19 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             ss << "        const void*  kp = (const void*)"  << src1 << ";\n";
             ss << "        const void*  vp = (const void*)"  << src2 << ";\n";
             if (op.p.flash_attn.kv_type == (int) GGML_TYPE_BF16) {
-                ss << "        attention_f32q_bf16kv_fused_gqa_omp(outp, qp, kp, vp, "
+                // _inner: uses `#pragma omp for` internally, implicit barrier.
+                ss << "        attention_f32q_bf16kv_fused_gqa_inner(outp, qp, kp, vp, "
                    << "head_dim, n_q_heads, n_kv_heads, seq_len, scale, "
                    << "nb_k1, nb_k2, nb_v1, nb_v2);\n";
             } else {
-                ss << "        attention_f32_raw_gqa_stride_omp(outp, qp, kp, vp, "
+                // F32 KV path doesn't have an _inner variant yet — fall back
+                // to omp single. Bumping this is task #16 follow-up.
+                ss << "        #pragma omp single\n";
+                ss << "        {\n";
+                ss << "            attention_f32_raw_gqa_stride_omp(outp, qp, kp, vp, "
                    << "head_dim, n_q_heads, n_kv_heads, seq_len, scale, "
                    << "nb_k1, nb_k2, nb_v1, nb_v2);\n";
+                ss << "        }\n";
             }
             ss << "    }\n";
             break;
@@ -730,6 +780,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                              : op.dst_type == GGML_TYPE_F16  ? 2 : 4);
             int64_t total_elems = op.ne[0] * op.ne[1] * op.ne[2] * op.ne[3];
             if (total_elems == 0) total_elems = op.ne[0];
+            ss << "    #pragma omp single\n";
             ss << "    memcpy(" << dst << ", " << src0 << ", "
                << (size_t) (total_elems * elem_bytes) << "u);\n";
             break;
@@ -738,6 +789,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
         case OpType::SOFT_MAX: {
             int rows = (op.ne[1] > 1) ? (int) op.ne[1] : 1;
             int cols = (int) op.ne[0];
+            ss << "    #pragma omp single\n";
             ss << "    {\n";
             ss << "        int rows = " << rows << ", cols = " << cols << ";\n";
             ss << "        for (int r = 0; r < rows; r++) {\n";
@@ -783,13 +835,17 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
     ss << "#include <omp.h>\n";
     ss << "#include <veda/device.h>\n\n";
 
-    // External kernels from libve_sgemv.so
-    ss << "extern void ve_bf16_matvec_rowmajor_ptr_omp(float* y, const uint16_t* W, const float* x, int M, int K);\n";
+    // External kernels from libve_sgemv.so. The "_inner" variants assume the
+    // caller is inside a #pragma omp parallel region and use `#pragma omp for`
+    // to share work — implicit barrier at end-of-for synchronises the team.
+    // The "_omp" variants spawn their own region and are used only by the
+    // OpType::FLASH_ATTN F32 fallback (kept until we add an _inner there).
+    ss << "extern void ve_bf16_matvec_rowmajor_ptr_inner(float* y, const uint16_t* W, const float* x, int M, int K);\n";
     ss << "extern void ve_f32_matvec_ptr(float* y, const float* W, const float* x, int M, int K);\n";
     ss << "extern void attention_f32_raw_gqa_stride_omp(float* out, const float* q, const void* k, const void* v,"
        << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, float scale,"
        << " size_t nb_k1, size_t nb_k2, size_t nb_v1, size_t nb_v2);\n";
-    ss << "extern void attention_f32q_bf16kv_fused_gqa_omp(float* out, const float* q, const void* k, const void* v,"
+    ss << "extern void attention_f32q_bf16kv_fused_gqa_inner(float* out, const float* q, const void* k, const void* v,"
        << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, float scale,"
        << " size_t nb_k1, size_t nb_k2, size_t nb_v1, size_t nb_v2);\n\n";
 
@@ -833,9 +889,22 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
     ss << "    }\n";
     ss << "\n";
 
+    // One outer #pragma omp parallel for the whole cgraph. Every op inside
+    // either calls an "_inner" external (which uses `#pragma omp for`) or
+    // emits its own work-sharing directive (`#pragma omp for`, `single`).
+    // The implicit barrier at end-of-construct synchronises before the
+    // next op runs — no explicit `#pragma omp barrier` needed.
+    //
+    // Threads fork once per kernel launch instead of once per op (~18×
+    // for the attention+FFN block on Llama-3.2-3B).
+    ss << "    #pragma omp parallel num_threads(8)\n";
+    ss << "    {\n";
+
     for (size_t i = 0; i < traced_ops_.size(); ++i) {
         ss << gen_op_code(traced_ops_[i], (int) i);
     }
+
+    ss << "    }\n";   // end #pragma omp parallel
 
     // Copy the very last op's output into the host-supplied `output` HMEM.
     // Only useful when this is the very last compute (logits); for layer
