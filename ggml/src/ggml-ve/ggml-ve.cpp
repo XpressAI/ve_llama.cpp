@@ -91,7 +91,13 @@ struct cached_graph {
     gcomp::CompiledGraph * cg         = nullptr;
     bool                   executable = true;
 };
-static thread_local std::unordered_map<uint64_t, cached_graph> g_cg_cache;
+// NOT thread_local — ggml's scheduler can invoke backend_graph_compute
+// from different worker threads, and a thread_local cache loses the
+// CompiledGraph every time. Two cgraphs back-to-back from different
+// threads would each force a fresh trace+compile (or .so load) even
+// though the signature is identical.
+static std::mutex                                       g_cg_cache_mu;
+static std::unordered_map<uint64_t, cached_graph>       g_cg_cache;
 
 // 64-bit structural fingerprint over (op, dst_type, dst_ne, src_type, src_ne)
 // for every node. Same set of {op + shape + dtype} → same signature → same
@@ -114,6 +120,100 @@ static uint64_t cgraph_signature(const ggml_cgraph * g) {
         }
     }
     return h;
+}
+
+// GGML_VE_DIAGNOSE_SIG=1 — diff per-tensor ne against the previous cgraph
+// with the same n_nodes. On each compile-triggering miss, print which
+// tensor's shape changed since the last seen cgraph of that node count.
+// Answers "what's causing the second compile mid-decode" in one run.
+struct sig_diag_node {
+    int     op       = -1;
+    int     type     = -1;
+    int64_t dst_ne[4] = { -1, -1, -1, -1 };
+    int     src_type[GGML_MAX_SRC] = { -1, -1, -1, -1 };
+    int64_t src_ne  [GGML_MAX_SRC][4] = {{0}};
+};
+struct sig_diag_state {
+    int                          n_nodes = -1;
+    std::vector<sig_diag_node>   nodes;
+};
+static std::mutex                                       g_sig_diag_mu;
+static std::unordered_map<int, sig_diag_state>          g_sig_diag_by_nnodes;
+
+static void diagnose_signature(const ggml_cgraph * g, uint64_t sig) {
+    sig_diag_state cur;
+    cur.n_nodes = g->n_nodes;
+    cur.nodes.resize(g->n_nodes);
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * n = g->nodes[i];
+        cur.nodes[i].op   = (int) n->op;
+        cur.nodes[i].type = (int) n->type;
+        for (int d = 0; d < 4; ++d) cur.nodes[i].dst_ne[d] = n->ne[d];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            cur.nodes[i].src_type[s] = src ? (int) src->type : -1;
+            for (int d = 0; d < 4; ++d) cur.nodes[i].src_ne[s][d] = src ? src->ne[d] : -1;
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(g_sig_diag_mu);
+    auto & prev = g_sig_diag_by_nnodes[g->n_nodes];
+    if (prev.n_nodes != g->n_nodes || prev.nodes.empty()) {
+        fprintf(stderr, "[VE-SIG-DIAG] sig=%016lx n_nodes=%d — first cgraph of this size, no diff baseline\n",
+                (unsigned long) sig, g->n_nodes);
+        prev = std::move(cur);
+        return;
+    }
+
+    fprintf(stderr, "[VE-SIG-DIAG] sig=%016lx n_nodes=%d — differences vs previous cgraph:\n",
+            (unsigned long) sig, g->n_nodes);
+    int diff_count = 0;
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * n = g->nodes[i];
+        const char * nm = n->name && n->name[0] ? n->name : "?";
+        if (cur.nodes[i].op != prev.nodes[i].op) {
+            fprintf(stderr, "  node %3d '%s' op: %d -> %d (%s)\n",
+                    i, nm, prev.nodes[i].op, cur.nodes[i].op, ggml_op_name(n->op));
+            ++diff_count;
+        }
+        if (cur.nodes[i].type != prev.nodes[i].type) {
+            fprintf(stderr, "  node %3d '%s' (%s) dst.type: %d -> %d\n",
+                    i, nm, ggml_op_name(n->op),
+                    prev.nodes[i].type, cur.nodes[i].type);
+            ++diff_count;
+        }
+        for (int d = 0; d < 4; ++d) {
+            if (cur.nodes[i].dst_ne[d] != prev.nodes[i].dst_ne[d]) {
+                fprintf(stderr, "  node %3d '%s' (%s) dst.ne[%d]: %ld -> %ld\n",
+                        i, nm, ggml_op_name(n->op),
+                        d, (long) prev.nodes[i].dst_ne[d], (long) cur.nodes[i].dst_ne[d]);
+                ++diff_count;
+            }
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            const char * sn = (src && src->name && src->name[0]) ? src->name : "?";
+            if (cur.nodes[i].src_type[s] != prev.nodes[i].src_type[s]) {
+                fprintf(stderr, "  node %3d '%s' (%s) src[%d]='%s' type: %d -> %d\n",
+                        i, nm, ggml_op_name(n->op), s, sn,
+                        prev.nodes[i].src_type[s], cur.nodes[i].src_type[s]);
+                ++diff_count;
+            }
+            for (int d = 0; d < 4; ++d) {
+                if (cur.nodes[i].src_ne[s][d] != prev.nodes[i].src_ne[s][d]) {
+                    fprintf(stderr, "  node %3d '%s' (%s) src[%d]='%s' ne[%d]: %ld -> %ld\n",
+                            i, nm, ggml_op_name(n->op), s, sn,
+                            d, (long) prev.nodes[i].src_ne[s][d], (long) cur.nodes[i].src_ne[s][d]);
+                    ++diff_count;
+                }
+            }
+        }
+    }
+    if (diff_count == 0) {
+        fprintf(stderr, "  (no per-tensor differences — signature collision? signature impl bug?)\n");
+    }
+
+    prev = std::move(cur);
 }
 
 ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -215,51 +315,80 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     if (gcomp::GraphCompiler::enabled() && cgraph->n_nodes >= gc_min_nodes) {
         auto & gc = gcomp::get_compiler();
         const uint64_t sig = cgraph_signature(cgraph);
-        auto it = g_cg_cache.find(sig);
-        if (it != g_cg_cache.end()) {
-            // Known signature. Either we've executed it before (try again),
-            // or we've marked it un-executable (skip and fall through).
-            if (it->second.executable && it->second.cg) {
-                if (gc.execute(it->second.cg, ctx, cgraph)) {
+        static const bool diag_sig = (std::getenv("GGML_VE_DIAGNOSE_SIG") != nullptr);
+
+        // Look up the cached entry under lock. We copy it out into a
+        // local so the actual execute() / compile() / store happen
+        // outside the critical section — ncc compile takes ~30 s and
+        // we don't want to hold the cache mutex that long.
+        cached_graph entry;
+        bool         entry_present = false;
+        {
+            std::lock_guard<std::mutex> lk(g_cg_cache_mu);
+            auto it = g_cg_cache.find(sig);
+            if (it != g_cg_cache.end()) {
+                entry         = it->second;
+                entry_present = true;
+            }
+        }
+
+        if (diag_sig && !entry_present) {
+            diagnose_signature(cgraph, sig);
+        }
+
+        if (entry_present) {
+            // Three possible cached outcomes: (1) executable=true with a
+            // valid cg → execute; (2) executable=true but cg=null → trace
+            // was rejected previously, fall through to interpreter; (3)
+            // executable=false → execute regressed previously, ditto.
+            if (entry.executable && entry.cg) {
+                if (gc.execute(entry.cg, ctx, cgraph)) {
                     ctx->ops_total() += cgraph->n_nodes;
                     return GGML_STATUS_SUCCESS;
                 }
                 // Execute regressed — remember and stop trying.
-                it->second.executable = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_cg_cache_mu);
+                    auto it = g_cg_cache.find(sig);
+                    if (it != g_cg_cache.end()) it->second.executable = false;
+                }
                 if (gc_verbose) {
                     fprintf(stderr, "[VE-GC] execute failed for sig=%016lx — marked un-executable, falling back\n",
                             (unsigned long) sig);
                 }
             }
-            // executable==false: silently fall through to the interpreter.
-            // No .so reload, no recompile.
-        } else if (gc.trace(cgraph)) {
-            // First time we've seen this signature. Compile, try execute,
-            // store the result either way (so we don't re-trace/re-load
-            // every call for shapes that don't pan out).
-            char hashbuf[32];
-            std::snprintf(hashbuf, sizeof(hashbuf), "%016lx", (unsigned long) sig);
-            gcomp::CompiledGraph * cg2 = gc.compile(hashbuf, /*n_ctx=*/ 4096);
-            if (cg2) {
-                cached_graph entry;
-                entry.cg = cg2;
-                if (gc.execute(cg2, ctx, cgraph)) {
-                    entry.executable = true;
-                    g_cg_cache[sig] = entry;
-                    ctx->ops_total() += cgraph->n_nodes;
-                    return GGML_STATUS_SUCCESS;
-                }
-                entry.executable = false;
-                g_cg_cache[sig] = entry;
-                if (gc_verbose) {
-                    fprintf(stderr, "[VE-GC] compile ok but execute failed for sig=%016lx — cached as un-executable\n",
-                            (unsigned long) sig);
+            // Anything else: silently fall through to the interpreter.
+        } else {
+            // Trace: succeed (compile + try execute) or fail (cache the
+            // failure so the next call doesn't re-trace).
+            bool traced = gc.trace(cgraph);
+            cached_graph new_entry;  // cg=null, executable=true by default
+            if (traced) {
+                char hashbuf[32];
+                std::snprintf(hashbuf, sizeof(hashbuf), "%016lx", (unsigned long) sig);
+                gcomp::CompiledGraph * cg2 = gc.compile(hashbuf, /*n_ctx=*/ 4096);
+                if (cg2) {
+                    new_entry.cg         = cg2;
+                    new_entry.executable = gc.execute(cg2, ctx, cgraph);
+                } else if (gc_verbose) {
+                    fprintf(stderr, "[VE-GC] compile failed for sig=%016lx\n", (unsigned long) sig);
                 }
             } else if (gc_verbose) {
-                fprintf(stderr, "[VE-GC] compile failed for sig=%016lx\n", (unsigned long) sig);
+                fprintf(stderr, "[VE-GC] trace rejected the graph sig=%016lx; cached as interpreter-only\n",
+                        (unsigned long) sig);
             }
-        } else if (gc_verbose) {
-            fprintf(stderr, "[VE-GC] trace rejected the graph; interpreter\n");
+            // Cache the outcome either way (cg may be null, executable
+            // may be false). Future calls with the same sig skip trace
+            // and either execute (if cg+executable) or fall straight
+            // through to the interpreter.
+            {
+                std::lock_guard<std::mutex> lk(g_cg_cache_mu);
+                g_cg_cache[sig] = new_entry;
+            }
+            if (new_entry.cg && new_entry.executable) {
+                ctx->ops_total() += cgraph->n_nodes;
+                return GGML_STATUS_SUCCESS;
+            }
         }
     }
 
