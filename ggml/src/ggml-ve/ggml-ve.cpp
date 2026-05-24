@@ -501,4 +501,19 @@ void ggml_backend_ve_get_device_memory(int device, size_t * free, size_t * total
     *total = d->total_memory;
 }
 
+bool ggml_backend_ve_get_stats(ggml_backend_t backend, struct ggml_backend_ve_stats * out) {
+    if (out == nullptr || !ggml_backend_is_ve(backend)) return false;
+    auto * ctx = (ggml_ve::backend_context *) backend->context;
+    if (ctx == nullptr) return false;
+    int64_t cache_hits = 0, cache_misses = 0;
+    ctx->cache().stats(/*allocated=*/nullptr, &cache_hits, &cache_misses);
+    out->hbm_cache_hits   = cache_hits;
+    out->hbm_cache_misses = cache_misses;
+    out->syncs            = ctx->sync_count();
+    out->ops_total        = ctx->ops_total();
+    out->ops_mul_mat      = ctx->ops_mul_mat();
+    out->ops_hbm          = ctx->ops_hbm();
+    return true;
+}
+
 GGML_BACKEND_DL_IMPL(ggml_backend_ve_reg)
