@@ -247,10 +247,11 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
         op.src2_kind = k;
     }
 
-    // GET_ROWS is now codegened (see OpType::GET_ROWS case below) but the
-    // generated kernel reads the token id from the very first i32 of the
-    // kernel's `input` HMEM arg — so it works for graphs with at most ONE
-    // GET_ROWS. trace() pre-counts and rejects graphs with more.
+    // GET_ROWS codegen below (OpType::GET_ROWS) branches per-op on
+    // whether src0 is the embedding WEIGHT (real token-id lookup from
+    // input[0]) or an intermediate (memcpy first row). Multi-GET_ROWS
+    // graphs work as long as at most one is WEIGHT-backed — same
+    // constraint the legacy backend operates under.
 
     // Reject multi-token (prompt-eval) shapes — the codegen bakes a
     // per-token element count into the .so and would run off the end
@@ -447,24 +448,6 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     tensor_slot_order_.clear();
     colmajor_specs_.clear();
     trace_valid_ = true;
-
-    // GET_ROWS codegen below assumes there's at most one in the graph
-    // (it reads the token id from input[0]). Refuse multi-GET_ROWS
-    // graphs up front instead of midway through trace_one.
-    {
-        int n_get_rows = 0;
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (cgraph->nodes[i]->op == GGML_OP_GET_ROWS) ++n_get_rows;
-        }
-        if (n_get_rows > 1) {
-            if (debug_enabled()) {
-                fprintf(stderr, "[VE-GC] refuse: %d GET_ROWS ops in one graph (codegen only handles 1)\n",
-                        n_get_rows);
-            }
-            trace_valid_ = false;
-            return false;
-        }
-    }
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         if (!trace_one(cgraph->nodes[i])) {
