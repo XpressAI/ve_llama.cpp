@@ -449,6 +449,42 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     colmajor_specs_.clear();
     trace_valid_ = true;
 
+    // Pre-pass: refuse if any weight tensor referenced by this cgraph
+    // isn't already on a VE_HBM buffer. The compiled kernel takes the
+    // slot's HBM pointer at face value, and we don't yet have the legacy
+    // port's special "GET_ROWS weight on CPU mmap" upload+rewrite path.
+    //
+    // Trying to compile anyway and uploading via the host weight cache
+    // produces garbage output: the GGUF loader leaves the embedding
+    // table as a CPU mmap until first touch, and our cache hands back a
+    // raw row-major HBM copy, but the compiled kernel's GET_ROWS code
+    // assumes a layout/stride the legacy generator only sets up for
+    // weights it explicitly knows about.
+    //
+    // Punting to the interpreter for these cgraphs is the right answer:
+    // the interpreter goes through resolve_in()/the same hbm_weight_cache
+    // and uploads the embedding to HBM as a side effect. The next cgraph
+    // that touches the same weight will see it on HBM and compile
+    // cleanly.
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (!n) continue;
+        const ggml_tensor * srcs[GGML_MAX_SRC + 1] = { n, n->src[0], n->src[1], n->src[2] };
+        for (const ggml_tensor * t : srcs) {
+            if (!t || !is_weight(t)) continue;
+            ggml_backend_buffer_type_t buft = t->buffer ? ggml_backend_buffer_get_type(t->buffer) : nullptr;
+            const char * bn = buft ? ggml_backend_buft_name(buft) : nullptr;
+            if (!bn || std::strncmp(bn, "VE", 2) != 0 || !std::strstr(bn, "_HBM")) {
+                if (debug_enabled()) {
+                    fprintf(stderr, "[VE-GC] refuse: weight '%s' is on non-HBM buffer (%s) at op #%d\n",
+                            t->name ? t->name : "?", bn ? bn : "<no-buffer>", i);
+                }
+                trace_valid_ = false;
+                return false;
+            }
+        }
+    }
+
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         if (!trace_one(cgraph->nodes[i])) {
             if (debug_enabled()) {
