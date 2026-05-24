@@ -36,6 +36,7 @@ const char * op_type_name(OpType t) {
         case OpType::ROPE:          return "ROPE";
         case OpType::SET_ROWS:      return "SET_ROWS";
         case OpType::FLASH_ATTN:    return "FLASH_ATTN";
+        case OpType::GLU_SWIGLU:    return "GLU_SWIGLU";
         case OpType::CPY:           return "CPY";
         case OpType::SOFT_MAX:      return "SOFT_MAX";
         default:                    return "UNKNOWN";
@@ -277,8 +278,18 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
         if (!t) return false;
         if (t->ne[3] > 1) return true;
         if (for_op == GGML_OP_FLASH_ATTN_EXT) {
-            // FA Q (src[0]): n_tokens=ne[1]. K/V (src[1..2]): n_kv_tokens=ne[1] (always grows; we accept).
-            if (src_slot == 0) return t->ne[1] > 1;
+            // FA Q (src[0]) and dst exist in two shape conventions depending
+            // on how the FA result is permuted: [D, N, H, B] (n_tokens in
+            // ne[1], heads in ne[2]) OR [D, H, N, B] (heads in ne[1],
+            // n_tokens in ne[2]). At decode either way N=1, so accept as
+            // long as the *product* of ne[1] and ne[2] is small.
+            //   K/V (src[1..2]) grow seq-wise on ne[1] — KV cache, allowed.
+            if (is_dst || src_slot == 0) {
+                // Accept any FA Q / dst where total "token slots" across
+                // ne[1]*ne[2] equals heads*1 (decode) — i.e. one of the two
+                // dims is exactly 1. Multi-token prompt eval has both > 1.
+                return (t->ne[1] > 1) && (t->ne[2] > 1);
+            }
             return false;
         }
         if (for_op == GGML_OP_SET_ROWS && is_dst) {
@@ -385,6 +396,18 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
         case GGML_OP_SOFT_MAX:
             op.type = OpType::SOFT_MAX;
             break;
+        case GGML_OP_GLU: {
+            // Only the SWIGLU split-mode variant (Llama-3 FFN). gate=src[0],
+            // up=src[1], output = silu(gate) * up. Falls back to interpreter
+            // for other GLU variants.
+            if (ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU) return false;
+            if (!node->src[0] || !node->src[1]) return false;
+            if (node->src[0]->type != GGML_TYPE_F32 ||
+                node->src[1]->type != GGML_TYPE_F32 ||
+                node->type        != GGML_TYPE_F32) return false;
+            op.type = OpType::GLU_SWIGLU;
+            break;
+        }
         case GGML_OP_UNARY:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ADD_ID:
@@ -846,6 +869,24 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             break;
         }
 
+        case OpType::GLU_SWIGLU: {
+            // SWIGLU: y = silu(gate) * up. gate/up/dst are F32 with the
+            // same shape; row count is ggml_nrows(gate) = ne[1]*ne[2]*ne[3].
+            int64_t nc = op.ne[0];
+            int64_t nr = (op.ne[1] > 0 ? op.ne[1] : 1) *
+                         (op.ne[2] > 0 ? op.ne[2] : 1) *
+                         (op.ne[3] > 0 ? op.ne[3] : 1);
+            ss << "    {\n";
+            ss << "        int nc = " << nc << ", nr = " << nr << ";\n";
+            ss << "        float* y    = (float*)" << dst  << ";\n";
+            ss << "        float* gate = (float*)" << src0 << ";\n";
+            ss << "        float* up   = (float*)" << src1 << ";\n";
+            // _inner: uses `#pragma omp for` internally.
+            ss << "        swiglu_hbm_full_inner(y, gate, up, nc, nr);\n";
+            ss << "    }\n";
+            break;
+        }
+
         case OpType::SOFT_MAX: {
             int rows = (op.ne[1] > 1) ? (int) op.ne[1] : 1;
             int cols = (int) op.ne[0];
@@ -908,7 +949,8 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
        << " size_t nb_k1, size_t nb_k2, size_t nb_v1, size_t nb_v2);\n";
     ss << "extern void attention_f32q_bf16kv_fused_gqa_inner(float* out, const float* q, const void* k, const void* v,"
        << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, float scale,"
-       << " size_t nb_k1, size_t nb_k2, size_t nb_v1, size_t nb_v2);\n\n";
+       << " size_t nb_k1, size_t nb_k2, size_t nb_v1, size_t nb_v2);\n";
+    ss << "extern void swiglu_hbm_full_inner(float* y, float* gate, float* up, int nc, int nr);\n\n";
 
     int n_slots = (int) tensor_slot_order_.size();
 

@@ -48,6 +48,7 @@ enum class OpType {
     FLASH_ATTN,
     CPY,
     SOFT_MAX,
+    GLU_SWIGLU,       // GGML_OP_GLU with GGML_GLU_OP_SWIGLU, split gate/up
 };
 
 enum class BufferKind {
