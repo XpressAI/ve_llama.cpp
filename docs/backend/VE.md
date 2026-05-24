@@ -62,32 +62,31 @@ The K-quants and MXFP4 paths are deliberately deferred. NCC cannot vectorize int
 
 ## Build
 
-The VE backend depends on a separately-built shared library (`libve_sgemv.so`) that contains the VE-side kernels. Build it once from the kernel source tree:
+The VE-side kernel sources live in-tree under `ggml/src/ggml-ve/kernels-veda/` and are built into `libve_sgemv.so` + `libve_kernels.so` as part of the normal CMake invocation. There is no separate `make` step.
 
 ```bash
-cd /path/to/ggml-ve-veda
-make libve_sgemv.so
-```
-
-This produces `libve_sgemv.so` in the same directory.
-
-Then build llama.cpp with the VE backend enabled:
-
-```bash
-cd /path/to/llama.cpp
-cmake -B build -DGGML_VE=ON \
-    -DGGML_VE_VEDA_KERNELS_DIR=/path/to/ggml-ve-veda
+cd /path/to/ve_llama.cpp
+cmake -B build -DGGML_VE=ON
 cmake --build build -j8 --target llama-cli
 ```
 
-`GGML_VE_VEDA_KERNELS_DIR` tells the backend where to find `libve_sgemv.so` at runtime. If unset, it defaults to the build-time path and can be overridden later with `VE_SGEMV_PATH=...`.
+The build drives two toolchains under the hood:
+
+- **NCC** compiles the OMP-driven wrapper TUs (`ve_sgemv_wrapper.c`, `ve_kvcolmajor_wrapper.c`, `ve_kernels.c`). NCC understands NEC vector pragmas.
+- **LLVM-VE-RV** compiles the inner intrinsics TUs (`flash_attn_bf16_*.c`, `ve_sgemv_bf16.c`, `bf16_sgemm_intrinsics.c`, `sgemv_packed_bf16_unr.c`). NCC does not grok `velintrin.h`, so the BF16 hot paths need llvm-ve-rv's clang.
+
+Both toolchains ship with NEC's SDK at their canonical locations (`/opt/nec/ve/bin/ncc` and `/usr/local/ve/llvm-ve-rv-2.2.0/bin/clang`). If either is missing the kernel build is skipped with a configure-time warning; pass `-DGGML_VE_VEDA_KERNELS_DIR=<dir>` to consume prebuilt `.so` files instead.
 
 ### CMake Options
 
 | Option | Default | Description |
 |---|---|---|
 | `GGML_VE` | `OFF` | Compile the VE backend |
-| `GGML_VE_VEDA_KERNELS_DIR` | `~/claude_workspace/ggml-ve-veda` | Search path for `libve_sgemv.so` (compiled in as a default; overridable with `VE_SGEMV_PATH` at runtime) |
+| `GGML_VE_NCC` | `/opt/nec/ve/bin/ncc` | Path to NEC's NCC C compiler |
+| `GGML_VE_LLVM` | `/usr/local/ve/llvm-ve-rv-2.2.0/bin/clang` | Path to llvm-ve-rv's clang (for `velintrin.h`) |
+| `GGML_VE_NLC_LIB` | `/opt/nec/ve/nlc/3.1.0/lib` | NEC Numeric Library Collection lib dir (`cblas`, `blas_openmp`) |
+| `GGML_VE_VEDA_INCLUDE_DIR` | `/opt/nec/ve/share/veoffload-veda/include` | VEDA device headers |
+| `GGML_VE_VEDA_KERNELS_DIR` | _(unset)_ | Override: directory containing prebuilt `libve_sgemv.so` + `libve_kernels.so`. When set, the in-tree kernel build is bypassed. |
 
 ## Running
 
@@ -116,6 +115,8 @@ VE_NODE_NUMBER=0 ./build/bin/llama-cli \
 | `VE_KERNELS_PATH` | Override the path to `libve_kernels.so` (optional, K-quant kernels — not yet built) |
 | `GGML_VE_COMPILE_GRAPH=1` | Enable the JIT graph compiler (~20% decode speedup after warm cache) |
 | `GGML_VE_NO_COLMAJOR=1` | Disable the F32 col-major + CBLAS-NoTrans fast path for prompt eval (debug only) |
+| `GGML_VE_NO_KV_SHADOW=1` | Disable the column-major BF16 KV-cache shadow used by flash attention. The shadow mirrors freshly-written K/V rows into a unit-stride layout so the FA kernel reads along the seq axis without strided loads; disabling it falls back to the row-major path. |
+| `GGML_VE_COLMAJOR_FA_MIN=N` | Minimum `kv_len` at which the col-major FA path takes over (default `96`). Lower values pay the mirror cost on shorter contexts; higher values delay the speedup until the context is long enough to amortize it. |
 | `GGML_VE_DEBUG_DISPATCH=1` | Log the first 200 op dispatches with tensor / buffer info |
 | `GGML_VE_DEBUG_SYNC=1` | Log every deferred-sync flush |
 | `GGML_VE_DEBUG_KERNELS=1` | Log kernel-load failures at init |
@@ -124,14 +125,17 @@ VE_NODE_NUMBER=0 ./build/bin/llama-cli \
 
 ## Performance
 
-Reference numbers on a single VE 2.0 card, Llama-3.2-3B-Instruct BF16:
+Reference numbers on a single VE 2.0 card, Llama-3.2-3B-Instruct BF16 with `-fa on -ctk bf16 -ctv bf16`:
 
-| Configuration | Decode (tg) | Prompt eval (pp32) |
-|---|---|---|
-| `GGML_VE_HBM=1` (interpreter) | 14–20 t/s | ~60 t/s |
-| `GGML_VE_COMPILE_GRAPH=1` (JIT) | 25–35 t/s | ~75 t/s |
+| Configuration | n=100 | n=200 | n=400 | Prompt eval (pp15) |
+|---|---|---|---|---|
+| Row-major FA (`GGML_VE_NO_KV_SHADOW=1`) | 17.4 t/s | 12.8 t/s | 8.3 t/s | ~57 t/s |
+| Col-major FA shadow (default) | 28.7 t/s | 29.0 t/s | 28.8 t/s | ~57 t/s |
+| Col-major FA + `GGML_VE_COMPILE_GRAPH=1` | 28–35 t/s | 28–35 t/s | 28–35 t/s | ~75 t/s |
 
-For comparison, NEC's standalone `ve-llama2.c` reference (BF16 Llama-2-7B) achieves ~50 t/s. The gap to that number on this backend is mostly per-op kernel launch overhead, which the JIT graph compiler exists to close.
+The KV-shadow path flattens decode tok/s across `kv_len` because the FA inner loop now reads along the seq axis with unit stride instead of the row-major 2048-byte stride. Without it, per-token cost grows linearly with `kv_len`.
+
+For comparison, NEC's standalone `ve-llama2.c` reference (BF16 Llama-2-7B) achieves ~50 t/s. The remaining gap to that number on the larger model is dominated by MUL_MAT bandwidth (FA is no longer the bottleneck once the shadow is in play); the JIT graph compiler narrows it further by reducing per-op kernel launch overhead.
 
 ## Status & Known Limitations
 
