@@ -1169,7 +1169,9 @@ CompiledGraph * GraphCompiler::compile(const std::string & model_hash, int64_t n
 
     struct stat st;
     if (stat(so.c_str(), &st) == 0) {
-        fprintf(stderr, "[VE-GC] loading cached %s\n", so.c_str());
+        if (debug_enabled()) {
+            fprintf(stderr, "[VE-GC] loading cached %s\n", so.c_str());
+        }
         return load_compiled(so, model_hash);
     }
 

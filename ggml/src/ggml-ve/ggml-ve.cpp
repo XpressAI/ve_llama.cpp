@@ -81,14 +81,17 @@ void backend_free(ggml_backend_t backend) {
 // source and the same on-disk .so; they should hit the same in-memory
 // CompiledGraph too — otherwise we needlessly recompile per call.
 //
-// The previous version was a single slot keyed by op_count alone, which
-// collided across distinct cgraph shapes that happen to share node count
-// (e.g. Llama decode hands us a 6-node and a 23-node chunk per token —
-// the 23-node one was fine in isolation, but if any other 23-node
-// shape ever appeared we'd thrash). Decode of Llama-3.2-3B with
-// scheduler-split cgraphs averaged ~19 backend calls/token but only ~3
-// distinct signatures, so a small map is plenty.
-static thread_local std::unordered_map<uint64_t, gcomp::CompiledGraph *> g_cg_cache;
+// `executable` tracks whether execute() succeeded last time. Some cgraph
+// shapes (small GET_ROWS chunks, intermediate-source ops) trace + compile
+// fine but fail in execute (typically because a slot tensor has no HBM
+// backing). We KEEP the compiled handle anyway so we don't reload the
+// .so from disk every call — just skip the execute attempt next time
+// and fall through to the interpreter.
+struct cached_graph {
+    gcomp::CompiledGraph * cg         = nullptr;
+    bool                   executable = true;
+};
+static thread_local std::unordered_map<uint64_t, cached_graph> g_cg_cache;
 
 // 64-bit structural fingerprint over (op, dst_type, dst_ne, src_type, src_ne)
 // for every node. Same set of {op + shape + dtype} → same signature → same
@@ -212,28 +215,48 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     if (gcomp::GraphCompiler::enabled() && cgraph->n_nodes >= gc_min_nodes) {
         auto & gc = gcomp::get_compiler();
         const uint64_t sig = cgraph_signature(cgraph);
-        if (auto it = g_cg_cache.find(sig); it != g_cg_cache.end()) {
-            if (gc.execute(it->second, ctx, cgraph)) {
-                ctx->ops_total() += cgraph->n_nodes;
-                return GGML_STATUS_SUCCESS;
+        auto it = g_cg_cache.find(sig);
+        if (it != g_cg_cache.end()) {
+            // Known signature. Either we've executed it before (try again),
+            // or we've marked it un-executable (skip and fall through).
+            if (it->second.executable && it->second.cg) {
+                if (gc.execute(it->second.cg, ctx, cgraph)) {
+                    ctx->ops_total() += cgraph->n_nodes;
+                    return GGML_STATUS_SUCCESS;
+                }
+                // Execute regressed — remember and stop trying.
+                it->second.executable = false;
+                if (gc_verbose) {
+                    fprintf(stderr, "[VE-GC] execute failed for sig=%016lx — marked un-executable, falling back\n",
+                            (unsigned long) sig);
+                }
             }
-            // Execute failed — drop the entry and re-trace below.
-            g_cg_cache.erase(it);
-        }
-        if (gc.trace(cgraph)) {
-            // Use the signature as the model_hash so the on-disk .so
-            // filename is stable across runs of the same shape.
+            // executable==false: silently fall through to the interpreter.
+            // No .so reload, no recompile.
+        } else if (gc.trace(cgraph)) {
+            // First time we've seen this signature. Compile, try execute,
+            // store the result either way (so we don't re-trace/re-load
+            // every call for shapes that don't pan out).
             char hashbuf[32];
             std::snprintf(hashbuf, sizeof(hashbuf), "%016lx", (unsigned long) sig);
-            std::string model_hash = hashbuf;
-            gcomp::CompiledGraph * cg2 = gc.compile(model_hash, /*n_ctx=*/ 4096);
-            if (cg2 && gc.execute(cg2, ctx, cgraph)) {
-                g_cg_cache[sig] = cg2;
-                ctx->ops_total() += cgraph->n_nodes;
-                return GGML_STATUS_SUCCESS;
-            }
-            if (gc_verbose) {
-                fprintf(stderr, "[VE-GC] compile/execute failed; falling back to interpreter\n");
+            gcomp::CompiledGraph * cg2 = gc.compile(hashbuf, /*n_ctx=*/ 4096);
+            if (cg2) {
+                cached_graph entry;
+                entry.cg = cg2;
+                if (gc.execute(cg2, ctx, cgraph)) {
+                    entry.executable = true;
+                    g_cg_cache[sig] = entry;
+                    ctx->ops_total() += cgraph->n_nodes;
+                    return GGML_STATUS_SUCCESS;
+                }
+                entry.executable = false;
+                g_cg_cache[sig] = entry;
+                if (gc_verbose) {
+                    fprintf(stderr, "[VE-GC] compile ok but execute failed for sig=%016lx — cached as un-executable\n",
+                            (unsigned long) sig);
+                }
+            } else if (gc_verbose) {
+                fprintf(stderr, "[VE-GC] compile failed for sig=%016lx\n", (unsigned long) sig);
             }
         } else if (gc_verbose) {
             fprintf(stderr, "[VE-GC] trace rejected the graph; interpreter\n");
