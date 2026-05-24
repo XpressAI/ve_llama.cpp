@@ -342,7 +342,10 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
         const char * env = std::getenv("GGML_VE_COMPILE_MIN_NODES");
         return env ? std::atoi(env) : 1;
     }();
-    static const bool gc_verbose = (std::getenv("GGML_VE_COMPILE_DEBUG") != nullptr);
+    static const bool gc_verbose = []() {
+        const char * env = std::getenv("GGML_VE_COMPILE_DEBUG");
+        return !(env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0);
+    }();
     if (gc_verbose) {
         fprintf(stderr, "[VE-GC] graph_compute called n_nodes=%d (min=%d)\n",
                 cgraph->n_nodes, gc_min_nodes);

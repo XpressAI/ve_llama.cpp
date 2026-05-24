@@ -54,7 +54,10 @@ bool name_contains(const std::string & name, const char * needle) {
 
 bool debug_enabled() {
     static int v = -1;
-    if (v < 0) v = (std::getenv("GGML_VE_COMPILE_DEBUG") != nullptr) ? 1 : 0;
+    if (v < 0) {
+        const char * env = std::getenv("GGML_VE_COMPILE_DEBUG");
+        v = (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0) ? 0 : 1;
+    }
     return v != 0;
 }
 
@@ -66,7 +69,13 @@ bool debug_enabled() {
 bool GraphCompiler::enabled() {
     static int v = -1;
     if (v < 0) {
-        v = (std::getenv("GGML_VE_COMPILE_GRAPH") != nullptr) ? 1 : 0;
+        // Accept `=0`, empty, or unset as off; any other value as on.
+        // The earlier check (and the legacy backend's, at
+        // llama.cpp/ggml/src/ggml-ve/ggml-ve.cpp:9527) treated bare
+        // presence as on, so `GGML_VE_COMPILE_GRAPH=0` actually enabled
+        // the compiler — surprising and not user-expected.
+        const char * env = std::getenv("GGML_VE_COMPILE_GRAPH");
+        v = (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0) ? 0 : 1;
         if (v) {
             fprintf(stderr, "[VE-GC] graph compilation ENABLED\n");
         }
