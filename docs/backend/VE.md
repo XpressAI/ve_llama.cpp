@@ -115,7 +115,7 @@ VE_NODE_NUMBER=0 ./build/bin/llama-cli \
 | `VE_KERNELS_PATH` | Override the path to `libve_kernels.so` (optional, K-quant kernels — not yet built) |
 | `GGML_VE_COMPILE_GRAPH=1` | Enable the JIT graph compiler (~20% decode speedup after warm cache) |
 | `GGML_VE_NO_COLMAJOR=1` | Disable the F32 col-major + CBLAS-NoTrans fast path for prompt eval (debug only) |
-| `GGML_VE_NO_KV_SHADOW=1` | Disable the column-major BF16 KV-cache shadow used by flash attention. The shadow mirrors freshly-written K/V rows into a unit-stride layout so the FA kernel reads along the seq axis without strided loads; disabling it falls back to the row-major path. |
+| `GGML_VE_NO_KV_SHADOW=1` | Disable the column-major BF16 KV-cache shadow used by flash attention (debug only — the shadow is a strict win in normal use; the knob exists as a bisection lever in case a model exposes a correctness regression on the col-major path). |
 | `GGML_VE_COLMAJOR_FA_MIN=N` | Minimum `kv_len` at which the col-major FA path takes over (default `96`). Lower values pay the mirror cost on shorter contexts; higher values delay the speedup until the context is long enough to amortize it. |
 | `GGML_VE_DEBUG_DISPATCH=1` | Log the first 200 op dispatches with tensor / buffer info |
 | `GGML_VE_DEBUG_SYNC=1` | Log every deferred-sync flush |
