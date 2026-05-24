@@ -99,24 +99,51 @@ struct cached_graph {
 static std::mutex                                       g_cg_cache_mu;
 static std::unordered_map<uint64_t, cached_graph>       g_cg_cache;
 
-// 64-bit structural fingerprint over (op, dst_type, dst_ne, src_type, src_ne)
-// for every node. Same set of {op + shape + dtype} → same signature → same
-// generated source. Cheap: ~6 hashes per node × n_nodes nodes.
+// True for the KV cache tensors and the attention mask. The growing
+// dimensions of these tensors (the seq dim and, for mask, the masked-kv
+// dim) change mid-decode as ggml's allocator expands the KV view in
+// power-of-2 chunks. The compiled kernel takes the actual sequence
+// length from the runtime `pos` arg and doesn't care about the view's
+// per-call shape, so excluding those dims keeps a single .so reusable
+// across all decode steps in a session.
+static bool is_kv_or_mask_tensor(const ggml_tensor * t) {
+    if (!t || !t->name) return false;
+    const char * n = t->name;
+    return std::strncmp(n, "cache_k", 7) == 0
+        || std::strncmp(n, "cache_v", 7) == 0
+        || std::strncmp(n, "attn_inp_kq_mask", 16) == 0;
+}
+
+// 64-bit structural fingerprint. Hashes everything that affects
+// generated source. Treats KV-cache and mask tensors as if their
+// growing dimensions are wildcards — see is_kv_or_mask_tensor above.
 static uint64_t cgraph_signature(const ggml_cgraph * g) {
     std::hash<uint64_t> H;
     uint64_t h = 0xcbf29ce484222325ULL;  // FNV offset basis
     auto mix = [&](uint64_t v) { h ^= H(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+    auto mix_tensor = [&](const ggml_tensor * t, int slot) {
+        if (t == nullptr) { mix(0); return; }
+        mix((uint64_t) t->type | (uint64_t)(slot + 1) << 32);
+        const bool wild = is_kv_or_mask_tensor(t);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            // Hash ne[0] always (head_dim / embed_dim — stable per model).
+            // For KV / mask tensors skip ne[1..2] (the seq + mask dims
+            // that grow as KV occupancy crosses power-of-2 chunk
+            // boundaries); ne[3] back in since batch is meaningful.
+            if (wild && (d == 1 || d == 2)) {
+                mix((uint64_t) 0xFFFFFFFFFFFFFFFFULL);  // wildcard marker
+            } else {
+                mix((uint64_t) t->ne[d]);
+            }
+        }
+    };
     mix((uint64_t) g->n_nodes);
     for (int i = 0; i < g->n_nodes; ++i) {
         const ggml_tensor * n = g->nodes[i];
         mix((uint64_t) n->op);
-        mix((uint64_t) n->type);
-        for (int d = 0; d < GGML_MAX_DIMS; ++d) mix((uint64_t) n->ne[d]);
+        mix_tensor(n, /*slot=*/-1);
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            const ggml_tensor * src = n->src[s];
-            if (src == nullptr) { mix(0); continue; }
-            mix((uint64_t) src->type | (uint64_t)(s + 1) << 32);
-            for (int d = 0; d < GGML_MAX_DIMS; ++d) mix((uint64_t) src->ne[d]);
+            mix_tensor(n->src[s], s);
         }
     }
     return h;
