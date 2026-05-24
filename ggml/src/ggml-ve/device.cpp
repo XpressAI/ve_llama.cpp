@@ -1,5 +1,6 @@
 #include "device.hpp"
 #include "colmajor_cache.hpp"
+#include "kv_shadow_cache.hpp"
 
 #include <array>
 #include <cstdlib>
@@ -166,6 +167,9 @@ const kernel_meta & meta(kernel_id id) {
         /* K_MUL_MAT_ID_BF16_F32_HBM_FULL             */ { "ve_mul_mat_id_bf16_f32_hbm_full",          KMOD_SGEMV  },
         /* K_ADD_ID_F32_HMEM                          */ { "ve_add_id_f32_hmem",                       KMOD_SGEMV  },
         /* K_ADD_ID_F32_HBM_FULL                      */ { "ve_add_id_f32_hbm_full",                   KMOD_SGEMV  },
+
+        /* K_FLASH_ATTN_EXT_F32Q_BF16KV_COLMAJOR_HBM  */ { "ve_flash_attn_ext_f32q_bf16kv_colmajor_hbm", KMOD_SGEMV },
+        /* K_KVCACHE_MIRROR_TO_COLMAJOR_HBM           */ { "ve_kvcache_mirror_to_colmajor_hbm",        KMOD_SGEMV  },
     };
     return table[id];
 }
@@ -263,6 +267,8 @@ void init_one_device(int i) {
                   i, dev.name, total_mem / (1024.0 * 1024.0 * 1024.0));
     dev.colmajor = new colmajor_weight_cache();
     dev.colmajor->set_context(dev.context);
+    dev.kv_shadow = new kv_shadow_cache();
+    dev.kv_shadow->set_context(dev.context);
     dev.initialized = true;
 }
 

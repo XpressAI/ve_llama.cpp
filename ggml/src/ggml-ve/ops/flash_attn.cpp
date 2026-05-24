@@ -19,14 +19,163 @@
 
 #include "../backend_ctx.hpp"
 #include "../device.hpp"
+#include "../kv_shadow_cache.hpp"
 #include "../ops.hpp"
 
 #include "ggml.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace ggml_ve {
 namespace ops {
+
+/* ------------------------------------------------------------------ *
+ * Stage 3: column-major shadow KV cache fast path.
+ *
+ * Pre-conditions checked here (above and beyond flash_attn_supports):
+ *   - Q F32, K/V BF16 (col-major shadow is only built for BF16 caches).
+ *   - Single-token decode (q->ne[1] == 1). Multi-token prefill writes
+ *     don't go through the per-row mirror hook, so the shadow watermark
+ *     can't catch up in one step — those keep using row-major FA.
+ *   - kv_len >= GGML_VE_COLMAJOR_FA_MIN (default 96 — Stage 1 crossover).
+ *   - Mask F16, no head/batch broadcast (ne[2] == ne[3] == 1).
+ *   - Q and dst are contiguous in (head_dim, head)-major order so the
+ *     kernel's `q + h*head_dim` indexing matches reality.
+ *   - The shadow exists for both K and V canonical tensors, and the
+ *     watermark covers [0, kv_len). If not, fall back to the row-major
+ *     path (it'll get rebuilt on the next SET_ROWS). */
+static bool try_flash_attn_colmajor(backend_context * ctx, ggml_tensor * dst) {
+    static const bool enabled = std::getenv("GGML_VE_NO_KV_SHADOW") == nullptr;
+    if (!enabled) return false;
+
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_BF16 || v->type != GGML_TYPE_BF16) {
+        return false;
+    }
+    if (q->ne[1] != 1) return false;
+    if (mask == nullptr || mask->type != GGML_TYPE_F16) return false;
+    if (mask->ne[2] != 1 || mask->ne[3] != 1)            return false;
+
+    static const int colmajor_min = []() {
+        const char * e = std::getenv("GGML_VE_COLMAJOR_FA_MIN");
+        return e ? std::atoi(e) : 96;
+    }();
+    const int64_t kv_len = k->ne[1];
+    if (kv_len < (int64_t) colmajor_min) return false;
+
+    VEDAfunction fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_COLMAJOR_HBM);
+    if (fn == 0) return false;
+
+    if (!ctx->dev() || !ctx->dev()->kv_shadow) return false;
+    auto * shadows = ctx->dev()->kv_shadow;
+
+    /* Walk view_src chain to the bottom-most tensor — for permuted KV
+     * views ("cache_k_l0 (view) (permuted)") the immediate view_src is
+     * the permutation; the actual KV cache canonical is one or more
+     * levels down. */
+    const ggml_tensor * k_canon = k;
+    while (k_canon->view_src) k_canon = k_canon->view_src;
+    const ggml_tensor * v_canon = v;
+    while (v_canon->view_src) v_canon = v_canon->view_src;
+    if (!tensor_is_hbm(k_canon) || !tensor_is_hbm(v_canon)) return false;
+
+    kv_shadow * k_sh = shadows->find(tensor_hbm_ptr(k_canon));
+    kv_shadow * v_sh = shadows->find(tensor_hbm_ptr(v_canon));
+    if (!shadows->valid_for_range(k_sh, kv_len)) return false;
+    if (!shadows->valid_for_range(v_sh, kv_len)) return false;
+
+    const uint64_t head_dim   = (uint64_t) q->ne[0];
+    const uint64_t n_q_heads  = (uint64_t) q->ne[2];
+    const uint64_t n_kv_heads = (uint64_t) k->ne[2];
+
+    /* The shadow's channels axis must agree with [head_dim * n_kv_heads]
+     * to be safely reinterpretable as [n_kv_heads][head_dim][seq_max]. */
+    if (k_sh->channels != (int64_t) (head_dim * n_kv_heads)) return false;
+    if (v_sh->channels != (int64_t) (head_dim * n_kv_heads)) return false;
+
+    /* Q is [head_dim, N=1, n_q_heads, batch] so per-head stride = nb[2].
+     * dst is [head_dim, n_q_heads, N=1, batch] (note dims 1 and 2 are
+     * swapped vs Q) so per-head stride = nb[1]. The kernel needs both
+     * head strides as bytes so it can index q + h*q_hstride and
+     * out + h*out_hstride correctly. */
+    if (dst->ne[0] != q->ne[0])  return false;
+    if (dst->ne[1] != q->ne[2])  return false;
+    if (q->nb[0]   != sizeof(float) || dst->nb[0] != sizeof(float)) return false;
+    if (q->nb[2]   % sizeof(float) != 0)                            return false;
+    if (dst->nb[1] % sizeof(float) != 0)                            return false;
+
+    const VEDAdeviceptr q_hbm   = ctx->resolve_in(q);
+    const VEDAdeviceptr dst_hbm = ctx->resolve_out(dst);
+    if (q_hbm == 0 || dst_hbm == 0) return false;
+
+    /* Stage mask the same way the row-major dispatch does. */
+    const size_t mask_bytes = ggml_nbytes(mask);
+    VEDAhmemptr mask_hmem = ctx->pool().acquire(mask_bytes);
+    if (mask_hmem == 0) return false;
+    VEDAresult mask_err;
+    if (tensor_is_hbm(mask)) {
+        mask_err = vedaHMemcpyDtoX(reinterpret_cast<void *>(mask_hmem),
+                                    tensor_hbm_ptr(mask), mask_bytes);
+    } else if (mask->data != nullptr) {
+        mask_err = vedaHMemcpy(reinterpret_cast<void *>(mask_hmem),
+                               mask->data, mask_bytes);
+    } else {
+        ctx->pool().release(mask_hmem);
+        return false;
+    }
+    if (!ggml_ve_ok(mask_err, "vedaHMemcpy (flash_attn_colmajor mask)")) {
+        ctx->pool().release(mask_hmem);
+        return false;
+    }
+
+    float scale = 0.0f;
+    std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    uint64_t scale_bits = 0;
+    std::memcpy(&scale_bits, &scale, sizeof(float));
+    /* max_bias / softcap are already verified zero by flash_attn_supports,
+     * so the kernel's slope param is just the identity. */
+    const float    slope_f = 1.0f;
+    uint64_t slope_bits = 0;
+    std::memcpy(&slope_bits, &slope_f, sizeof(float));
+
+    VEDAargs args = nullptr;
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(flash_attn_colmajor)")) {
+        ctx->pool().release(mask_hmem);
+        return false;
+    }
+    vedaArgsSetVPtr(args,  0, dst_hbm);
+    vedaArgsSetVPtr(args,  1, q_hbm);
+    vedaArgsSetVPtr(args,  2, k_sh->shadow_hbm);
+    vedaArgsSetVPtr(args,  3, v_sh->shadow_hbm);
+    vedaArgsSetHMEM(args,  4, mask_hmem);
+    vedaArgsSetU64 (args,  5, head_dim);
+    vedaArgsSetU64 (args,  6, n_q_heads);
+    vedaArgsSetU64 (args,  7, n_kv_heads);
+    vedaArgsSetU64 (args,  8, (uint64_t) kv_len);
+    vedaArgsSetU64 (args,  9, (uint64_t) k_sh->seq_max);
+    vedaArgsSetU64 (args, 10, (uint64_t) q->nb[2]);    /* Q per-head stride: heads are dim 2 */
+    vedaArgsSetU64 (args, 11, (uint64_t) dst->nb[1]);  /* dst per-head stride: heads are dim 1 */
+    vedaArgsSetU64 (args, 12, scale_bits);
+    vedaArgsSetU64 (args, 13, slope_bits);
+
+    uint64_t result = 0;
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+                    "vedaLaunchKernelEx(flash_attn_colmajor)")) {
+        ctx->pool().release(mask_hmem);
+        return false;
+    }
+
+    ctx->enqueue_input(mask_hmem);
+    ctx->mark_sync_pending();
+    ctx->ops_flash_attn()++;
+    ctx->ops_hbm()++;
+    return true;
+}
 
 bool flash_attn_supports(const ggml_tensor * op) {
     static const bool dbg = std::getenv("GGML_VE_DEBUG_FA") != nullptr;
@@ -76,6 +225,11 @@ bool flash_attn_supports(const ggml_tensor * op) {
 
 bool flash_attn(backend_context * ctx, ggml_tensor * dst) {
     if (!flash_attn_supports(dst)) return false;
+
+    /* Try the column-major shadow path first. Falls through if any gate
+     * fails (e.g. shadow not yet warm, multi-token decode, kv_len small). */
+    if (try_flash_attn_colmajor(ctx, dst)) return true;
+
     const ggml_tensor * q    = dst->src[0];
     const ggml_tensor * k    = dst->src[1];
     const ggml_tensor * v    = dst->src[2];

@@ -156,6 +156,14 @@ enum kernel_id {
     K_ADD_ID_F32_HMEM,
     K_ADD_ID_F32_HBM_FULL,
 
+    /* Column-major KV cache fast path (Stage 3). FA reads from a
+     * persistent BF16 col-major shadow we maintain alongside the
+     * standard cache; mirror kernel writes each new row to that shadow
+     * after every SET_ROWS. Append-only at the end of the enum so old
+     * cached .so files keep loading correctly. */
+    K_FLASH_ATTN_EXT_F32Q_BF16KV_COLMAJOR_HBM,
+    K_KVCACHE_MIRROR_TO_COLMAJOR_HBM,
+
     K_COUNT,
 };
 
@@ -173,6 +181,8 @@ kernel_module kernel_owner(kernel_id id);
 
 // Forward decl: defined in colmajor_cache.hpp
 class colmajor_weight_cache;
+// Forward decl: defined in kv_shadow_cache.hpp
+class kv_shadow_cache;
 
 struct device {
     int          ve_device   = 0;     // VE device ID (0..3 on a 4-card system)
@@ -198,6 +208,12 @@ struct device {
     // weight tensor for the entire process lifetime. Lazily heap-allocated
     // in init_devices_once() to keep this header free of the cache impl.
     colmajor_weight_cache * colmajor = nullptr;
+
+    // Column-major shadow of the BF16 KV cache (Stage 3 colmajor FA).
+    // One shadow per cache_k_lN / cache_v_lN tensor, keyed by HBM addr.
+    // Populated lazily on first SET_ROWS mirror; FA reads it when the
+    // watermark covers the requested seq_len.
+    kv_shadow_cache *       kv_shadow = nullptr;
 
     // Convenience accessor with bounds check.
     VEDAfunction fn(kernel_id id) const {
