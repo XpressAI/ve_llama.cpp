@@ -117,4 +117,5 @@ With `GGML_VE_COMPILE_GRAPH=1`, decode improves by an additional 15–25% once t
 ## References
 
 - [SX-Aurora TSUBASA architecture overview](https://www.nec.com/en/global/solutions/hpc/sx/index.html)
-- [`ve-llama2.c`](https://github.com/efocht/ve-llama2.c) — NEC engineer's standalone BF16 Llama-2 port; the inspiration for the BF16 matvec implementation used here.
+- [`SX-Aurora/ve-llama2.c`](https://github.com/SX-Aurora/ve-llama2.c) — standalone BF16 Llama-2 port for the Vector Engine; the inspiration for the BF16 matvec implementation used here.
+- [Llama 2 on Vector Engine — BF16](https://sx-aurora.github.io/posts/Llama2-on-VE-bf16/) — blog post walking through the packed-FP32 BF16 trick the BF16 path is built on.
