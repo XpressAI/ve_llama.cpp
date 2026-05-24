@@ -1264,21 +1264,6 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         // pure metadata tensor with no buffer/data, the slot stays 0.
         const ggml_tensor * src_for_addr = raw->data ? raw : c;
         VEDAdeviceptr hbm = hbm_ptr_for_tensor(src_for_addr);
-        // If the tensor isn't already on VE_HBM and the slot is a WEIGHT,
-        // fall back to the backend's host->HBM upload cache — same path
-        // the interpreter uses for CPU-mapped weights (mostly the
-        // embedding table, which the GGUF loader leaves mmap'd until
-        // first touch). Without this the very first cgraph in any decode
-        // (GET_ROWS on the embedding table) fails the NULL-slot check
-        // and falls back to interpreter even though the compiler could
-        // run it.
-        if (hbm == 0
-            && bctx != nullptr
-            && (size_t) slot_pos < (size_t) graph->num_slots
-            && graph->slot_kinds[slot_pos] == BufferKind::WEIGHT
-            && src_for_addr->data != nullptr) {
-            hbm = bctx->resolve_in(src_for_addr);
-        }
         tptrs[slot_pos++] = hbm;
     };
 
