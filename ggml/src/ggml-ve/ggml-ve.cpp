@@ -27,7 +27,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <functional>
 #include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,14 +75,43 @@ void backend_free(ggml_backend_t backend) {
     delete backend;
 }
 
-// Graph-compiler state: one CompiledGraph per backend thread. We compile on
-// the first compute and re-use as long as op-count matches. If the shape
-// changes we drop the cached compiled graph and re-trace next call.
-struct compiled_graph_state {
-    gcomp::CompiledGraph * compiled = nullptr;
-    int                    op_count = -1;
-};
-static thread_local compiled_graph_state g_cg_state;
+// In-memory cache of compiled graphs, keyed by a structural signature of
+// the cgraph (op + dst dtype + dst shape + per-src dtype + per-src shape
+// over every node). Two cgraphs with the same signature generate the same
+// source and the same on-disk .so; they should hit the same in-memory
+// CompiledGraph too — otherwise we needlessly recompile per call.
+//
+// The previous version was a single slot keyed by op_count alone, which
+// collided across distinct cgraph shapes that happen to share node count
+// (e.g. Llama decode hands us a 6-node and a 23-node chunk per token —
+// the 23-node one was fine in isolation, but if any other 23-node
+// shape ever appeared we'd thrash). Decode of Llama-3.2-3B with
+// scheduler-split cgraphs averaged ~19 backend calls/token but only ~3
+// distinct signatures, so a small map is plenty.
+static thread_local std::unordered_map<uint64_t, gcomp::CompiledGraph *> g_cg_cache;
+
+// 64-bit structural fingerprint over (op, dst_type, dst_ne, src_type, src_ne)
+// for every node. Same set of {op + shape + dtype} → same signature → same
+// generated source. Cheap: ~6 hashes per node × n_nodes nodes.
+static uint64_t cgraph_signature(const ggml_cgraph * g) {
+    std::hash<uint64_t> H;
+    uint64_t h = 0xcbf29ce484222325ULL;  // FNV offset basis
+    auto mix = [&](uint64_t v) { h ^= H(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+    mix((uint64_t) g->n_nodes);
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * n = g->nodes[i];
+        mix((uint64_t) n->op);
+        mix((uint64_t) n->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) mix((uint64_t) n->ne[d]);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) { mix(0); continue; }
+            mix((uint64_t) src->type | (uint64_t)(s + 1) << 32);
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) mix((uint64_t) src->ne[d]);
+        }
+    }
+    return h;
+}
 
 ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * ctx = (backend_context *) backend->context;
@@ -161,15 +194,15 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     }
 
     // --- Compiled-graph fast path (opt-in via GGML_VE_COMPILE_GRAPH=1) ----
-    // Only attempt graph compilation for "real" decode graphs (>= this
-    // many nodes). With the CPU-buffer claim in dev_supports_buft, a
-    // Llama-3.2-3B decode arrives as one ~400-node graph instead of
-    // ~56 fragments, so the threshold can be relatively high; matching
-    // the legacy port's 100 keeps warmup/probe graphs on the
-    // interpreter (cheap, no ncc roundtrip).
+    // No node-count threshold by default. ncc compile is ~30 s per unique
+    // cgraph signature, but a per-token decode chunk repeats ~50× per
+    // second — even a 6-node chunk amortises in under a minute. The
+    // previous default of 100 prevented the compiler from ever engaging
+    // on Llama-class decode, where the scheduler hands us 6- and 23-node
+    // chunks. Set GGML_VE_COMPILE_MIN_NODES=N to override.
     static const int gc_min_nodes = []{
         const char * env = std::getenv("GGML_VE_COMPILE_MIN_NODES");
-        return env ? std::atoi(env) : 100;
+        return env ? std::atoi(env) : 1;
     }();
     static const bool gc_verbose = (std::getenv("GGML_VE_COMPILE_DEBUG") != nullptr);
     if (gc_verbose) {
@@ -178,20 +211,24 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     }
     if (gcomp::GraphCompiler::enabled() && cgraph->n_nodes >= gc_min_nodes) {
         auto & gc = gcomp::get_compiler();
-        if (g_cg_state.compiled && g_cg_state.op_count == cgraph->n_nodes) {
-            if (gc.execute(g_cg_state.compiled, ctx, cgraph)) {
+        const uint64_t sig = cgraph_signature(cgraph);
+        if (auto it = g_cg_cache.find(sig); it != g_cg_cache.end()) {
+            if (gc.execute(it->second, ctx, cgraph)) {
                 ctx->ops_total() += cgraph->n_nodes;
                 return GGML_STATUS_SUCCESS;
             }
-            g_cg_state.compiled = nullptr;
-            g_cg_state.op_count = -1;
+            // Execute failed — drop the entry and re-trace below.
+            g_cg_cache.erase(it);
         }
         if (gc.trace(cgraph)) {
-            std::string model_hash = "n" + std::to_string(cgraph->n_nodes);
+            // Use the signature as the model_hash so the on-disk .so
+            // filename is stable across runs of the same shape.
+            char hashbuf[32];
+            std::snprintf(hashbuf, sizeof(hashbuf), "%016lx", (unsigned long) sig);
+            std::string model_hash = hashbuf;
             gcomp::CompiledGraph * cg2 = gc.compile(model_hash, /*n_ctx=*/ 4096);
             if (cg2 && gc.execute(cg2, ctx, cgraph)) {
-                g_cg_state.compiled = cg2;
-                g_cg_state.op_count = cgraph->n_nodes;
+                g_cg_cache[sig] = cg2;
                 ctx->ops_total() += cgraph->n_nodes;
                 return GGML_STATUS_SUCCESS;
             }
@@ -212,8 +249,17 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
         }
         ctx->ops_total()++;
     }
-    // Single sync at the end of the graph — see kb/bugs-lessons/deferred-sync.md.
-    ctx->flush("backend_graph_compute");
+    // Do NOT flush here. ggml's scheduler invokes the .synchronize hook
+    // (backend_synchronize, below) at boundaries where the host actually
+    // needs to read VE-side state (e.g. when handing logits back to CPU
+    // for sampling, or before a tensor transitions to another backend).
+    // The legacy ve_llama backend's graph_compute also doesn't flush —
+    // syncing here forces a vedaCtxSynchronize per cgraph chunk, and on
+    // models where the scheduler hands us many small chunks per token
+    // (Llama-3-class: ~19 chunks/token vs legacy's 1) the per-chunk sync
+    // becomes the dominant overhead. Measured ~3x decode regression vs
+    // legacy. Trust the scheduler — anything that legitimately needs to
+    // be sync'd will route through backend_synchronize.
 
     if (time_enabled) {
         auto end = std::chrono::steady_clock::now();
