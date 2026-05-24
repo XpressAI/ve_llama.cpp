@@ -117,6 +117,14 @@ static bool is_kv_or_mask_tensor(const ggml_tensor * t) {
 // 64-bit structural fingerprint. Hashes everything that affects
 // generated source. Treats KV-cache and mask tensors as if their
 // growing dimensions are wildcards — see is_kv_or_mask_tensor above.
+//
+// Note vs the legacy backend's compute_model_fingerprint (first 4
+// MUL_MAT weight dims + n_nodes only): legacy could get away with a
+// model-level fingerprint because it received one big cgraph per
+// token. Upstream's current scheduler hands us several small
+// cgraphs per token (6, 23, 853 nodes on Llama-class decode), and
+// they have genuinely distinct shapes, so we need per-cgraph-shape
+// granularity. Hence the broader hash.
 static uint64_t cgraph_signature(const ggml_cgraph * g) {
     std::hash<uint64_t> H;
     uint64_t h = 0xcbf29ce484222325ULL;  // FNV offset basis
