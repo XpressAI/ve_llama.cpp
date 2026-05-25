@@ -147,9 +147,10 @@ public:
     // Trace a whole cgraph. Returns false if any op is unsupported.
     bool trace(ggml_cgraph * cgraph);
 
-    // Compile the traced graph. model_hash distinguishes between different
-    // models / configurations; n_ctx is part of the cache key.
-    CompiledGraph * compile(const std::string & model_hash, int64_t n_ctx);
+    // Compile the traced graph. The on-disk cache key is the hash of
+    // the emitted source itself, so two cgraphs that produce identical
+    // code share a single .so.
+    CompiledGraph * compile(int64_t n_ctx);
 
     // Execute a previously-compiled graph for the current cgraph.
     // - resolves weight HBM pointers via name lookup from current_graph

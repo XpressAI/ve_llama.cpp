@@ -1197,31 +1197,41 @@ CompiledGraph * GraphCompiler::load_compiled(const std::string & so_path, const 
     return cg;
 }
 
-CompiledGraph * GraphCompiler::compile(const std::string & model_hash, int64_t n_ctx) {
+CompiledGraph * GraphCompiler::compile(int64_t n_ctx) {
     if (traced_ops_.empty() || !trace_valid_) return nullptr;
 
-    std::string func_name = "ve_graph_run_" + model_hash;
-    std::string source    = generate_source(func_name, n_ctx);
-    std::string hash      = compute_hash(source);
+    // Emit with a fixed placeholder so the hash captures the graph
+    // structure, not any caller-supplied namespace token. Earlier
+    // revisions hashed source that already contained the cgraph
+    // signature in the function name, which meant two cgraphs with
+    // different signatures but identical bodies generated two
+    // separate .so files and forced redundant NCC compiles.
+    static const std::string placeholder = "ve_graph_run_PLACEHOLDER";
+    std::string source = generate_source(placeholder, n_ctx);
+    std::string hash   = compute_hash(source);
+
+    // Substitute the real, hash-derived function name into the source
+    // before handing it off to NCC. The symbol name in the .so must
+    // match what load_compiled() looks up.
+    std::string func_name = "ve_graph_run_" + hash;
+    size_t      pos       = source.find(placeholder);
+    if (pos != std::string::npos) {
+        source.replace(pos, placeholder.size(), func_name);
+    }
 
     std::string dir = cache_dir();
-    // Per-source .so: many cgraphs share n_nodes (every attention block of
-    // every layer hits n=30) but emit different code. Keying only by
-    // n_nodes had them clobber each other's .so on disk and force a fresh
-    // NCC compile per layer, per call.
-    std::string so  = dir + "/graph_" + model_hash + "_ctx"
-                    + std::to_string(n_ctx) + "_" + hash + ".so";
+    std::string so  = dir + "/graph_" + hash + ".so";
 
     struct stat st;
     if (stat(so.c_str(), &st) == 0) {
         if (debug_enabled()) {
             fprintf(stderr, "[VE-GC] loading cached %s\n", so.c_str());
         }
-        return load_compiled(so, model_hash);
+        return load_compiled(so, hash);
     }
 
     if (!compile_source(source, so)) return nullptr;
-    return load_compiled(so, model_hash);
+    return load_compiled(so, hash);
 }
 
 // -------------------------------------------------------------------------

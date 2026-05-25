@@ -402,9 +402,7 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
             bool traced = gc.trace(cgraph);
             cached_graph new_entry;  // cg=null, executable=true by default
             if (traced) {
-                char hashbuf[32];
-                std::snprintf(hashbuf, sizeof(hashbuf), "%016lx", (unsigned long) sig);
-                gcomp::CompiledGraph * cg2 = gc.compile(hashbuf, /*n_ctx=*/ 4096);
+                gcomp::CompiledGraph * cg2 = gc.compile(/*n_ctx=*/ 4096);
                 if (cg2) {
                     new_entry.cg         = cg2;
                     new_entry.executable = gc.execute(cg2, ctx, cgraph);
