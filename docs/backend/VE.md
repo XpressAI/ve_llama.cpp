@@ -91,7 +91,7 @@ If you have multiple VE cards, set `VE_NODE_NUMBER` to the card index you want (
 | Variable                       | Purpose                                              |
 | ------------------------------ | ---------------------------------------------------- |
 | `VE_NODE_NUMBER=N`             | Select which VE card to use (NEC SDK convention).    |
-| `GGML_VE_COMPILE_GRAPH=1`      | Enable the JIT graph compiler. First-token latency increases on a cold cache; subsequent tokens get ~20% faster. The compiled graphs are cached on disk so the cold cost is paid only once per shape. |
+| `GGML_VE_COMPILE_GRAPH=1`      | Enable the JIT graph compiler. First-token latency increases on a cold cache; subsequent tokens get ~20% faster. Compiled graphs are cached at `$HOME/.cache/ggml-ve-compiled/` (or `/tmp/.cache/ggml-ve-compiled/` if `$HOME` is unset), one `.so` file per unique graph shape. Safe to delete to force a recompile. |
 | `VE_SGEMV_PATH=/path/to/libve_sgemv.so` | Override the location of the kernel library at runtime. |
 
 ## Performance
