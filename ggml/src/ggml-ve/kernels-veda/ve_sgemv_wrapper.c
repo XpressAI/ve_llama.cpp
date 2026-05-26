@@ -6716,36 +6716,26 @@ uint64_t ve_set_rows_f16_hbm_full(VEDAdeviceptr dst_hbm,
  */
 uint64_t ve_set_rows_bf16_hbm_full(VEDAdeviceptr dst_hbm,
                                     VEDAdeviceptr src_hbm,
-                                    void* idx_ptr,
+                                    VEDAdeviceptr idx_hbm,
                                     uint64_t nc,
                                     uint64_t nr,
                                     uint64_t nb_dst,
                                     uint64_t nb_src) {
     char* dst;
     char* src;
+    const int32_t* idx;
     VEDAresult err;
-    
-    /* Debug: print RAW and CONVERTED pointers - disabled for production */
-#if 0
-    static int set_rows_full_debug = 0;
-    set_rows_full_debug++;
-    int is_layer23_v = (dst_hbm >= 0x4000b00000ULL && dst_hbm <= 0x4000c00000ULL);
-    if (set_rows_full_debug <= 10 || is_layer23_v) {
-        fprintf(stderr, "[SET_ROWS_FULL-RAW] dst_hbm=0x%llx src_hbm=0x%llx nr=%llu nc=%llu%s\n",
-                (unsigned long long)dst_hbm, (unsigned long long)src_hbm,
-                (unsigned long long)nr, (unsigned long long)nc,
-                is_layer23_v ? " [L23?]" : "");
-    }
-#endif
+
     int is_layer23_v = 0;  /* Disabled */
-    
+
     err = vedaMemPtr((void**)&dst, dst_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
+
     err = vedaMemPtr((void**)&src, src_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
-    const int32_t* idx = (const int32_t*)idx_ptr;
+
+    err = vedaMemPtr((void**)&idx, idx_hbm);
+    if (err != VEDA_SUCCESS) return err;
     int rows = (int)nr;
     int cols = (int)nc;
     
