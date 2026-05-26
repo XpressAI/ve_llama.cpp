@@ -1555,14 +1555,15 @@ uint64_t ve_soft_max_f32_hmem(void* y_hmem,
  * NOTE: When passed via vedaArgsSetHMEM(), HMEM pointers are already converted
  * to raw VE-accessible pointers. Do NOT call vedaHMemPtr()!
  */
-uint64_t ve_soft_max_f32_omp_hmem(void* y_hmem,
-                                   void* x_hmem,
+uint64_t ve_soft_max_f32_omp_hmem(VEDAdeviceptr y_hbm,
+                                   VEDAdeviceptr x_hbm,
                                    uint64_t ne00,    /* elements per row (softmax dim) */
                                    uint64_t ne01,    /* number of rows to process */
                                    uint64_t scale_bits) {
-    /* HMEM pointers are already converted - use directly */
-    float* y = (float*)y_hmem;
-    float* x = (float*)x_hmem;
+    float* y;
+    float* x;
+    if (vedaMemPtr((void**)&y, y_hbm) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_hbm) != 0) return 2;
     
     /* Reinterpret scale_bits as float */
     float scale;
@@ -1713,16 +1714,19 @@ uint64_t ve_soft_max_f32_masked_hmem(void* y_hmem,
  * For row r: token_idx = r % ne1, head_idx = (r / ne1) % ne2
  * Mask row = mask + token_idx * ne0
  */
-uint64_t ve_soft_max_f32_masked_attn_hmem(void* y_hmem,
-                                           void* x_hmem,
-                                           void* mask_hmem,
+uint64_t ve_soft_max_f32_masked_attn_hmem(VEDAdeviceptr y_hbm,
+                                           VEDAdeviceptr x_hbm,
+                                           VEDAdeviceptr mask_hbm,
                                            uint64_t ne00,       /* elements per row (n_kv) */
                                            uint64_t total_rows, /* ne1 * ne2 * ne3 */
                                            uint64_t ne1,        /* n_tokens (mask row stride) */
                                            uint64_t scale_bits) {
-    float* y = (float*)y_hmem;
-    float* x = (float*)x_hmem;
-    float* mask = (float*)mask_hmem;
+    float* y;
+    float* x;
+    float* mask;
+    if (vedaMemPtr((void**)&y, y_hbm) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_hbm) != 0) return 2;
+    if (vedaMemPtr((void**)&mask, mask_hbm) != 0) return 3;
     
     float scale;
     uint32_t scale32 = (uint32_t)scale_bits;
