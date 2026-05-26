@@ -52,6 +52,7 @@ bool get_rows(backend_context * ctx, ggml_tensor * dst) {
     // sources, we do D→D; for host sources, H→D async; both freed after
     // the next sync.
     const size_t idx_bytes = nr * sizeof(int32_t);
+    if (idx_bytes == 0) return true;   // zero rows -> no-op
     VEDAdeviceptr idx_tmp = 0;
     if (vedaMemAllocAsync(&idx_tmp, idx_bytes, 0) != VEDA_SUCCESS || idx_tmp == 0) {
         return false;

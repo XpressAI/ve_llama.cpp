@@ -83,6 +83,7 @@ bool soft_max_f32(backend_context * ctx, ggml_tensor * dst) {
 
     const size_t src_bytes = ggml_nbytes(src);
     const size_t dst_bytes = ggml_nbytes(dst);
+    if (src_bytes == 0 || dst_bytes == 0) return true;  // no-op
 
     VEDAdeviceptr src_tmp = 0, dst_tmp = 0;
     if (vedaMemAllocAsync(&src_tmp, src_bytes, 0) != VEDA_SUCCESS) return false;
