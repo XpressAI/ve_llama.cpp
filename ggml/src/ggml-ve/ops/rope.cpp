@@ -70,36 +70,30 @@ bool rope(backend_context * ctx, ggml_tensor * dst) {
     const uint64_t n_ctx   = (uint64_t) x->ne[2];
     const uint64_t n_batch = (uint64_t) x->ne[3];
 
-    // Stage positions into HMEM, sourcing from HBM (D→H) or host memory
-    // (H→H) depending on where ggml put the i32 leaf. Both go through
-    // vedaH* — VEDAhmemptr is opaque.
+    // Stage positions into temp HBM (HMEM is for multi-VE / MPI only).
     const size_t pos_bytes = ggml_nbytes(pos);
-    VEDAhmemptr pos_hmem = ctx->pool().acquire(pos_bytes);
-    if (pos_hmem == 0) return false;
+    VEDAdeviceptr pos_tmp = 0;
+    if (vedaMemAllocAsync(&pos_tmp, pos_bytes, 0) != VEDA_SUCCESS || pos_tmp == 0) return false;
     VEDAresult pos_err;
     if (tensor_is_hbm(pos)) {
-        pos_err = vedaHMemcpyDtoX(reinterpret_cast<void *>(pos_hmem),
-                                   tensor_hbm_ptr(pos), pos_bytes);
+        pos_err = vedaMemcpyDtoDAsync(pos_tmp, tensor_hbm_ptr(pos), pos_bytes, 0);
     } else if (pos->data != nullptr) {
-        pos_err = vedaHMemcpy(reinterpret_cast<void *>(pos_hmem),
-                              pos->data, pos_bytes);
+        pos_err = vedaMemcpyHtoDAsync(pos_tmp, pos->data, pos_bytes, 0);
     } else {
-        ctx->pool().release(pos_hmem);
+        vedaMemFreeAsync(pos_tmp, 0);
         return false;
     }
-    if (!ggml_ve_ok(pos_err, "vedaHMemcpy (rope positions)")) {
-        ctx->pool().release(pos_hmem);
+    if (!ggml_ve_ok(pos_err, "vedaMemcpy* (rope positions)")) {
+        vedaMemFreeAsync(pos_tmp, 0);
         return false;
     }
+    ctx->enqueue_hbm_free(pos_tmp);
 
     VEDAargs args = nullptr;
-    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(rope)")) {
-        ctx->pool().release(pos_hmem);
-        return false;
-    }
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(rope)")) return false;
     vedaArgsSetVPtr(args,  0, dst_hbm);
     vedaArgsSetVPtr(args,  1, x_hbm);
-    vedaArgsSetHMEM(args,  2, pos_hmem);
+    vedaArgsSetVPtr(args,  2, pos_tmp);
     vedaArgsSetU64 (args,  3, ne0);
     vedaArgsSetU64 (args,  4, (uint64_t) n_dims);
     vedaArgsSetU64 (args,  5, n_heads);
@@ -112,13 +106,10 @@ bool rope(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetF32 (args, 12, freq_scale);
     vedaArgsSetF32 (args, 13, attn_factor);
 
-    uint64_t result = 0;
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(rope_hbm_omp_nocache)")) {
-        ctx->pool().release(pos_hmem);
         return false;
     }
-    ctx->enqueue_input(pos_hmem);
     ctx->mark_sync_pending();
     return true;
 }

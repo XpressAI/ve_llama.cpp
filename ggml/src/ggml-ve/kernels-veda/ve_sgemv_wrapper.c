@@ -9216,7 +9216,7 @@ uint64_t ve_get_omp_threads(void) {
  */
 uint64_t ve_rope_normal_hbm_omp_nocache(VEDAdeviceptr y_hbm,
                                          VEDAdeviceptr x_hbm,
-                                         void* pos_ptr,  // Position array in HMEM
+                                         VEDAdeviceptr pos_hbm,
                                          uint64_t ne0,
                                          uint64_t n_dims,
                                          uint64_t n_heads,
@@ -9231,10 +9231,10 @@ uint64_t ve_rope_normal_hbm_omp_nocache(VEDAdeviceptr y_hbm,
     /* Convert HBM pointers to raw VE addresses */
     float* y;
     const float* x;
+    const int32_t* pos;
     if (vedaMemPtr((void**)&y, y_hbm) != 0) return 1;
     if (vedaMemPtr((void**)&x, x_hbm) != 0) return 2;
-    
-    const int32_t* pos = (const int32_t*)pos_ptr;
+    if (vedaMemPtr((void**)&pos, pos_hbm) != 0) return 3;
     
     int heads = (int)n_heads;
     int ctx = (int)n_ctx;
@@ -9365,7 +9365,7 @@ uint64_t ve_rope_normal_hbm_single_pos(VEDAdeviceptr y_hbm,
  */
 uint64_t ve_rope_neox_hbm_omp_nocache(VEDAdeviceptr y_hbm,
                                        VEDAdeviceptr x_hbm,
-                                       void* pos_ptr,
+                                       VEDAdeviceptr pos_hbm,
                                        uint64_t ne0,
                                        uint64_t n_dims,
                                        uint64_t n_heads,
@@ -9380,10 +9380,10 @@ uint64_t ve_rope_neox_hbm_omp_nocache(VEDAdeviceptr y_hbm,
     /* Convert HBM pointers to raw VE addresses */
     float* y;
     const float* x;
+    const int32_t* pos;
     if (vedaMemPtr((void**)&y, y_hbm) != 0) return 1;
     if (vedaMemPtr((void**)&x, x_hbm) != 0) return 2;
-    
-    const int32_t* pos = (const int32_t*)pos_ptr;
+    if (vedaMemPtr((void**)&pos, pos_hbm) != 0) return 3;
     
     int heads = (int)n_heads;
     int ctx = (int)n_ctx;
@@ -9537,7 +9537,7 @@ uint64_t ve_rope_neox_hbm_single_pos(VEDAdeviceptr y_hbm,
  */
 uint64_t ve_rope_imrope_hbm_omp(VEDAdeviceptr y_hbm,
                                  VEDAdeviceptr x_hbm,
-                                 void* pos_ptr,        // Position tensor [n_ctx * 4]
+                                 VEDAdeviceptr pos_hbm,
                                  uint64_t ne0,         // Elements per head
                                  uint64_t n_dims,      // ROPE dimensions
                                  uint64_t n_heads,     // Number of heads
@@ -9556,10 +9556,10 @@ uint64_t ve_rope_imrope_hbm_omp(VEDAdeviceptr y_hbm,
     /* Convert HBM pointers to raw VE addresses */
     float* y;
     const float* x;
+    const int32_t* pos;
     if (vedaMemPtr((void**)&y, y_hbm) != 0) return 1;
     if (vedaMemPtr((void**)&x, x_hbm) != 0) return 2;
-    
-    const int32_t* pos = (const int32_t*)pos_ptr;  // Already a raw pointer from HMEM
+    if (vedaMemPtr((void**)&pos, pos_hbm) != 0) return 3;
     
     int heads = (int)n_heads;
     int ctx = (int)n_ctx;
