@@ -12691,14 +12691,16 @@ uint64_t ve_argsort_f32_hmem(
  * Each row is sorted independently in parallel.
  */
 uint64_t ve_argsort_f32_omp_hmem(
-    void* dst_hmem,      /* Output: int32_t indices [nrows x ne0] */
-    void* src_hmem,      /* Input: float values [nrows x ne0] */
+    VEDAdeviceptr dst_hbm,   /* Output: int32_t indices [nrows x ne0] */
+    VEDAdeviceptr src_hbm,   /* Input: float values [nrows x ne0] */
     uint64_t ne0,        /* Elements per row */
     uint64_t nrows,      /* Number of rows */
     uint64_t order       /* 0=ASC, 1=DESC */
 ) {
-    int32_t* dst = (int32_t*)dst_hmem;
-    const float* src = (const float*)src_hmem;
+    int32_t* dst;
+    const float* src;
+    if (vedaMemPtr((void**)&dst, dst_hbm) != 0) return 1;
+    if (vedaMemPtr((void**)&src, src_hbm) != 0) return 2;
     int n = (int)ne0;
     int nr = (int)nrows;
     

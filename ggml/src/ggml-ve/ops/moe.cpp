@@ -175,79 +175,52 @@ bool argsort(backend_context * ctx, ggml_tensor * dst) {
     const size_t src_bytes = nrows * ne0 * sizeof(float);
     const size_t dst_bytes = nrows * ne0 * sizeof(int32_t);
 
-    // The argsort kernel is HMEM-IO; stage both src and dst through the pool.
-    VEDAhmemptr src_hmem = ctx->pool().acquire(src_bytes);
-    VEDAhmemptr dst_hmem = ctx->pool().acquire(dst_bytes);
-    if (src_hmem == 0 || dst_hmem == 0) {
-        if (src_hmem) ctx->pool().release(src_hmem);
-        if (dst_hmem) ctx->pool().release(dst_hmem);
+    // Stage src + dst through temp HBM (HMEM is for multi-VE / MPI only).
+    VEDAdeviceptr src_tmp = 0, dst_tmp = 0;
+    if (vedaMemAllocAsync(&src_tmp, src_bytes, 0) != VEDA_SUCCESS) return false;
+    if (vedaMemAllocAsync(&dst_tmp, dst_bytes, 0) != VEDA_SUCCESS) {
+        vedaMemFreeAsync(src_tmp, 0);
         return false;
     }
+    ctx->enqueue_hbm_free(src_tmp);
+    ctx->enqueue_hbm_free(dst_tmp);
 
-    // src may be HBM or host memory; stage either way.
     VEDAresult src_err;
     if (tensor_is_hbm(src)) {
-        src_err = vedaHMemcpyDtoX(reinterpret_cast<void *>(src_hmem),
-                                   tensor_hbm_ptr(src), src_bytes);
+        src_err = vedaMemcpyDtoDAsync(src_tmp, tensor_hbm_ptr(src), src_bytes, 0);
     } else if (src->data != nullptr) {
-        src_err = vedaHMemcpy(reinterpret_cast<void *>(src_hmem),
-                              src->data, src_bytes);
+        src_err = vedaMemcpyHtoDAsync(src_tmp, src->data, src_bytes, 0);
     } else {
-        ctx->pool().release(src_hmem);
-        ctx->pool().release(dst_hmem);
         return false;
     }
-    if (!ggml_ve_ok(src_err, "vedaHMemcpy (argsort src)")) {
-        ctx->pool().release(src_hmem);
-        ctx->pool().release(dst_hmem);
-        return false;
-    }
+    if (!ggml_ve_ok(src_err, "vedaMemcpy* (argsort src)")) return false;
 
     const int32_t * params = (const int32_t *) dst->op_params;
     const uint64_t order = (uint64_t) params[0];   // 0=ASC, 1=DESC
 
     VEDAargs args = nullptr;
-    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(argsort)")) {
-        ctx->pool().release(src_hmem);
-        ctx->pool().release(dst_hmem);
-        return false;
-    }
-    vedaArgsSetHMEM(args, 0, dst_hmem);
-    vedaArgsSetHMEM(args, 1, src_hmem);
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(argsort)")) return false;
+    vedaArgsSetVPtr(args, 0, dst_tmp);
+    vedaArgsSetVPtr(args, 1, src_tmp);
     vedaArgsSetU64 (args, 2, ne0);
     vedaArgsSetU64 (args, 3, nrows);
     vedaArgsSetU64 (args, 4, order);
 
-    uint64_t result = 0;
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(argsort_f32_omp_hmem)")) {
-        ctx->pool().release(src_hmem);
-        ctx->pool().release(dst_hmem);
         return false;
     }
 
-    // Need kernel done before staging output back. (HMEM->HBM deferred-sync
-    // wiring is the same TODO as the K-quant path.)
-    vedaCtxSynchronize();
-
+    // Output unstage: HBM dst = D->D, CPU dst = sync + D->H.
     bool dst_ok = false;
     if (tensor_is_hbm(dst)) {
-        dst_ok = ggml_ve_ok(vedaHMemcpyXtoD(tensor_hbm_ptr(dst),
-                                             reinterpret_cast<void *>(dst_hmem), dst_bytes),
-                            "vedaHMemcpyXtoD (argsort dst)");
+        dst_ok = ggml_ve_ok(vedaMemcpyDtoDAsync(tensor_hbm_ptr(dst), dst_tmp, dst_bytes, 0),
+                            "vedaMemcpyDtoDAsync (argsort dst)");
     } else if (dst->data != nullptr) {
-        std::memcpy(dst->data, reinterpret_cast<void *>(dst_hmem), dst_bytes);
-        dst_ok = true;
+        vedaCtxSynchronize();
+        dst_ok = (vedaMemcpyDtoH(dst->data, dst_tmp, dst_bytes) == VEDA_SUCCESS);
     }
-    if (!dst_ok) {
-        ctx->pool().release(src_hmem);
-        ctx->pool().release(dst_hmem);
-        return false;
-    }
-    vedaCtxSynchronize();
-
-    ctx->pool().release(src_hmem);
-    ctx->pool().release(dst_hmem);
+    if (!dst_ok) return false;
     ctx->mark_sync_pending();
     return true;
 }
