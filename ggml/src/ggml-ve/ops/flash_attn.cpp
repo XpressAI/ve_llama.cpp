@@ -115,6 +115,7 @@ static bool try_flash_attn_colmajor(backend_context * ctx, ggml_tensor * dst) {
 
     /* Stage mask into temp HBM (HMEM is for multi-VE / MPI only). */
     const size_t mask_bytes = ggml_nbytes(mask);
+    if (mask_bytes == 0) return false;  /* fall back, mask required */
     VEDAdeviceptr mask_tmp = 0;
     if (vedaMemAllocAsync(&mask_tmp, mask_bytes, 0) != VEDA_SUCCESS) return false;
     VEDAresult mask_err;
@@ -265,6 +266,7 @@ bool flash_attn(backend_context * ctx, ggml_tensor * dst) {
 
     // Stage mask into temp HBM (HMEM is for multi-VE / MPI only).
     const size_t mask_bytes = ggml_nbytes(mask);
+    if (mask_bytes == 0) return false;  // fall back, mask required
     VEDAdeviceptr mask_tmp = 0;
     if (vedaMemAllocAsync(&mask_tmp, mask_bytes, 0) != VEDA_SUCCESS) return false;
     VEDAresult mask_err;

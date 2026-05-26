@@ -58,6 +58,7 @@ bool set_rows(backend_context * ctx, ggml_tensor * dst) {
     // Stage indices into temp HBM (NOT HMEM; HMEM is for inter-VE/MPI).
     // i64 → i32 narrowing happens on host before the upload.
     const size_t idx32_bytes = nr * sizeof(int32_t);
+    if (idx32_bytes == 0) return true;  // zero rows -> no-op
     VEDAdeviceptr idx_tmp = 0;
     if (vedaMemAllocAsync(&idx_tmp, idx32_bytes, 0) != VEDA_SUCCESS || idx_tmp == 0) return false;
 

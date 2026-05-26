@@ -176,6 +176,7 @@ bool argsort(backend_context * ctx, ggml_tensor * dst) {
     const size_t dst_bytes = nrows * ne0 * sizeof(int32_t);
 
     // Stage src + dst through temp HBM (HMEM is for multi-VE / MPI only).
+    if (src_bytes == 0 || dst_bytes == 0) return true;
     VEDAdeviceptr src_tmp = 0, dst_tmp = 0;
     if (vedaMemAllocAsync(&src_tmp, src_bytes, 0) != VEDA_SUCCESS) return false;
     if (vedaMemAllocAsync(&dst_tmp, dst_bytes, 0) != VEDA_SUCCESS) {

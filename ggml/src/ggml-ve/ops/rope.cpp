@@ -72,6 +72,7 @@ bool rope(backend_context * ctx, ggml_tensor * dst) {
 
     // Stage positions into temp HBM (HMEM is for multi-VE / MPI only).
     const size_t pos_bytes = ggml_nbytes(pos);
+    if (pos_bytes == 0) return true;
     VEDAdeviceptr pos_tmp = 0;
     if (vedaMemAllocAsync(&pos_tmp, pos_bytes, 0) != VEDA_SUCCESS || pos_tmp == 0) return false;
     VEDAresult pos_err;
