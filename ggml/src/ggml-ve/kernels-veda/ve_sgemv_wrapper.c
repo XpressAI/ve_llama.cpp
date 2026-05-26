@@ -519,16 +519,17 @@ uint64_t ve_dequant_q2k_bf16(VEDAdeviceptr out_vptr,
  *   M: Output dimension
  *   K: Input dimension
  */
-uint64_t ve_q2k_bf16_matvec_hbm(void* y_hmem,
+uint64_t ve_q2k_bf16_matvec_hbm(VEDAdeviceptr y_vptr,
                                 VEDAdeviceptr W_vptr,
-                                void* x_hmem,
+                                VEDAdeviceptr x_vptr,
                                 uint64_t M,
                                 uint64_t K) {
-    float* y = (float*)y_hmem;
-    float* x = (float*)x_hmem;
+    float* y;
+    float* x;
     bf16* W;
-    VEDAresult err = vedaMemPtr((void**)&W, W_vptr);
-    (void)err;  // Suppress unused variable warning
+    if (vedaMemPtr((void**)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_vptr) != 0) return 2;
+    if (vedaMemPtr((void**)&W, W_vptr) != 0) return 3;
     
     int m = (int)M;
     int k = (int)K;

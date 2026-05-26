@@ -52,9 +52,9 @@ bool launch_matvec_q8_0_full_hbm(VEDAfunction fn,
                       "vedaLaunchKernelEx(q8_0_fused_matvec_hbm_full)");
 }
 
-// HBM-weights, HMEM I/O for K-quants. Stages x and y through the HMEM pool.
-// We currently sync between kernel-launch and the y→HBM copy because there's
-// no HMEM→HBM transfer in the deferred-sync queue yet (TODO Phase 7-ish).
+// HBM-weights, temp-HBM staging for K-quant I/O (HMEM is for inter-VE / MPI
+// only). The kernel reads x from HBM and writes y to HBM; we then D->D copy
+// y to the caller's HBM output.
 bool launch_kquant_hbm_weights_hmem_io(backend_context * ctx,
                                        VEDAfunction fn,
                                        VEDAdeviceptr y_hbm,
@@ -63,60 +63,40 @@ bool launch_kquant_hbm_weights_hmem_io(backend_context * ctx,
                                        uint64_t M, uint64_t K) {
     const size_t x_bytes = K * sizeof(float);
     const size_t y_bytes = M * sizeof(float);
+    if (x_bytes == 0 || y_bytes == 0) return true;
 
-    VEDAhmemptr x_hmem = ctx->pool().acquire(x_bytes);
-    VEDAhmemptr y_hmem = ctx->pool().acquire(y_bytes);
-    if (x_hmem == 0 || y_hmem == 0) {
-        if (x_hmem) ctx->pool().release(x_hmem);
-        if (y_hmem) ctx->pool().release(y_hmem);
+    VEDAdeviceptr x_tmp = 0, y_tmp = 0;
+    if (vedaMemAllocAsync(&x_tmp, x_bytes, 0) != VEDA_SUCCESS) return false;
+    if (vedaMemAllocAsync(&y_tmp, y_bytes, 0) != VEDA_SUCCESS) {
+        vedaMemFreeAsync(x_tmp, 0);
         return false;
     }
+    ctx->enqueue_hbm_free(x_tmp);
+    ctx->enqueue_hbm_free(y_tmp);
 
-    // vedaHMemcpy{X,D}toX takes the *tagged* VEDAhmemptr cast to void* — NOT
-    // the host-converted address from vedaHMemPtr. See veda/tests/FT/
-    // FT_VEDA_mem_HMem_01.cpp for the canonical usage.
-    if (!ggml_ve_ok(vedaHMemcpyDtoX(reinterpret_cast<void *>(x_hmem), x_hbm, x_bytes),
-                    "vedaHMemcpyDtoX (kquant x: HBM->HMEM)")) {
-        ctx->pool().release(x_hmem);
-        ctx->pool().release(y_hmem);
+    if (!ggml_ve_ok(vedaMemcpyDtoDAsync(x_tmp, x_hbm, x_bytes, 0),
+                    "vedaMemcpyDtoDAsync (kquant x: HBM->HBM)")) {
         return false;
     }
 
     VEDAargs args = nullptr;
-    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(kquant)")) {
-        ctx->pool().release(x_hmem);
-        ctx->pool().release(y_hmem);
-        return false;
-    }
-    vedaArgsSetHMEM(args, 0, y_hmem);
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(kquant)")) return false;
+    vedaArgsSetVPtr(args, 0, y_tmp);
     vedaArgsSetVPtr(args, 1, W_hbm);
-    vedaArgsSetHMEM(args, 2, x_hmem);
+    vedaArgsSetVPtr(args, 2, x_tmp);
     vedaArgsSetU64 (args, 3, M);
     vedaArgsSetU64 (args, 4, K);
 
-    uint64_t result = 0;
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(kquant matvec)")) {
-        ctx->pool().release(x_hmem);
-        ctx->pool().release(y_hmem);
         return false;
     }
 
-    // Need the kernel finished before we read y_hmem. This is a local sync
-    // (kills the deferred-sync win for this op); the proper fix is to extend
-    // the deferred-sync queue with HMEM→HBM copies. Tracked as follow-up.
-    vedaCtxSynchronize();
-
-    if (!ggml_ve_ok(vedaHMemcpyXtoD(y_hbm, reinterpret_cast<void *>(y_hmem), y_bytes),
-                    "vedaHMemcpyXtoD (kquant y: HMEM->HBM)")) {
-        ctx->pool().release(x_hmem);
-        ctx->pool().release(y_hmem);
+    if (!ggml_ve_ok(vedaMemcpyDtoDAsync(y_hbm, y_tmp, y_bytes, 0),
+                    "vedaMemcpyDtoDAsync (kquant y: HBM->HBM)")) {
         return false;
     }
-    vedaCtxSynchronize();
-
-    ctx->pool().release(x_hmem);
-    ctx->pool().release(y_hmem);
+    ctx->mark_sync_pending();
     return true;
 }
 
