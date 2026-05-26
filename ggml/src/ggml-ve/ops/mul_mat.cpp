@@ -129,8 +129,14 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
     // win. The first MUL_MAT for each weight pays a one-time transpose
     // cost (~25ms for a 3072x3072) — make sure llama-bench warms up so
     // the cache fills before the timing window opens.
+    // GGML_VE_COLMAJOR_N1=1 forces N=1 to also use the colmajor F32 CBLAS path
+    // — more precise (true F32 accumulation vs. packed-FP32 matvec) at the cost
+    // of a per-call sync. Default off because Llama-3.x-class models tolerate
+    // the matvec's precision and the synchronization cost is non-trivial.
+    static const bool n1_colmajor =
+        (std::getenv("GGML_VE_COLMAJOR_N1") != nullptr);
     if (colmajor_enabled
-        && N > 1
+        && (N > 1 || n1_colmajor)
         && w->type == GGML_TYPE_BF16
         && ctx->dev() && ctx->dev()->colmajor
         && ctx->fn(K_BF16_TO_F32_COLMAJOR_HBM) != 0

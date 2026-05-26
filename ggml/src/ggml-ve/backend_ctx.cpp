@@ -33,6 +33,7 @@ static inline bool is_aligned(const void * p, size_t n) {
 VEDAdeviceptr backend_context::resolve_in_slow(const ggml_tensor * t) {
     if (t == nullptr || t->data == nullptr) return 0;
     const size_t size = ggml_nbytes(t);
+    if (size == 0) return 0;
     if (tensor_is_weight(t)) {
         // Key the cache by tensor NAME — weights sometimes arrive as
         // views into a packed mmap'd buffer; the view's `t->data`
@@ -89,6 +90,7 @@ VEDAdeviceptr backend_context::resolve_in_slow(const ggml_tensor * t) {
 VEDAdeviceptr backend_context::resolve_out_slow(ggml_tensor * dst) {
     if (dst == nullptr || dst->data == nullptr) return 0;
     const size_t size     = ggml_nbytes(dst);
+    if (size == 0) return 0;
     const size_t alloc_sz = backend_context::canary_enabled()
         ? size + backend_context::CANARY_BYTES
         : size;

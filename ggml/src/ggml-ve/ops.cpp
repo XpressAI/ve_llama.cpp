@@ -32,18 +32,23 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
         case GGML_OP_GLU:
             return ops::glu_supports(op);
         case GGML_OP_RMS_NORM:
+            if (std::getenv("GGML_VE_NO_RMS_NORM") != nullptr) return false;
             return ops::rms_norm_supports(op);
         case GGML_OP_CPY:
         case GGML_OP_CONT:
         case GGML_OP_DUP:
+            if (std::getenv("GGML_VE_NO_CPY") != nullptr) return false;
             return ops::cpy_supports(op);
         case GGML_OP_GET_ROWS:
+            if (std::getenv("GGML_VE_NO_GET_ROWS") != nullptr) return false;
             return ops::get_rows_supports(op);
         case GGML_OP_FLASH_ATTN_EXT:
             return ops::flash_attn_supports(op);
         case GGML_OP_SET_ROWS:
+            if (std::getenv("GGML_VE_NO_SET_ROWS") != nullptr) return false;
             return ops::set_rows_supports(op);
         case GGML_OP_ROPE:
+            if (std::getenv("GGML_VE_NO_ROPE") != nullptr) return false;
             return ops::rope_supports(op);
         case GGML_OP_MUL_MAT_ID:
             return ops::mul_mat_id_supports(op);
@@ -52,12 +57,16 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
         case GGML_OP_ARGSORT:
             return ops::argsort_supports(op);
         case GGML_OP_SOFT_MAX:
+            if (std::getenv("GGML_VE_NO_SOFTMAX") != nullptr) return false;
             return ops::soft_max_supports(op);
         case GGML_OP_MUL_MAT:
+            if (std::getenv("GGML_VE_NO_MUL_MAT") != nullptr) return false;
             return ops::mul_mat_supports(op) || ops::mul_mat_q_supports(op);
         case GGML_OP_SSM_CONV:
+            if (std::getenv("GGML_VE_NO_SSM_CONV") != nullptr) return false;
             return ops::ssm_conv_supports(op);
         case GGML_OP_GATED_DELTA_NET:
+            if (std::getenv("GGML_VE_NO_GDN") != nullptr) return false;
             return ops::gated_delta_net_supports(op);
         default:
             return false;
