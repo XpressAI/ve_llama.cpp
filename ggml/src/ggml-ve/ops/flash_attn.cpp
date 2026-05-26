@@ -113,25 +113,24 @@ static bool try_flash_attn_colmajor(backend_context * ctx, ggml_tensor * dst) {
     const VEDAdeviceptr dst_hbm = ctx->resolve_out(dst);
     if (q_hbm == 0 || dst_hbm == 0) return false;
 
-    /* Stage mask the same way the row-major dispatch does. */
+    /* Stage mask into temp HBM (HMEM is for multi-VE / MPI only). */
     const size_t mask_bytes = ggml_nbytes(mask);
-    VEDAhmemptr mask_hmem = ctx->pool().acquire(mask_bytes);
-    if (mask_hmem == 0) return false;
+    VEDAdeviceptr mask_tmp = 0;
+    if (vedaMemAllocAsync(&mask_tmp, mask_bytes, 0) != VEDA_SUCCESS) return false;
     VEDAresult mask_err;
     if (tensor_is_hbm(mask)) {
-        mask_err = vedaHMemcpyDtoX(reinterpret_cast<void *>(mask_hmem),
-                                    tensor_hbm_ptr(mask), mask_bytes);
+        mask_err = vedaMemcpyDtoDAsync(mask_tmp, tensor_hbm_ptr(mask), mask_bytes, 0);
     } else if (mask->data != nullptr) {
-        mask_err = vedaHMemcpy(reinterpret_cast<void *>(mask_hmem),
-                               mask->data, mask_bytes);
+        mask_err = vedaMemcpyHtoDAsync(mask_tmp, mask->data, mask_bytes, 0);
     } else {
-        ctx->pool().release(mask_hmem);
+        vedaMemFreeAsync(mask_tmp, 0);
         return false;
     }
-    if (!ggml_ve_ok(mask_err, "vedaHMemcpy (flash_attn_colmajor mask)")) {
-        ctx->pool().release(mask_hmem);
+    if (!ggml_ve_ok(mask_err, "vedaMemcpy* (flash_attn_colmajor mask)")) {
+        vedaMemFreeAsync(mask_tmp, 0);
         return false;
     }
+    ctx->enqueue_hbm_free(mask_tmp);
 
     float scale = 0.0f;
     std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -144,15 +143,12 @@ static bool try_flash_attn_colmajor(backend_context * ctx, ggml_tensor * dst) {
     std::memcpy(&slope_bits, &slope_f, sizeof(float));
 
     VEDAargs args = nullptr;
-    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(flash_attn_colmajor)")) {
-        ctx->pool().release(mask_hmem);
-        return false;
-    }
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(flash_attn_colmajor)")) return false;
     vedaArgsSetVPtr(args,  0, dst_hbm);
     vedaArgsSetVPtr(args,  1, q_hbm);
     vedaArgsSetVPtr(args,  2, k_sh->shadow_hbm);
     vedaArgsSetVPtr(args,  3, v_sh->shadow_hbm);
-    vedaArgsSetHMEM(args,  4, mask_hmem);
+    vedaArgsSetVPtr(args,  4, mask_tmp);
     vedaArgsSetU64 (args,  5, head_dim);
     vedaArgsSetU64 (args,  6, n_q_heads);
     vedaArgsSetU64 (args,  7, n_kv_heads);
@@ -163,14 +159,10 @@ static bool try_flash_attn_colmajor(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 12, scale_bits);
     vedaArgsSetU64 (args, 13, slope_bits);
 
-    uint64_t result = 0;
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(flash_attn_colmajor)")) {
-        ctx->pool().release(mask_hmem);
         return false;
     }
-
-    ctx->enqueue_input(mask_hmem);
     ctx->mark_sync_pending();
     ctx->ops_flash_attn()++;
     ctx->ops_hbm()++;
@@ -271,37 +263,33 @@ bool flash_attn(backend_context * ctx, ggml_tensor * dst) {
     std::memcpy(&max_bias_bits, &max_bias, sizeof(float));
     std::memcpy(&softcap_bits,  &softcap,  sizeof(float));
 
-    // Stage mask into HMEM, from HBM (D→H) or host memory (H→H).
+    // Stage mask into temp HBM (HMEM is for multi-VE / MPI only).
     const size_t mask_bytes = ggml_nbytes(mask);
-    VEDAhmemptr mask_hmem = ctx->pool().acquire(mask_bytes);
-    if (mask_hmem == 0) return false;
+    VEDAdeviceptr mask_tmp = 0;
+    if (vedaMemAllocAsync(&mask_tmp, mask_bytes, 0) != VEDA_SUCCESS) return false;
     VEDAresult mask_err;
     if (tensor_is_hbm(mask)) {
-        mask_err = vedaHMemcpyDtoX(reinterpret_cast<void *>(mask_hmem),
-                                    tensor_hbm_ptr(mask), mask_bytes);
+        mask_err = vedaMemcpyDtoDAsync(mask_tmp, tensor_hbm_ptr(mask), mask_bytes, 0);
     } else if (mask->data != nullptr) {
-        mask_err = vedaHMemcpy(reinterpret_cast<void *>(mask_hmem),
-                               mask->data, mask_bytes);
+        mask_err = vedaMemcpyHtoDAsync(mask_tmp, mask->data, mask_bytes, 0);
     } else {
-        ctx->pool().release(mask_hmem);
+        vedaMemFreeAsync(mask_tmp, 0);
         return false;
     }
-    if (!ggml_ve_ok(mask_err, "vedaHMemcpy (flash_attn mask)")) {
-        ctx->pool().release(mask_hmem);
+    if (!ggml_ve_ok(mask_err, "vedaMemcpy* (flash_attn mask)")) {
+        vedaMemFreeAsync(mask_tmp, 0);
         return false;
     }
+    ctx->enqueue_hbm_free(mask_tmp);
 
     VEDAargs args = nullptr;
-    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(flash_attn)")) {
-        ctx->pool().release(mask_hmem);
-        return false;
-    }
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(flash_attn)")) return false;
 
     vedaArgsSetVPtr(args,  0, dst_hbm);
     vedaArgsSetVPtr(args,  1, q_hbm);
     vedaArgsSetVPtr(args,  2, k_hbm);
     vedaArgsSetVPtr(args,  3, v_hbm);
-    vedaArgsSetHMEM(args,  4, mask_hmem);
+    vedaArgsSetVPtr(args,  4, mask_tmp);
 
     vedaArgsSetU64 (args,  5, D);
     vedaArgsSetU64 (args,  6, Dv);
@@ -341,14 +329,10 @@ bool flash_attn(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 30, (uint64_t) mask->ne[2]);
     vedaArgsSetU64 (args, 31, (uint64_t) mask->ne[3]);
 
-    uint64_t result = 0;
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(flash_attn)")) {
-        ctx->pool().release(mask_hmem);
         return false;
     }
-
-    ctx->enqueue_input(mask_hmem);
     ctx->mark_sync_pending();
     ctx->ops_flash_attn()++;
     ctx->ops_hbm()++;

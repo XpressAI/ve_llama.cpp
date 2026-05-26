@@ -207,7 +207,7 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_hbm_f32mask(
     VEDAdeviceptr q_hbm,
     VEDAdeviceptr k_hbm,
     VEDAdeviceptr v_hbm,
-    void* mask_ptr,  /* HMEM - F32 mask (pre-converted from F16 on host) */
+    VEDAdeviceptr mask_hbm,  /* HMEM - F32 mask (pre-converted from F16 on host) */
     uint64_t D,
     uint64_t Dv,
     uint64_t N,
@@ -248,7 +248,8 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_hbm_f32mask(
     if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
     
     /* Mask is F32 (pre-converted on host), HMEM already converted to raw pointer */
-    const float* mask = (const float*)mask_ptr;
+    const float* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     float scale, max_bias, logit_softcap;
     uint32_t tmp;
@@ -6865,7 +6866,7 @@ uint64_t ve_flash_attn_ext_f32_f16mask_hmem(
     void* q_ptr,             /* Query: [D, N, H, B] */
     void* k_ptr,             /* Key: [D, S, Hk, B] */
     void* v_ptr,             /* Value: [Dv, S, Hv, B] */
-    void* mask_ptr,          /* Mask: [S, N_padded, Hm, Bm] F16, can be NULL */
+    VEDAdeviceptr mask_hbm,          /* Mask: [S, N_padded, Hm, Bm] F16, can be NULL */
     uint64_t D,              /* Head dimension (Q, K) */
     uint64_t Dv,             /* Value head dimension (usually same as D) */
     uint64_t N,              /* Number of query tokens */
@@ -6898,7 +6899,8 @@ uint64_t ve_flash_attn_ext_f32_f16mask_hmem(
     const float* q = (const float*)q_ptr;
     const float* k = (const float*)k_ptr;
     const float* v = (const float*)v_ptr;
-    const uint16_t* mask = (const uint16_t*)mask_ptr;  /* F16 mask */
+    const uint16_t* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     /* Decode float parameters */
     float scale, max_bias, logit_softcap;
@@ -7178,7 +7180,7 @@ uint64_t ve_flash_attn_ext_bf16_f16mask_hmem(
     void* q_ptr,
     void* k_ptr,
     void* v_ptr,
-    void* mask_ptr,
+    VEDAdeviceptr mask_hbm,
     uint64_t D,
     uint64_t Dv,
     uint64_t N,
@@ -7225,7 +7227,8 @@ uint64_t ve_flash_attn_ext_bf16_f16mask_hmem(
     const uint16_t* q = (const uint16_t*)q_ptr;  /* BF16 */
     const uint16_t* k = (const uint16_t*)k_ptr;  /* BF16 */
     const uint16_t* v = (const uint16_t*)v_ptr;  /* BF16 */
-    const uint16_t* mask = (const uint16_t*)mask_ptr;  /* F16 */
+    const uint16_t* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     /* Decode float parameters */
     float scale, max_bias, logit_softcap;
@@ -7408,7 +7411,7 @@ uint64_t ve_flash_attn_ext_f32_f32mask_hmem(
     void* q_ptr,
     void* k_ptr,
     void* v_ptr,
-    void* mask_ptr,
+    VEDAdeviceptr mask_hbm,
     uint64_t D,
     uint64_t Dv,
     uint64_t N,
@@ -7441,7 +7444,8 @@ uint64_t ve_flash_attn_ext_f32_f32mask_hmem(
     const float* q = (const float*)q_ptr;
     const float* k = (const float*)k_ptr;
     const float* v = (const float*)v_ptr;
-    const float* mask = (const float*)mask_ptr;  /* F32 mask */
+    const float* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     float scale, max_bias, logit_softcap;
     uint32_t tmp;
@@ -7580,7 +7584,7 @@ uint64_t ve_flash_attn_ext_f32q_f16kv_hmem(
     void* q_ptr,
     void* k_ptr,
     void* v_ptr,
-    void* mask_ptr,
+    VEDAdeviceptr mask_hbm,
     uint64_t D,
     uint64_t Dv,
     uint64_t N,
@@ -7613,7 +7617,8 @@ uint64_t ve_flash_attn_ext_f32q_f16kv_hmem(
     const float* q = (const float*)q_ptr;     /* F32 Q */
     const uint16_t* k = (const uint16_t*)k_ptr;  /* F16 K */
     const uint16_t* v = (const uint16_t*)v_ptr;  /* F16 V */
-    const uint16_t* mask = (const uint16_t*)mask_ptr;  /* F16 mask */
+    const uint16_t* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     float scale, max_bias, logit_softcap;
     uint32_t tmp;
@@ -7813,7 +7818,7 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_hmem(
     void* q_ptr,
     void* k_ptr,
     void* v_ptr,
-    void* mask_ptr,
+    VEDAdeviceptr mask_hbm,
     uint64_t D,
     uint64_t Dv,
     uint64_t N,
@@ -7846,7 +7851,8 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_hmem(
     const float* q = (const float*)q_ptr;     /* F32 Q */
     const uint16_t* k = (const uint16_t*)k_ptr;  /* BF16 K */
     const uint16_t* v = (const uint16_t*)v_ptr;  /* BF16 V */
-    const uint16_t* mask = (const uint16_t*)mask_ptr;  /* F16 mask */
+    const uint16_t* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     float scale, max_bias, logit_softcap;
     uint32_t tmp;
@@ -8197,7 +8203,7 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_hbm(
     VEDAdeviceptr q_hbm,
     VEDAdeviceptr k_hbm,
     VEDAdeviceptr v_hbm,
-    void* mask_ptr,  /* HMEM - mask is small and static */
+    VEDAdeviceptr mask_hbm,  /* HMEM - mask is small and static */
     uint64_t D,
     uint64_t Dv,
     uint64_t N,
@@ -8237,7 +8243,8 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_hbm(
     if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
     if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
     
-    const uint16_t* mask = (const uint16_t*)mask_ptr;  /* HMEM already converted */
+    const uint16_t* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     float scale, max_bias, logit_softcap;
     uint32_t tmp;
@@ -8548,7 +8555,7 @@ uint64_t ve_flash_attn_bf16_intrinsics_hbm(
     VEDAdeviceptr q_hbm,
     VEDAdeviceptr k_hbm,
     VEDAdeviceptr v_hbm,
-    void* mask_ptr,  /* HMEM - F32 mask (pre-converted from F16 on host) */
+    VEDAdeviceptr mask_hbm,  /* HMEM - F32 mask (pre-converted from F16 on host) */
     uint64_t D,
     uint64_t Dv,
     uint64_t N,
@@ -8589,7 +8596,8 @@ uint64_t ve_flash_attn_bf16_intrinsics_hbm(
     if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
     
     /* Mask is F32 (pre-converted on host), HMEM already converted to raw pointer */
-    const float* mask = (const float*)mask_ptr;
+    const float* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     /* Convert bit patterns to floats */
     float scale, max_bias, logit_softcap;
@@ -8682,7 +8690,7 @@ uint64_t ve_simple_attn_bf16kv_hbm(
     VEDAdeviceptr q_hbm,
     VEDAdeviceptr k_hbm,
     VEDAdeviceptr v_hbm,
-    void* mask_ptr,  /* HMEM - F16 mask */
+    VEDAdeviceptr mask_hbm,  /* HMEM - F16 mask */
     uint64_t D,      /* Head dimension for Q, K */
     uint64_t Dv,     /* Head dimension for V (usually same as D) */
     uint64_t N,      /* Number of query tokens (usually 1 for generation) */
@@ -8712,7 +8720,8 @@ uint64_t ve_simple_attn_bf16kv_hbm(
     if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
     if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
     
-    const uint16_t* mask = (const uint16_t*)mask_ptr;
+    const uint16_t* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     /* Decode float parameters */
     float scale, max_bias, logit_softcap;
@@ -8912,7 +8921,7 @@ uint64_t ve_flash_attn_f32_hbm(
     VEDAdeviceptr q_hbm,
     VEDAdeviceptr k_hbm,
     VEDAdeviceptr v_hbm,
-    void* mask_ptr,  /* HMEM - F16 mask */
+    VEDAdeviceptr mask_hbm,  /* HMEM - F16 mask */
     uint64_t D,
     uint64_t Dv,
     uint64_t N,
@@ -8942,7 +8951,8 @@ uint64_t ve_flash_attn_f32_hbm(
     if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
     if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
     
-    const uint16_t* mask = (const uint16_t*)mask_ptr;  /* HMEM - F16 mask */
+    const uint16_t* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     /* Decode float parameters */
     float scale, max_bias, logit_softcap;
@@ -11324,7 +11334,7 @@ uint64_t ve_flash_attn_f32_twopass_hbm(
     VEDAdeviceptr q_hbm,
     VEDAdeviceptr k_hbm,
     VEDAdeviceptr v_hbm,
-    void* mask_ptr,  /* HMEM - F16 mask (can be NULL) */
+    VEDAdeviceptr mask_hbm,  /* HMEM - F16 mask (can be NULL) */
     uint64_t D,      /* head_dim */
     uint64_t Dv,     /* value head_dim (usually same as D) */
     uint64_t N,      /* number of query tokens (1 for generation) */
@@ -11350,7 +11360,8 @@ uint64_t ve_flash_attn_f32_twopass_hbm(
     if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
     if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
     
-    const uint16_t* mask = (const uint16_t*)mask_ptr;
+    const uint16_t* mask = NULL;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 99;
     
     /* Decode float parameters */
     float scale, max_bias, logit_softcap;

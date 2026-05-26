@@ -137,7 +137,7 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_colmajor_hbm(
     VEDAdeviceptr q_vptr,
     VEDAdeviceptr k_col_vptr,
     VEDAdeviceptr v_col_vptr,
-    void *        mask_hmem,         /* F16 mask in HMEM, may be NULL */
+    VEDAdeviceptr mask_hbm,           /* F16 mask in HBM, may be 0 (no mask) */
     uint64_t head_dim,
     uint64_t n_q_heads,
     uint64_t n_kv_heads,
@@ -151,11 +151,13 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_colmajor_hbm(
     float * q;
     bf16 *  k_col;
     bf16 *  v_col;
+    const uint16_t * mask_f16 = NULL;
 
     if (vedaMemPtr((void **)&out,   out_vptr)   != 0) return 1;
     if (vedaMemPtr((void **)&q,     q_vptr)     != 0) return 2;
     if (vedaMemPtr((void **)&k_col, k_col_vptr) != 0) return 3;
     if (vedaMemPtr((void **)&v_col, v_col_vptr) != 0) return 4;
+    if (mask_hbm && vedaMemPtr((void **)(void*)&mask_f16, mask_hbm) != 0) return 5;
 
     float scale, slope;
     uint32_t sb = (uint32_t) scale_bits, lb = (uint32_t) slope_bits;
@@ -173,8 +175,8 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_colmajor_hbm(
     /* F16 -> F32 mask once, shared across heads. 8192 covers ctx >= 8192. */
     float mask_f32[8192] __attribute__((aligned(64)));
     float * mask = NULL;
-    if (mask_hmem != NULL) {
-        mask_f16_to_f32((const uint16_t *) mask_hmem, mask_f32, sl);
+    if (mask_f16 != NULL) {
+        mask_f16_to_f32(mask_f16, mask_f32, sl);
         mask = mask_f32;
     }
 
