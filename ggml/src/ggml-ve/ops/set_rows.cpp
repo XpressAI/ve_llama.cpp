@@ -55,28 +55,24 @@ bool set_rows(backend_context * ctx, ggml_tensor * dst) {
     const uint64_t nb_dst = (uint64_t) dst->nb[1];
     const uint64_t nb_src = (uint64_t) src->nb[1];
 
-    // The VE kernel reads indices as int32 with a 4-byte stride.
-    // Stage them into HMEM as int32 — narrowing i64 if needed, and
-    // sourcing from either HBM or host memory depending on where ggml
-    // put the i32/i64 leaf tensor.
+    // Stage indices into temp HBM (NOT HMEM; HMEM is for inter-VE/MPI).
+    // i64 → i32 narrowing happens on host before the upload.
     const size_t idx32_bytes = nr * sizeof(int32_t);
-    VEDAhmemptr idx_hmem = ctx->pool().acquire(idx32_bytes);
-    if (idx_hmem == 0) return false;
+    VEDAdeviceptr idx_tmp = 0;
+    if (vedaMemAllocAsync(&idx_tmp, idx32_bytes, 0) != VEDA_SUCCESS || idx_tmp == 0) return false;
 
     if (idx->type == GGML_TYPE_I32) {
         VEDAresult err;
         if (tensor_is_hbm(idx)) {
-            err = vedaHMemcpyDtoX(reinterpret_cast<void *>(idx_hmem),
-                                   tensor_hbm_ptr(idx), idx32_bytes);
+            err = vedaMemcpyDtoDAsync(idx_tmp, tensor_hbm_ptr(idx), idx32_bytes, 0);
         } else if (idx->data != nullptr) {
-            err = vedaHMemcpy(reinterpret_cast<void *>(idx_hmem),
-                              idx->data, idx32_bytes);
+            err = vedaMemcpyHtoDAsync(idx_tmp, idx->data, idx32_bytes, 0);
         } else {
-            ctx->pool().release(idx_hmem);
+            vedaMemFreeAsync(idx_tmp, 0);
             return false;
         }
-        if (!ggml_ve_ok(err, "vedaHMemcpy (set_rows i32 idx)")) {
-            ctx->pool().release(idx_hmem);
+        if (!ggml_ve_ok(err, "vedaMemcpy* (set_rows i32 idx)")) {
+            vedaMemFreeAsync(idx_tmp, 0);
             return false;
         }
     } else {  // GGML_TYPE_I64 — narrow on host.
@@ -91,56 +87,46 @@ bool set_rows(backend_context * ctx, ggml_tensor * dst) {
             std::memcpy(host_i64.data(), idx->data, nr * sizeof(int64_t));
             i64_ok = true;
         }
-        if (!i64_ok) {
-            ctx->pool().release(idx_hmem);
-            return false;
-        }
+        if (!i64_ok) { vedaMemFreeAsync(idx_tmp, 0); return false; }
         std::vector<int32_t> host_i32(nr);
         for (uint64_t i = 0; i < nr; ++i) host_i32[i] = (int32_t) host_i64[i];
-        if (!ggml_ve_ok(vedaHMemcpy(reinterpret_cast<void *>(idx_hmem),
-                                     host_i32.data(), idx32_bytes),
-                        "vedaHMemcpy (set_rows i32 narrowed idx)")) {
-            ctx->pool().release(idx_hmem);
+        if (!ggml_ve_ok(vedaMemcpyHtoDAsync(idx_tmp, host_i32.data(), idx32_bytes, 0),
+                        "vedaMemcpyHtoDAsync (set_rows i32 narrowed idx)")) {
+            vedaMemFreeAsync(idx_tmp, 0);
             return false;
         }
+        // host_i32 destructor must outlive the async HtoD -- the i64
+        // narrowing is short-lived so we explicitly sync here. This is
+        // a slow path (i64 indices are rare); the common i32 path above
+        // stays fully async.
+        vedaCtxSynchronize();
     }
+    ctx->enqueue_hbm_free(idx_tmp);
 
     kernel_id kid;
     switch (dst->type) {
         case GGML_TYPE_F16:  kid = K_SET_ROWS_F16_HBM_FULL;  break;
         case GGML_TYPE_BF16: kid = K_SET_ROWS_BF16_HBM_FULL; break;
         case GGML_TYPE_F32:  kid = K_SET_ROWS_F32_HBM_FULL;  break;
-        default:
-            ctx->pool().release(idx_hmem);
-            return false;
+        default: return false;
     }
     VEDAfunction fn = ctx->fn(kid);
-    if (fn == 0) {
-        ctx->pool().release(idx_hmem);
-        return false;
-    }
+    if (fn == 0) return false;
 
     VEDAargs args = nullptr;
-    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(set_rows)")) {
-        ctx->pool().release(idx_hmem);
-        return false;
-    }
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(set_rows)")) return false;
     vedaArgsSetVPtr(args, 0, dst_hbm);
     vedaArgsSetVPtr(args, 1, src_hbm);
-    vedaArgsSetHMEM(args, 2, idx_hmem);
+    vedaArgsSetVPtr(args, 2, idx_tmp);
     vedaArgsSetU64 (args, 3, nc);
     vedaArgsSetU64 (args, 4, nr);
     vedaArgsSetU64 (args, 5, nb_dst);
     vedaArgsSetU64 (args, 6, nb_src);
 
-    uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(set_rows_hbm_full)")) {
-        ctx->pool().release(idx_hmem);
         return false;
     }
-
-    ctx->enqueue_input(idx_hmem);
     ctx->mark_sync_pending();
 
     /* ------------------------------------------------------------------ *

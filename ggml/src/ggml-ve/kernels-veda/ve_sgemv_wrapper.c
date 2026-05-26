@@ -5965,7 +5965,7 @@ uint64_t ve_get_rows_bf16_f32_hbm(VEDAdeviceptr y_hbm,
  */
 uint64_t ve_get_rows_bf16_f32_hbm_hbm(VEDAdeviceptr y_hbm,
                                        VEDAdeviceptr x_hbm,
-                                       void* idx_ptr,
+                                       VEDAdeviceptr idx_hbm,
                                        uint64_t nc,
                                        uint64_t nr,
                                        uint64_t nb_src,
@@ -5973,15 +5973,17 @@ uint64_t ve_get_rows_bf16_f32_hbm_hbm(VEDAdeviceptr y_hbm,
     // Convert HBM handles to raw pointers
     float* y;
     const uint16_t* x;
+    const int32_t* idx;
     VEDAresult err;
-    
+
     err = vedaMemPtr((void**)&y, y_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
+
     err = vedaMemPtr((void**)&x, x_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
-    const int32_t* idx = (const int32_t*)idx_ptr;
+
+    err = vedaMemPtr((void**)&idx, idx_hbm);
+    if (err != VEDA_SUCCESS) return err;
     
     int cols = (int)nc;
     int rows = (int)nr;
@@ -6011,7 +6013,7 @@ uint64_t ve_get_rows_bf16_f32_hbm_hbm(VEDAdeviceptr y_hbm,
  */
 uint64_t ve_get_rows_f32_f32_hbm_hbm(VEDAdeviceptr y_hbm,
                                       VEDAdeviceptr x_hbm,
-                                      void* idx_ptr,
+                                      VEDAdeviceptr idx_hbm,
                                       uint64_t nc,
                                       uint64_t nr,
                                       uint64_t nb_src,
@@ -6019,15 +6021,17 @@ uint64_t ve_get_rows_f32_f32_hbm_hbm(VEDAdeviceptr y_hbm,
     // Convert HBM handles to raw pointers
     float* y;
     const float* x;
+    const int32_t* idx;
     VEDAresult err;
-    
+
     err = vedaMemPtr((void**)&y, y_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
+
     err = vedaMemPtr((void**)&x, x_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
-    const int32_t* idx = (const int32_t*)idx_ptr;
+
+    err = vedaMemPtr((void**)&idx, idx_hbm);
+    if (err != VEDA_SUCCESS) return err;
     
     int cols = (int)nc;
     int rows = (int)nr;
@@ -6670,22 +6674,24 @@ uint64_t ve_set_rows_f32_hbm(VEDAdeviceptr dst_hbm,
  */
 uint64_t ve_set_rows_f16_hbm_full(VEDAdeviceptr dst_hbm,
                                    VEDAdeviceptr src_hbm,
-                                   void* idx_ptr,
+                                   VEDAdeviceptr idx_hbm,
                                    uint64_t nc,
                                    uint64_t nr,
                                    uint64_t nb_dst,
                                    uint64_t nb_src) {
     char* dst;
     char* src;
+    const int32_t* idx;
     VEDAresult err;
-    
+
     err = vedaMemPtr((void**)&dst, dst_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
+
     err = vedaMemPtr((void**)&src, src_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
-    const int32_t* idx = (const int32_t*)idx_ptr;
+
+    err = vedaMemPtr((void**)&idx, idx_hbm);
+    if (err != VEDA_SUCCESS) return err;
     int rows = (int)nr;
     int cols = (int)nc;
     
@@ -6799,22 +6805,24 @@ uint64_t ve_set_rows_bf16_hbm_full(VEDAdeviceptr dst_hbm,
  */
 uint64_t ve_set_rows_f32_hbm_full(VEDAdeviceptr dst_hbm,
                                    VEDAdeviceptr src_hbm,
-                                   void* idx_ptr,
+                                   VEDAdeviceptr idx_hbm,
                                    uint64_t nc,
                                    uint64_t nr,
                                    uint64_t nb_dst,
                                    uint64_t nb_src) {
     char* dst;
     char* src;
+    const int32_t* idx;
     VEDAresult err;
-    
+
     err = vedaMemPtr((void**)&dst, dst_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
+
     err = vedaMemPtr((void**)&src, src_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
-    const int32_t* idx = (const int32_t*)idx_ptr;
+
+    err = vedaMemPtr((void**)&idx, idx_hbm);
+    if (err != VEDA_SUCCESS) return err;
     int rows = (int)nr;
     int cols = (int)nc;
     

@@ -47,61 +47,50 @@ bool get_rows(backend_context * ctx, ggml_tensor * dst) {
     const uint64_t nb_src  = (uint64_t) src->nb[1];
     const uint64_t nb_dst  = (uint64_t) dst->nb[1];
 
-    // Stage indices into HMEM, sourcing from HBM (D→H) or host memory
-    // (H→H) depending on where ggml put the i32 leaf. Both go through
-    // vedaH* calls — a plain memcpy would crash because VEDAhmemptr is
-    // an opaque handle, not a dereferenceable host pointer.
+    // Stage indices into a temp HBM (NOT HMEM -- see kb: HMEM is for
+    // inter-VE / NEC MPI only, not single-VE VH↔VE staging). For HBM
+    // sources, we do D→D; for host sources, H→D async; both freed after
+    // the next sync.
     const size_t idx_bytes = nr * sizeof(int32_t);
-    VEDAhmemptr idx_hmem = ctx->pool().acquire(idx_bytes);
-    if (idx_hmem == 0) return false;
+    VEDAdeviceptr idx_tmp = 0;
+    if (vedaMemAllocAsync(&idx_tmp, idx_bytes, 0) != VEDA_SUCCESS || idx_tmp == 0) {
+        return false;
+    }
     VEDAresult idx_err;
     if (tensor_is_hbm(idx)) {
-        idx_err = vedaHMemcpyDtoX(reinterpret_cast<void *>(idx_hmem),
-                                   tensor_hbm_ptr(idx), idx_bytes);
+        idx_err = vedaMemcpyDtoDAsync(idx_tmp, tensor_hbm_ptr(idx), idx_bytes, 0);
     } else if (idx->data != nullptr) {
-        idx_err = vedaHMemcpy(reinterpret_cast<void *>(idx_hmem),
-                              idx->data, idx_bytes);
+        idx_err = vedaMemcpyHtoDAsync(idx_tmp, idx->data, idx_bytes, 0);
     } else {
-        ctx->pool().release(idx_hmem);
+        vedaMemFreeAsync(idx_tmp, 0);
         return false;
     }
-    if (!ggml_ve_ok(idx_err, "vedaHMemcpy (get_rows idx)")) {
-        ctx->pool().release(idx_hmem);
+    if (!ggml_ve_ok(idx_err, "vedaMemcpy* (get_rows idx)")) {
+        vedaMemFreeAsync(idx_tmp, 0);
         return false;
     }
+    ctx->enqueue_hbm_free(idx_tmp);
 
     kernel_id kid = (src->type == GGML_TYPE_BF16)
         ? K_GET_ROWS_BF16_F32_HBM_HBM
         : K_GET_ROWS_F32_F32_HBM_HBM;
     VEDAfunction fn = ctx->fn(kid);
-    if (fn == 0) {
-        ctx->pool().release(idx_hmem);
-        return false;
-    }
+    if (fn == 0) return false;
 
     VEDAargs args = nullptr;
-    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(get_rows)")) {
-        ctx->pool().release(idx_hmem);
-        return false;
-    }
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(get_rows)")) return false;
     vedaArgsSetVPtr(args, 0, dst_hbm);
     vedaArgsSetVPtr(args, 1, src_hbm);
-    vedaArgsSetHMEM(args, 2, idx_hmem);
+    vedaArgsSetVPtr(args, 2, idx_tmp);
     vedaArgsSetU64 (args, 3, nc);
     vedaArgsSetU64 (args, 4, nr);
     vedaArgsSetU64 (args, 5, nb_src);
     vedaArgsSetU64 (args, 6, nb_dst);
 
-    uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(get_rows_hbm_hbm)")) {
-        ctx->pool().release(idx_hmem);
         return false;
     }
-
-    // The kernel reads the index HMEM buffer in-flight, so defer release
-    // until after the next flush.
-    ctx->enqueue_input(idx_hmem);
     ctx->mark_sync_pending();
     return true;
 }
