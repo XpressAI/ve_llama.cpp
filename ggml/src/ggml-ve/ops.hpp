@@ -79,6 +79,13 @@ bool argsort_supports(const ggml_tensor * op);
 bool soft_max_f32(backend_context * ctx, ggml_tensor * dst);
 bool soft_max_supports(const ggml_tensor * op);
 
+// Recurrent-layer ops (Qwen3.5 / Qwen3.6 hybrid SSM + attention).
+bool ssm_conv_f32(backend_context * ctx, ggml_tensor * dst);
+bool ssm_conv_supports(const ggml_tensor * op);
+
+bool gated_delta_net_f32(backend_context * ctx, ggml_tensor * dst);
+bool gated_delta_net_supports(const ggml_tensor * op);
+
 }  // namespace ops
 
 }  // namespace ggml_ve

@@ -611,6 +611,8 @@ bool dev_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
         case GGML_OP_ADD_ID:
         case GGML_OP_ARGSORT:
         case GGML_OP_SOFT_MAX:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_GATED_DELTA_NET:
             return true;
         default:
             return false;

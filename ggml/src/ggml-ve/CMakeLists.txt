@@ -69,6 +69,8 @@ ggml_add_backend_library(ggml-ve
     ops/rope.cpp
     ops/set_rows.cpp
     ops/softmax.cpp
+    ops/ssm_conv.cpp
+    ops/gated_delta_net.cpp
 )
 
 target_include_directories(ggml-ve PRIVATE ${VEDA_INCLUDE_DIR})

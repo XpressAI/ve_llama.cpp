@@ -164,6 +164,15 @@ enum kernel_id {
     K_FLASH_ATTN_EXT_F32Q_BF16KV_COLMAJOR_HBM,
     K_KVCACHE_MIRROR_TO_COLMAJOR_HBM,
 
+    /* Recurrent-layer ops for Qwen3.5 / Qwen3.6 (hybrid SSM+attention).
+     * SSM_CONV is the 1D causal conv that feeds the gated delta net;
+     * GATED_DELTA_NET is the fused linear-attention + state update.
+     * Both pure-F32, fully HBM-resident. */
+    K_SSM_CONV_F32_HBM,
+    K_COPY_STRIDED_F32_HBM,
+    K_COPY_BYTES_F32_HBM,
+    K_GATED_DELTA_NET_F32_HBM,
+
     K_COUNT,
 };
 

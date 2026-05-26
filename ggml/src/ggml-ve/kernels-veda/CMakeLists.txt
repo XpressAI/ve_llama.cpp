@@ -74,6 +74,7 @@ endfunction()
 # Wrapper objects (NCC: drive OMP, use NEC pragmas).
 ggml_ve_add_ncc_object(ve_sgemv_wrapper.c    OBJ_SGEMV_WRAPPER)
 ggml_ve_add_ncc_object(ve_kvcolmajor_wrapper.c OBJ_KVCOL_WRAPPER)
+ggml_ve_add_ncc_object(ve_recurrent_wrapper.c OBJ_RECUR_WRAPPER)
 
 # Intrinsics objects (LLVM-VE-RV: velintrin.h).
 ggml_ve_add_llvm_object(flash_attn_bf16_intrinsics.c OBJ_FA_INTRIN)
@@ -90,13 +91,13 @@ set(LIBVE_SGEMV "${GGML_VE_KERNEL_OUTPUT_DIR}/libve_sgemv.so")
 add_custom_command(
     OUTPUT  ${LIBVE_SGEMV}
     COMMAND ${GGML_VE_NCC} -shared -fopenmp -ftrace -o ${LIBVE_SGEMV}
-        ${OBJ_SGEMV_WRAPPER} ${OBJ_KVCOL_WRAPPER}
+        ${OBJ_SGEMV_WRAPPER} ${OBJ_KVCOL_WRAPPER} ${OBJ_RECUR_WRAPPER}
         ${OBJ_FA_INTRIN} ${OBJ_FA_FUSED} ${OBJ_FA_COL}
         ${OBJ_SGEMV_BF16} ${OBJ_BF16_SGEMM} ${OBJ_SGEMV_PACKED}
         -lm -L${GGML_VE_NLC_LIB} -lcblas -lblas_openmp
         -Wl,-rpath,${GGML_VE_NLC_LIB}
     DEPENDS
-        ${OBJ_SGEMV_WRAPPER} ${OBJ_KVCOL_WRAPPER}
+        ${OBJ_SGEMV_WRAPPER} ${OBJ_KVCOL_WRAPPER} ${OBJ_RECUR_WRAPPER}
         ${OBJ_FA_INTRIN} ${OBJ_FA_FUSED} ${OBJ_FA_COL}
         ${OBJ_SGEMV_BF16} ${OBJ_BF16_SGEMM} ${OBJ_SGEMV_PACKED}
     COMMENT "NCC link libve_sgemv.so"

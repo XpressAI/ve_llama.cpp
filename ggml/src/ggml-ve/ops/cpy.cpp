@@ -27,32 +27,97 @@ bool cpy_supports(const ggml_tensor * op) {
     }
     const ggml_tensor * x = op->src[0];
     if (x == nullptr) return false;
-    // Same dtype, both contiguous, same total nbytes — i.e. a straight memcpy.
+    // Same dtype required.
     if (x->type != op->type) return false;
-    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(op)) return false;
-    if (ggml_nbytes(x) != ggml_nbytes(op)) return false;
+    // GGML's CPY requires matching total element count; logical shape
+    // may differ (the conv_state slide in Qwen3.5 takes a 3D view and
+    // copies into a 2D view of the recurrent cache).
+    if (ggml_nelements(x) != ggml_nelements(op)) return false;
+
+    // Three paths in order of speed:
+    //  (a) both contiguous, identical ne  -> contiguous memcpy
+    //  (b) same ne, F32, stride-1 inner   -> strided per-row copy
+    //  (c) F32, any ne with matching count -> generic element-by-element
+    //      (Qwen3.5 conv_state slide / similar reshape-on-copy)
+    if (x->type != GGML_TYPE_F32) {
+        // Only the F32 fast path is wired today; non-F32 -> contiguous-only.
+        if (!ggml_is_contiguous(x) || !ggml_is_contiguous(op))   return false;
+        if (ggml_nbytes(x) != ggml_nbytes(op))                   return false;
+        return true;
+    }
+
+    if (x->nb[0] != sizeof(float) || op->nb[0] != sizeof(float)) return false;
     return true;
 }
 
 bool cpy_f32(backend_context * ctx, ggml_tensor * dst) {
     if (!cpy_supports(dst)) return false;
 
-    VEDAfunction fn = ctx->fn(K_COPY_HBM_FULL);
-    if (fn == 0) return false;
+    const ggml_tensor * src = dst->src[0];
 
-    const VEDAdeviceptr y = ctx->resolve_out(dst);
-    const VEDAdeviceptr x = ctx->resolve_in(dst->src[0]);
+    const VEDAdeviceptr y   = ctx->resolve_out(dst);
+    const VEDAdeviceptr x   = ctx->resolve_in(src);
     if (y == 0 || x == 0) return false;
+
+    const bool both_contig = ggml_is_contiguous(src) && ggml_is_contiguous(dst);
+    const bool same_bytes  = (ggml_nbytes(src) == ggml_nbytes(dst));
+    bool same_ne = true;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (src->ne[i] != dst->ne[i]) { same_ne = false; break; }
+    }
 
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(cpy)")) return false;
-    vedaArgsSetVPtr(args, 0, y);
-    vedaArgsSetVPtr(args, 1, x);
-    vedaArgsSetU64 (args, 2, (uint64_t) ggml_nbytes(dst));
+
+    VEDAfunction fn = 0;
+    if (both_contig && same_bytes && same_ne) {
+        fn = ctx->fn(K_COPY_HBM_FULL);
+        if (fn == 0) { vedaArgsDestroy(args); return false; }
+        vedaArgsSetVPtr(args, 0, y);
+        vedaArgsSetVPtr(args, 1, x);
+        vedaArgsSetU64 (args, 2, (uint64_t) ggml_nbytes(dst));
+    } else if (same_ne) {
+        // Strided same-shape, F32 (view-of-view, conv_state mid-update).
+        fn = ctx->fn(K_COPY_STRIDED_F32_HBM);
+        if (fn == 0) { vedaArgsDestroy(args); return false; }
+        vedaArgsSetVPtr(args, 0,  y);
+        vedaArgsSetVPtr(args, 1,  x);
+        vedaArgsSetU64 (args, 2,  (uint64_t) dst->ne[0]);
+        vedaArgsSetU64 (args, 3,  (uint64_t) dst->ne[1]);
+        vedaArgsSetU64 (args, 4,  (uint64_t) dst->ne[2]);
+        vedaArgsSetU64 (args, 5,  (uint64_t) dst->ne[3]);
+        vedaArgsSetU64 (args, 6,  (uint64_t) (src->nb[1] / sizeof(float)));
+        vedaArgsSetU64 (args, 7,  (uint64_t) (src->nb[2] / sizeof(float)));
+        vedaArgsSetU64 (args, 8,  (uint64_t) (src->nb[3] / sizeof(float)));
+        vedaArgsSetU64 (args, 9,  (uint64_t) (dst->nb[1] / sizeof(float)));
+        vedaArgsSetU64 (args, 10, (uint64_t) (dst->nb[2] / sizeof(float)));
+        vedaArgsSetU64 (args, 11, (uint64_t) (dst->nb[3] / sizeof(float)));
+    } else {
+        // General reshape-on-copy (conv_state slide back into recurrent cache).
+        // Walks both ne[]'s independently and remaps each linear index.
+        fn = ctx->fn(K_COPY_BYTES_F32_HBM);
+        if (fn == 0) { vedaArgsDestroy(args); return false; }
+        vedaArgsSetVPtr(args, 0,  y);
+        vedaArgsSetVPtr(args, 1,  x);
+        vedaArgsSetU64 (args, 2,  (uint64_t) src->ne[0]);
+        vedaArgsSetU64 (args, 3,  (uint64_t) src->ne[1]);
+        vedaArgsSetU64 (args, 4,  (uint64_t) src->ne[2]);
+        vedaArgsSetU64 (args, 5,  (uint64_t) src->ne[3]);
+        vedaArgsSetU64 (args, 6,  (uint64_t) (src->nb[1] / sizeof(float)));
+        vedaArgsSetU64 (args, 7,  (uint64_t) (src->nb[2] / sizeof(float)));
+        vedaArgsSetU64 (args, 8,  (uint64_t) (src->nb[3] / sizeof(float)));
+        vedaArgsSetU64 (args, 9,  (uint64_t) dst->ne[0]);
+        vedaArgsSetU64 (args, 10, (uint64_t) dst->ne[1]);
+        vedaArgsSetU64 (args, 11, (uint64_t) dst->ne[2]);
+        vedaArgsSetU64 (args, 12, (uint64_t) dst->ne[3]);
+        vedaArgsSetU64 (args, 13, (uint64_t) (dst->nb[1] / sizeof(float)));
+        vedaArgsSetU64 (args, 14, (uint64_t) (dst->nb[2] / sizeof(float)));
+        vedaArgsSetU64 (args, 15, (uint64_t) (dst->nb[3] / sizeof(float)));
+    }
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
-                    "vedaLaunchKernelEx(copy_hbm_full)")) {
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
+                    "vedaLaunchKernelEx(cpy)")) {
         return false;
     }
     ctx->mark_sync_pending();

@@ -170,6 +170,11 @@ const kernel_meta & meta(kernel_id id) {
 
         /* K_FLASH_ATTN_EXT_F32Q_BF16KV_COLMAJOR_HBM  */ { "ve_flash_attn_ext_f32q_bf16kv_colmajor_hbm", KMOD_SGEMV },
         /* K_KVCACHE_MIRROR_TO_COLMAJOR_HBM           */ { "ve_kvcache_mirror_to_colmajor_hbm",        KMOD_SGEMV  },
+
+        /* K_SSM_CONV_F32_HBM                         */ { "ve_ssm_conv_f32_hbm",                      KMOD_SGEMV  },
+        /* K_COPY_STRIDED_F32_HBM                     */ { "ve_copy_strided_f32_hbm",                  KMOD_SGEMV  },
+        /* K_COPY_BYTES_F32_HBM                       */ { "ve_copy_bytes_f32_hbm",                    KMOD_SGEMV  },
+        /* K_GATED_DELTA_NET_F32_HBM                  */ { "ve_gated_delta_net_f32_hbm",               KMOD_SGEMV  },
     };
     return table[id];
 }

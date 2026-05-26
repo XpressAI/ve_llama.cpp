@@ -55,6 +55,10 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
             return ops::soft_max_supports(op);
         case GGML_OP_MUL_MAT:
             return ops::mul_mat_supports(op) || ops::mul_mat_q_supports(op);
+        case GGML_OP_SSM_CONV:
+            return ops::ssm_conv_supports(op);
+        case GGML_OP_GATED_DELTA_NET:
+            return ops::gated_delta_net_supports(op);
         default:
             return false;
     }
@@ -126,6 +130,10 @@ bool compute_forward(backend_context * ctx, ggml_tensor * node) {
                 return ops::mul_mat_q(ctx, node);
             }
             return ops::mul_mat(ctx, node);
+        case GGML_OP_SSM_CONV:
+            return ops::ssm_conv_f32(ctx, node);
+        case GGML_OP_GATED_DELTA_NET:
+            return ops::gated_delta_net_f32(ctx, node);
         default:
             GGML_LOG_ERROR("ggml-ve: unsupported op assigned to backend: %s\n",
                            ggml_op_name(node->op));
