@@ -17,6 +17,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <vector>
@@ -86,7 +89,14 @@ public:
         pending_hbm_frees_.push_back(hbm);
         needs_sync_ = true;
     }
-    void mark_sync_pending() { needs_sync_ = true; }
+    void mark_sync_pending() {
+        needs_sync_ = true;
+        // In canary mode, force a per-op flush so that any kernel that
+        // tramples its dst's trailing canary is caught immediately --
+        // we log the op name, then continue and likely crash on the
+        // next op. The crash trace then pinpoints the offender.
+        if (canary_enabled()) flush("canary-per-op");
+    }
     bool has_pending() const { return needs_sync_; }
 
     // ---- Tensor → HBM resolution ----
@@ -126,6 +136,14 @@ public:
     VEDAdeviceptr resolve_in_slow (const ggml_tensor * t);
     VEDAdeviceptr resolve_out_slow(ggml_tensor *       dst);
 
+    // Constants for the canary guard mode.
+    static constexpr size_t  CANARY_BYTES   = 64;
+    static constexpr uint8_t CANARY_PATTERN = 0xCD;
+    static bool canary_enabled() {
+        static bool on = (std::getenv("GGML_VE_DEBUG_CANARY") != nullptr);
+        return on;
+    }
+
     // Single sync for the whole batch of queued ops. After the sync, copy
     // every queued HMEM output back to host, recycle HMEM buffers, free
     // pending HBM allocs.
@@ -144,19 +162,39 @@ public:
         sync_count_++;
         vedaCtxSynchronize();
 
+        // Check guard bands -- any byte != 0xCD means a kernel wrote
+        // past the dst it was given.
+        if (canary_enabled() && !canaries_.empty()) {
+            uint8_t guard[CANARY_BYTES];
+            for (auto & c : canaries_) {
+                VEDAdeviceptr trailer = (VEDAdeviceptr)((uintptr_t)c.base + c.logical_sz);
+                if (vedaMemcpyDtoH(guard, trailer, CANARY_BYTES) != VEDA_SUCCESS) continue;
+                for (size_t i = 0; i < CANARY_BYTES; ++i) {
+                    if (guard[i] != CANARY_PATTERN) {
+                        fprintf(stderr,
+                                "[CANARY] OVERFLOW in '%s' (logical_sz=%zu): byte +%zu past end "
+                                "= 0x%02x (expected 0x%02x). First 16 trailer bytes: ",
+                                c.label ? c.label : "?", c.logical_sz, i,
+                                guard[i], CANARY_PATTERN);
+                        for (int j = 0; j < 16; ++j) fprintf(stderr, "%02x ", guard[j]);
+                        fprintf(stderr, "\n");
+                        break;
+                    }
+                }
+            }
+            canaries_.clear();
+        }
+
         clock_gettime(CLOCK_MONOTONIC, &t1);
 
         for (auto & o : pending_outputs_) {
             vedaHMemcpy(o.host_dst, reinterpret_cast<void *>(o.hmem), o.size);
             pool_.release(o.hmem);
         }
-        // CPU-dst ops (from resolve_out): stage temp HBM → HMEM, then memcpy
-        // to the host destination. We do this BEFORE freeing the temp HBMs.
+        // CPU-dst ops (from resolve_out): direct DtoH from temp HBM
+        // into the original host destination. No HMEM intermediate.
         for (auto & d : deferred_dtoh_) {
-            if (vedaMemcpyDtoH(reinterpret_cast<void *>(d.hmem), d.temp_hbm, d.size) == VEDA_SUCCESS) {
-                std::memcpy(d.host_dst, reinterpret_cast<void *>(d.hmem), d.size);
-            }
-            pool_.release(d.hmem);
+            vedaMemcpyDtoH(d.host_dst, d.temp_hbm, d.size);
             vedaMemFreeAsync(d.temp_hbm, 0);
         }
         for (auto & h : pending_inputs_) {
@@ -164,6 +202,14 @@ public:
         }
         for (auto & v : pending_hbm_frees_) {
             vedaMemFreeAsync(v, 0);
+        }
+        // Free bounce buffers used to align misaligned host sources for
+        // HtoD. AVEO's DMA path requires >= 8-byte aligned source; view
+        // tensors whose data pointer carries a sub-8-byte offset (e.g.
+        // Qwen3.5 conv_state_last at parent+36) must be staged through a
+        // properly-aligned host buffer before async HtoD.
+        for (auto & b : pending_host_frees_) {
+            std::free(b);
         }
 
         clock_gettime(CLOCK_MONOTONIC, &t2);
@@ -173,6 +219,7 @@ public:
         pending_outputs_.clear();
         pending_inputs_.clear();
         pending_hbm_frees_.clear();
+        pending_host_frees_.clear();
         deferred_dtoh_.clear();
         needs_sync_ = false;
     }
@@ -181,18 +228,25 @@ public:
     void abort_pending() {
         for (auto & o : pending_outputs_) pool_.release(o.hmem);
         for (auto & h : pending_inputs_)  pool_.release(h);
-        for (auto & d : deferred_dtoh_)   { pool_.release(d.hmem); }
         if (!pending_hbm_frees_.empty() || !deferred_dtoh_.empty()) {
             vedaCtxSynchronize();
             for (auto & v : pending_hbm_frees_) vedaMemFreeAsync(v, 0);
             for (auto & d : deferred_dtoh_)     vedaMemFreeAsync(d.temp_hbm, 0);
         }
+        for (auto & b : pending_host_frees_) std::free(b);
         pending_outputs_.clear();
         pending_inputs_.clear();
         pending_hbm_frees_.clear();
+        pending_host_frees_.clear();
+        canaries_.clear();
         deferred_dtoh_.clear();
         needs_sync_ = false;
     }
+
+    // Bounce-buffer hook for resolve_in: track an aligned host buffer
+    // that holds a copy of a misaligned tensor's bytes. Must outlive
+    // the async HtoD that reads from it, so we free at flush() time.
+    void enqueue_host_free(void * p) { pending_host_frees_.push_back(p); }
 
     // ---- Per-op statistics, useful for telemetry on free() ----
     int64_t & ops_total()      { return ops_total_; }
@@ -212,13 +266,29 @@ private:
     std::vector<pending_output> pending_outputs_;
     std::vector<VEDAhmemptr>    pending_inputs_;
     std::vector<VEDAdeviceptr>  pending_hbm_frees_;
+    std::vector<void *>         pending_host_frees_;
+
+    // HBM guard-band canaries (GGML_VE_DEBUG_CANARY=1). Each temp HBM
+    // allocation that resolve_*_slow makes carries an extra 64-byte
+    // trailer filled with 0xCD. flush() checks each trailer after
+    // sync; any byte that's not 0xCD points to a kernel that wrote
+    // past its declared dst size.
+public:
+    struct canary_record {
+        VEDAdeviceptr base       = 0;     // start of the allocation
+        size_t        logical_sz = 0;     // bytes the kernel was told it has
+        const char *  label      = nullptr;
+    };
+    std::vector<canary_record> canaries_;
 
     // Deferred D→H copies for ops whose `dst` lives in a CPU buffer.
-    // After the next sync, we copy temp_hbm → hmem (D→H), then
-    // hmem → host_dst (memcpy), then free temp_hbm and release hmem.
+    // After the next sync, we copy temp_hbm → host_dst directly with
+    // vedaMemcpyDtoH and free temp_hbm. Previous design staged through
+    // an HMEM intermediate which added a redundant memcpy hop and
+    // introduced HMEM-pool lifetime bugs in long queues (the recvBuff
+    // segfault that bit Qwen3.5 op #38).
     struct deferred_dtoh {
         VEDAdeviceptr temp_hbm = 0;
-        VEDAhmemptr   hmem     = 0;
         void *        host_dst = nullptr;
         size_t        size     = 0;
     };

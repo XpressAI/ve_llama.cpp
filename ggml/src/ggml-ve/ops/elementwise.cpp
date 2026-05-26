@@ -63,7 +63,7 @@ bool mul_f32(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 3, (uint64_t) ggml_nelements(dst));
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(mul_hbm_full)")) {
         return false;
     }
@@ -108,7 +108,7 @@ bool scale_f32(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 3, (uint64_t) ggml_nelements(dst));
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(scale_hbm_full)")) {
         return false;
     }
@@ -144,7 +144,7 @@ bool silu_f32(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 2, (uint64_t) ggml_nelements(dst));
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(silu_hbm_full)")) {
         return false;
     }
@@ -203,7 +203,7 @@ bool glu_f32(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 4, nr);
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(swiglu_hbm_full)")) {
         return false;
     }

@@ -113,7 +113,7 @@ bool rope(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetF32 (args, 13, attn_factor);
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(rope_hbm_omp_nocache)")) {
         ctx->pool().release(pos_hmem);
         return false;

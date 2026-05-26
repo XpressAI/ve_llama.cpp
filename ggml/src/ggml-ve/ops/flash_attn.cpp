@@ -164,7 +164,7 @@ static bool try_flash_attn_colmajor(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 13, slope_bits);
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(flash_attn_colmajor)")) {
         ctx->pool().release(mask_hmem);
         return false;
@@ -342,7 +342,7 @@ bool flash_attn(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 31, (uint64_t) mask->ne[3]);
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(flash_attn)")) {
         ctx->pool().release(mask_hmem);
         return false;

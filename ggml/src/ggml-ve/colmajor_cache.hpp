@@ -91,7 +91,7 @@ public:
         vedaArgsSetU64 (args, 3, (uint64_t) K);
 
         uint64_t rc = 0;
-        err = vedaLaunchKernelEx(transpose_fn, 0, args, /*destroyArgs=*/1, &rc);
+        err = vedaLaunchKernelEx(transpose_fn, 0, args, /*destroyArgs=*/1, nullptr);
         if (err != VEDA_SUCCESS) {
             fprintf(stderr, "[ve-colmajor-cache] transpose launch failed: %s\n",
                     ggml_ve_err_str(err));

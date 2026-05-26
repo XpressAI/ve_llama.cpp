@@ -85,7 +85,7 @@ bool mul_mat_id(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 8, n_tokens);
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(mul_mat_id_bf16_f32_hbm_full)")) {
         return false;
     }
@@ -141,7 +141,7 @@ bool add_id(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 6, ne2);
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(add_id_f32_hbm_full)")) {
         return false;
     }
@@ -219,7 +219,7 @@ bool argsort(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, 4, order);
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(argsort_f32_omp_hmem)")) {
         ctx->pool().release(src_hmem);
         ctx->pool().release(dst_hmem);

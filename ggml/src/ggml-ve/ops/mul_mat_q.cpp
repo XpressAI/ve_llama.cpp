@@ -48,7 +48,7 @@ bool launch_matvec_q8_0_full_hbm(VEDAfunction fn,
     vedaArgsSetU64 (args, 4, K);
 
     uint64_t result = 0;
-    return ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    return ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                       "vedaLaunchKernelEx(q8_0_fused_matvec_hbm_full)");
 }
 
@@ -95,7 +95,7 @@ bool launch_kquant_hbm_weights_hmem_io(backend_context * ctx,
     vedaArgsSetU64 (args, 4, K);
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(kquant matvec)")) {
         ctx->pool().release(x_hmem);
         ctx->pool().release(y_hmem);

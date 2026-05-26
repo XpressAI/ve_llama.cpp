@@ -84,7 +84,7 @@ bool launch_matmul(VEDAfunction fn,
     if (include_N) vedaArgsSetU64(args, 5, N);
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(mul_mat)")) {
         return false;
     }
@@ -161,7 +161,7 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
                 vedaArgsSetU64 (args, 4, K);
                 vedaArgsSetU64 (args, 5, N);
                 uint64_t rc = 0;
-                if (ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &rc),
+                if (ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                                "vedaLaunchKernelEx(f32_sgemm_cblas_notrans)")) {
                     vedaCtxSynchronize();
                     ctx->ops_mul_mat()++;

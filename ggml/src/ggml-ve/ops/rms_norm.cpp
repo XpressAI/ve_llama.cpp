@@ -74,7 +74,7 @@ bool rms_norm_f32(backend_context * ctx, ggml_tensor * dst) {
     }
 
     uint64_t result = 0;
-    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, &result),
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(rms_norm_hbm)")) {
         return false;
     }
