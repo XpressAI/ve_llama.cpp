@@ -5234,18 +5234,18 @@ uint64_t ve_add_hbm_full(VEDAdeviceptr y_vptr,
     float* y;
     float* a;
     float* b;
-    
+
     vedaMemPtr((void**)&y, y_vptr);
     vedaMemPtr((void**)&a, a_vptr);
     vedaMemPtr((void**)&b, b_vptr);
-    
+
     int n_int = (int)n;
-    
+
     #pragma _NEC ivdep
     for (int i = 0; i < n_int; i++) {
         y[i] = a[i] + b[i];
     }
-    
+
     return 0;
 }
 

@@ -44,7 +44,16 @@ bool mul_supports(const ggml_tensor * op) {
     if (op->op != GGML_OP_MUL) return false;
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
-    return a && b && same_elemcount_f32(a, b, op);
+    if (!a || !b || !same_elemcount_f32(a, b, op)) return false;
+    // Until the producer-consumer stale-CPU-memory issue is fully fixed
+    // (see qwen35-correctness-open.md), only claim MULs where every tensor
+    // lives in VE HBM. A MUL whose src/dst lives in CPU memory means we'd
+    // have to stage through resolve_in_slow / resolve_out_slow, and the
+    // staleness pattern -- two unrelated tensors aliased to the same host
+    // slot by the cgraph allocator -- corrupts Qwen3.5's recurrent layers
+    // even though every kernel is correct in isolation.
+    if (!tensor_is_hbm(a) || !tensor_is_hbm(b) || !tensor_is_hbm(op)) return false;
+    return true;
 }
 
 bool mul_f32(backend_context * ctx, ggml_tensor * dst) {

@@ -22,14 +22,19 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
         case GGML_OP_TRANSPOSE:
             return true;
         case GGML_OP_ADD:
+            if (std::getenv("GGML_VE_NO_ADD") != nullptr) return false;
             return ops::add_supports(op);
         case GGML_OP_MUL:
+            if (std::getenv("GGML_VE_NO_MUL") != nullptr) return false;
             return ops::mul_supports(op);
         case GGML_OP_SCALE:
+            if (std::getenv("GGML_VE_NO_SCALE") != nullptr) return false;
             return ops::scale_supports(op);
         case GGML_OP_UNARY:
+            if (std::getenv("GGML_VE_NO_UNARY") != nullptr) return false;
             return ops::silu_supports(op);
         case GGML_OP_GLU:
+            if (std::getenv("GGML_VE_NO_GLU") != nullptr) return false;
             return ops::glu_supports(op);
         case GGML_OP_RMS_NORM:
             if (std::getenv("GGML_VE_NO_RMS_NORM") != nullptr) return false;

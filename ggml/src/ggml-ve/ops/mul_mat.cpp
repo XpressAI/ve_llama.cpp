@@ -104,9 +104,45 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
     const uint64_t N = (uint64_t) x->ne[1];
 
     const VEDAdeviceptr w_vptr = ctx->resolve_in(w);
-    const VEDAdeviceptr x_vptr = ctx->resolve_in(x);
+    VEDAdeviceptr       x_vptr = ctx->resolve_in(x);
     const VEDAdeviceptr y_vptr = ctx->resolve_out(dst);
     if (w_vptr == 0 || x_vptr == 0 || y_vptr == 0) return false;
+
+    // GGML_VE_BF16_INPUT_TRUNC=1: when the weight is BF16 and the input is F32,
+    // truncate the input to BF16 precision first to match what CPU's
+    // ggml_vec_dot_bf16 does (vec_dot_type[BF16] = BF16, so CPU converts the
+    // F32 input via from_float before the BF16xBF16 dot). Without this VE
+    // keeps F32 input precision and produces more-precise (but different from
+    // CPU) results — which empirically breaks Qwen3.5 even though Llama-3.x
+    // tolerates it. Copy the input into a temp HBM buffer first because the
+    // truncation is destructive and we must not corrupt the upstream tensor.
+    static const bool bf16_input_trunc =
+        (std::getenv("GGML_VE_BF16_INPUT_TRUNC") != nullptr);
+    if (bf16_input_trunc
+        && w->type == GGML_TYPE_BF16
+        && x->type == GGML_TYPE_F32
+        && ctx->fn(K_F32_TRUNCATE_TO_BF16_INPLACE) != 0) {
+        const size_t x_bytes = ggml_nbytes(x);
+        VEDAdeviceptr x_trunc = 0;
+        if (vedaMemAllocAsync(&x_trunc, x_bytes, 0) == VEDA_SUCCESS && x_trunc != 0) {
+            if (ggml_ve_ok(vedaMemcpyDtoDAsync(x_trunc, x_vptr, x_bytes, 0),
+                           "vedaMemcpyDtoDAsync (bf16_input_trunc src)")) {
+                ctx->enqueue_hbm_free(x_trunc);
+                VEDAargs targs = nullptr;
+                if (ggml_ve_ok(vedaArgsCreate(&targs), "vedaArgsCreate(input_trunc)")) {
+                    vedaArgsSetVPtr(targs, 0, x_trunc);
+                    vedaArgsSetU64 (targs, 1, (uint64_t) ggml_nelements(x));
+                    if (ggml_ve_ok(vedaLaunchKernelEx(ctx->fn(K_F32_TRUNCATE_TO_BF16_INPLACE),
+                                                      0, targs, /*destroyArgs=*/1, nullptr),
+                                   "vedaLaunchKernelEx(f32_truncate_to_bf16)")) {
+                        x_vptr = x_trunc;
+                    }
+                }
+            } else {
+                vedaMemFreeAsync(x_trunc, 0);
+            }
+        }
+    }
 
     // Opt-in until validated end-to-end.
     static const bool colmajor_enabled =

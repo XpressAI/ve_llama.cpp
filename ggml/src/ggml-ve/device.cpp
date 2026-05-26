@@ -175,6 +175,7 @@ const kernel_meta & meta(kernel_id id) {
         /* K_COPY_STRIDED_F32_HBM                     */ { "ve_copy_strided_f32_hbm",                  KMOD_SGEMV  },
         /* K_COPY_BYTES_F32_HBM                       */ { "ve_copy_bytes_f32_hbm",                    KMOD_SGEMV  },
         /* K_GATED_DELTA_NET_F32_HBM                  */ { "ve_gated_delta_net_f32_hbm",               KMOD_SGEMV  },
+        /* K_F32_TRUNCATE_TO_BF16_INPLACE             */ { "ve_f32_truncate_to_bf16_precision_inplace", KMOD_SGEMV },
     };
     return table[id];
 }

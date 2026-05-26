@@ -483,3 +483,28 @@ uint64_t ve_copy_bytes_f32_hbm(
     }
     return 0;
 }
+
+/* ---------------------------------------------------------------------- */
+/* F32 -> "BF16 precision" in-place truncation.
+ *
+ * Matches what CPU's GGML does for MUL_MAT with src0=BF16, src1=F32:
+ *   vec_dot_type[BF16] = BF16, so GGML converts src1 from F32 to BF16
+ *   first (top 16 bits, round-to-nearest-even via from_float), then runs
+ *   ggml_vec_dot_bf16. We mimic the same precision loss by masking the
+ *   low 16 bits of each F32 to zero (truncate-toward-zero — not RTNE,
+ *   but close enough for the Qwen3.5 precision-matching experiment).
+ *
+ * Operates in-place on the F32 buffer.
+ */
+uint64_t ve_f32_truncate_to_bf16_precision_inplace(
+    VEDAdeviceptr buf_vptr,
+    uint64_t n) {
+    uint32_t * buf;
+    if (vedaMemPtr((void **)&buf, buf_vptr) != 0) return 1;
+    const long N = (long) n;
+#pragma omp parallel for
+    for (long i = 0; i < N; ++i) {
+        buf[i] &= 0xFFFF0000u;
+    }
+    return 0;
+}
