@@ -508,3 +508,174 @@ uint64_t ve_f32_truncate_to_bf16_precision_inplace(
     }
     return 0;
 }
+
+/* ---------------------------------------------------------------------- */
+/* SUM_ROWS:  dst[0, i1, i2, i3] = sum_i0 src[i0, i1, i2, i3]
+ *
+ * src strides passed in floats (sn1, sn2, sn3 — stride between successive
+ * i1, i2, i3 slices). dst strides similarly (dn1, dn2, dn3). dst->ne[0]
+ * must be 1.
+ *
+ * Used by Qwen3.5 gated-delta-net.
+ */
+uint64_t ve_sum_rows_f32_hbm(
+    VEDAdeviceptr dst_vptr,
+    VEDAdeviceptr src_vptr,
+    uint64_t ne00,
+    uint64_t ne01,
+    uint64_t ne02,
+    uint64_t ne03,
+    uint64_t sn1_f, uint64_t sn2_f, uint64_t sn3_f,
+    uint64_t dn1_f, uint64_t dn2_f, uint64_t dn3_f) {
+
+    float * dst;
+    const float * src;
+    if (vedaMemPtr((void **)&dst, dst_vptr) != 0) return 1;
+    if (vedaMemPtr((void **)(void*)&src, src_vptr) != 0) return 2;
+
+    const int n0 = (int) ne00;
+    const int n1 = (int) ne01;
+    const int n2 = (int) ne02;
+    const int n3 = (int) ne03;
+    const int s1 = (int) sn1_f, s2 = (int) sn2_f, s3 = (int) sn3_f;
+    const int d1 = (int) dn1_f, d2 = (int) dn2_f, d3 = (int) dn3_f;
+
+#pragma omp parallel for collapse(3) if (n1*n2*n3 >= 8)
+    for (int i3 = 0; i3 < n3; ++i3) {
+        for (int i2 = 0; i2 < n2; ++i2) {
+            for (int i1 = 0; i1 < n1; ++i1) {
+                const float * s = src + i3 * s3 + i2 * s2 + i1 * s1;
+                double acc = 0.0;
+#pragma _NEC ivdep
+                for (int i0 = 0; i0 < n0; ++i0) acc += s[i0];
+                dst[i3 * d3 + i2 * d2 + i1 * d1] = (float) acc;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* REPEAT:  tile src across all dims so dst->ne = nr * src->ne
+ * Both contiguous. Innermost contiguous copy is ne00 floats per chunk.
+ *
+ * Used by Qwen3.5 GDN to expand k_in / v_in from [head_v_dim, 1, num_heads]
+ * to [head_v_dim, head_v_dim, num_heads].
+ */
+uint64_t ve_repeat_f32_hbm(
+    VEDAdeviceptr dst_vptr,
+    VEDAdeviceptr src_vptr,
+    uint64_t ne00, uint64_t ne01, uint64_t ne02, uint64_t ne03,
+    uint64_t nr0,  uint64_t nr1,  uint64_t nr2,  uint64_t nr3) {
+
+    float * dst;
+    const float * src;
+    if (vedaMemPtr((void **)&dst, dst_vptr) != 0) return 1;
+    if (vedaMemPtr((void **)(void*)&src, src_vptr) != 0) return 2;
+
+    const long n00 = (long) ne00, n01 = (long) ne01;
+    const long n02 = (long) ne02, n03 = (long) ne03;
+    const long r0  = (long) nr0,  r1  = (long) nr1;
+    const long r2  = (long) nr2,  r3  = (long) nr3;
+
+    const long dN0 = n00 * r0;
+    const long dN1 = n01 * r1;
+    const long dN2 = n02 * r2;
+    /* dN3 = n03 * r3 — implied by total iteration. */
+
+    /* Walk the dst index space. For each output coord (j0, j1, j2, j3)
+     * the source coord is (j0 % n00, j1 % n01, j2 % n02, j3 % n03). */
+#pragma omp parallel for collapse(3) if (dN1*dN2 >= 8)
+    for (long j3 = 0; j3 < n03 * r3; ++j3) {
+        for (long j2 = 0; j2 < dN2; ++j2) {
+            for (long j1 = 0; j1 < dN1; ++j1) {
+                const long k1 = j1 % n01;
+                const long k2 = j2 % n02;
+                const long k3 = j3 % n03;
+                const float * s = src + k3 * (n00 * n01 * n02)
+                                       + k2 * (n00 * n01)
+                                       + k1 * n00;
+                float * d = dst + j3 * (dN0 * dN1 * dN2)
+                                + j2 * (dN0 * dN1)
+                                + j1 * dN0;
+                /* Tile the innermost ne00 floats r0 times. */
+                for (long i = 0; i < r0; ++i) {
+#pragma _NEC ivdep
+                    for (long k0 = 0; k0 < n00; ++k0) d[i*n00 + k0] = s[k0];
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* CONCAT along an arbitrary dim 0..3. Both sources F32, contiguous (the
+ * common path; non-contiguous can be staged through CPY first if needed).
+ *
+ * dim       which axis to concatenate along
+ * a_ne[i]   src0 dims
+ * b_ne[i]   src1 dims (== a_ne[i] except for i==dim)
+ * dst_ne[i] = a_ne[i] for i != dim,  a_ne[dim] + b_ne[dim] for i == dim
+ *
+ * All-contig fast path: walk dst row-major; the index space splits into
+ * "from a" and "from b" regions along `dim`.
+ */
+uint64_t ve_concat_f32_hbm(
+    VEDAdeviceptr dst_vptr,
+    VEDAdeviceptr a_vptr,
+    VEDAdeviceptr b_vptr,
+    uint64_t dim,
+    uint64_t a_ne0, uint64_t a_ne1, uint64_t a_ne2, uint64_t a_ne3,
+    uint64_t b_ne0, uint64_t b_ne1, uint64_t b_ne2, uint64_t b_ne3) {
+
+    float * dst;
+    const float * a;
+    const float * b;
+    if (vedaMemPtr((void **)&dst,                 dst_vptr) != 0) return 1;
+    if (vedaMemPtr((void **)(void*)&a,            a_vptr)   != 0) return 2;
+    if (vedaMemPtr((void **)(void*)&b,            b_vptr)   != 0) return 3;
+
+    const long aN[4] = { (long) a_ne0, (long) a_ne1, (long) a_ne2, (long) a_ne3 };
+    const long bN[4] = { (long) b_ne0, (long) b_ne1, (long) b_ne2, (long) b_ne3 };
+    long dN[4];
+    for (int i = 0; i < 4; ++i) {
+        dN[i] = aN[i];
+        if (i == (int) dim) dN[i] = aN[i] + bN[i];
+    }
+    const long aOff[4] = { 0, 0, 0, 0 };  /* a starts at 0 along every dim */
+    long bOff[4] = { 0, 0, 0, 0 };
+    bOff[dim] = aN[dim];  /* b starts where a ends along the concat axis */
+
+    /* Strides in float units (contiguous). */
+    const long aS[4] = { 1, aN[0], aN[0]*aN[1], aN[0]*aN[1]*aN[2] };
+    const long bS[4] = { 1, bN[0], bN[0]*bN[1], bN[0]*bN[1]*bN[2] };
+    const long dS[4] = { 1, dN[0], dN[0]*dN[1], dN[0]*dN[1]*dN[2] };
+
+#pragma omp parallel for collapse(2) if (dN[2]*dN[3] >= 4)
+    for (long j3 = 0; j3 < dN[3]; ++j3) {
+        for (long j2 = 0; j2 < dN[2]; ++j2) {
+            for (long j1 = 0; j1 < dN[1]; ++j1) {
+                /* Vectorise the innermost loop. */
+                for (long j0 = 0; j0 < dN[0]; ++j0) {
+                    int from_b = 0;
+                    long i0 = j0, i1 = j1, i2 = j2, i3 = j3;
+                    switch ((int) dim) {
+                        case 0: if (j0 >= aN[0]) { from_b = 1; i0 = j0 - aN[0]; } break;
+                        case 1: if (j1 >= aN[1]) { from_b = 1; i1 = j1 - aN[1]; } break;
+                        case 2: if (j2 >= aN[2]) { from_b = 1; i2 = j2 - aN[2]; } break;
+                        case 3: if (j3 >= aN[3]) { from_b = 1; i3 = j3 - aN[3]; } break;
+                        default: break;
+                    }
+                    float v;
+                    if (from_b) v = b[i0*bS[0] + i1*bS[1] + i2*bS[2] + i3*bS[3]];
+                    else        v = a[i0*aS[0] + i1*aS[1] + i2*aS[2] + i3*aS[3]];
+                    dst[j0*dS[0] + j1*dS[1] + j2*dS[2] + j3*dS[3]] = v;
+                }
+            }
+        }
+    }
+    /* silence aOff unused-warning */
+    (void) aOff[0];
+    return 0;
+}

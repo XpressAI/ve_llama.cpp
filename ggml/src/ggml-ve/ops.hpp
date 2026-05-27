@@ -95,6 +95,15 @@ bool ssm_conv_supports(const ggml_tensor * op);
 bool gated_delta_net_f32(backend_context * ctx, ggml_tensor * dst);
 bool gated_delta_net_supports(const ggml_tensor * op);
 
+bool sum_rows_f32(backend_context * ctx, ggml_tensor * dst);
+bool sum_rows_supports(const ggml_tensor * op);
+
+bool repeat_f32(backend_context * ctx, ggml_tensor * dst);
+bool repeat_supports(const ggml_tensor * op);
+
+bool concat_f32(backend_context * ctx, ggml_tensor * dst);
+bool concat_supports(const ggml_tensor * op);
+
 }  // namespace ops
 
 }  // namespace ggml_ve

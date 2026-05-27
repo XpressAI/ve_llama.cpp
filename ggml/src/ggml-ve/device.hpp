@@ -184,6 +184,10 @@ enum kernel_id {
     K_SUB_HBM_FULL,
     K_L2_NORM_HBM_FULL,
 
+    K_SUM_ROWS_F32_HBM,
+    K_REPEAT_F32_HBM,
+    K_CONCAT_F32_HBM,
+
     K_COUNT,
 };
 

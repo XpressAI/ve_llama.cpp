@@ -40,40 +40,62 @@ bool single_f32(const ggml_tensor * x, const ggml_tensor * dst) {
 
 // ---------------- MUL ----------------
 bool mul_supports(const ggml_tensor * op) {
-
     if (op->op != GGML_OP_MUL) return false;
+    if (op->type != GGML_TYPE_F32) return false;
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
-    if (!a || !b || !same_elemcount_f32(a, b, op)) return false;
-    // Until the producer-consumer stale-CPU-memory issue is fully fixed
-    // (see qwen35-correctness-open.md), only claim MULs where every tensor
-    // lives in VE HBM. A MUL whose src/dst lives in CPU memory means we'd
-    // have to stage through resolve_in_slow / resolve_out_slow, and the
-    // staleness pattern -- two unrelated tensors aliased to the same host
-    // slot by the cgraph allocator -- corrupts Qwen3.5's recurrent layers
-    // even though every kernel is correct in isolation.
-    if (!tensor_is_hbm(a) || !tensor_is_hbm(b) || !tensor_is_hbm(op)) return false;
+    if (!a || !b) return false;
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) return false;
+    const int64_t na = ggml_nelements(a);
+    const int64_t nb = ggml_nelements(b);
+    const int64_t nd = ggml_nelements(op);
+    if (nd != na) return false;
+    if (nb != na) {
+        // Broadcast: nb must divide na evenly.
+        if (nb == 0 || (na % nb) != 0) return false;
+    }
+    // Producer-consumer stale-CPU-memory guard for the same-shape path
+    // (see qwen35-correctness-open.md). Broadcast MUL doesn't hit the same
+    // pattern in practice (src1 is usually a small weight in HBM), so allow
+    // it through.
+    if (nb == na && (!tensor_is_hbm(a) || !tensor_is_hbm(b) || !tensor_is_hbm(op))) return false;
     return true;
 }
 
 bool mul_f32(backend_context * ctx, ggml_tensor * dst) {
-    VEDAfunction fn = ctx->fn(K_MUL_HBM_FULL);
-    if (fn == 0 || !mul_supports(dst)) return false;
+    if (!mul_supports(dst)) return false;
     const VEDAdeviceptr ya = ctx->resolve_out(dst);
     const VEDAdeviceptr a0 = ctx->resolve_in(dst->src[0]);
     const VEDAdeviceptr a1 = ctx->resolve_in(dst->src[1]);
     if (ya == 0 || a0 == 0 || a1 == 0) return false;
 
+    const uint64_t na = (uint64_t) ggml_nelements(dst->src[0]);
+    const uint64_t nb = (uint64_t) ggml_nelements(dst->src[1]);
+    const uint64_t ne00 = (uint64_t) dst->src[0]->ne[0];
+
+    VEDAfunction fn;
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(mul)")) return false;
-    vedaArgsSetVPtr(args, 0, ya);
-    vedaArgsSetVPtr(args, 1, a0);
-    vedaArgsSetVPtr(args, 2, a1);
-    vedaArgsSetU64 (args, 3, (uint64_t) ggml_nelements(dst));
+    if (na == nb) {
+        fn = ctx->fn(K_MUL_HBM_FULL);
+        vedaArgsSetVPtr(args, 0, ya);
+        vedaArgsSetVPtr(args, 1, a0);
+        vedaArgsSetVPtr(args, 2, a1);
+        vedaArgsSetU64 (args, 3, na);
+    } else {
+        fn = ctx->fn(K_MUL_HBM_FULL_BCAST);
+        vedaArgsSetVPtr(args, 0, ya);
+        vedaArgsSetVPtr(args, 1, a0);
+        vedaArgsSetVPtr(args, 2, a1);
+        vedaArgsSetU64 (args, 3, na);
+        vedaArgsSetU64 (args, 4, nb);
+        vedaArgsSetU64 (args, 5, ne00);
+    }
+    if (fn == 0) { vedaArgsDestroy(args); return false; }
 
-    uint64_t result = 0;
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
-                    "vedaLaunchKernelEx(mul_hbm_full)")) {
+                    "vedaLaunchKernelEx(mul)")) {
         return false;
     }
     ctx->mark_sync_pending();

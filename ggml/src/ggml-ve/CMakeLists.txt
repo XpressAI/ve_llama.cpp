@@ -71,6 +71,9 @@ ggml_add_backend_library(ggml-ve
     ops/softmax.cpp
     ops/ssm_conv.cpp
     ops/gated_delta_net.cpp
+    ops/sum_rows.cpp
+    ops/repeat.cpp
+    ops/concat.cpp
 )
 
 target_include_directories(ggml-ve PRIVATE ${VEDA_INCLUDE_DIR})

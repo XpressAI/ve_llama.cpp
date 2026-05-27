@@ -183,6 +183,9 @@ const kernel_meta & meta(kernel_id id) {
         /* K_SQR_HBM_FULL                             */ { "ve_sqr_hbm_full",                          KMOD_SGEMV  },
         /* K_SUB_HBM_FULL                             */ { "ve_sub_hbm_full",                          KMOD_SGEMV  },
         /* K_L2_NORM_HBM_FULL                         */ { "ve_l2_norm_hbm_full",                      KMOD_SGEMV  },
+        /* K_SUM_ROWS_F32_HBM                         */ { "ve_sum_rows_f32_hbm",                      KMOD_SGEMV  },
+        /* K_REPEAT_F32_HBM                           */ { "ve_repeat_f32_hbm",                        KMOD_SGEMV  },
+        /* K_CONCAT_F32_HBM                           */ { "ve_concat_f32_hbm",                        KMOD_SGEMV  },
     };
     return table[id];
 }

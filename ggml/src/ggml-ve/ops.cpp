@@ -97,6 +97,15 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
         case GGML_OP_L2_NORM:
             if (std::getenv("GGML_VE_NO_L2_NORM") != nullptr) return false;
             return trace(ops::l2_norm_supports(op));
+        case GGML_OP_SUM_ROWS:
+            if (std::getenv("GGML_VE_NO_SUM_ROWS") != nullptr) return false;
+            return trace(ops::sum_rows_supports(op));
+        case GGML_OP_REPEAT:
+            if (std::getenv("GGML_VE_NO_REPEAT") != nullptr) return false;
+            return trace(ops::repeat_supports(op));
+        case GGML_OP_CONCAT:
+            if (std::getenv("GGML_VE_NO_CONCAT") != nullptr) return false;
+            return trace(ops::concat_supports(op));
         default:
             return false;
     }
@@ -135,6 +144,12 @@ bool compute_forward(backend_context * ctx, ggml_tensor * node) {
             return ops::sub_f32(ctx, node);
         case GGML_OP_SQR:
             return ops::sqr_f32(ctx, node);
+        case GGML_OP_SUM_ROWS:
+            return ops::sum_rows_f32(ctx, node);
+        case GGML_OP_REPEAT:
+            return ops::repeat_f32(ctx, node);
+        case GGML_OP_CONCAT:
+            return ops::concat_f32(ctx, node);
         case GGML_OP_MUL:
             return ops::mul_f32(ctx, node);
         case GGML_OP_SCALE:
