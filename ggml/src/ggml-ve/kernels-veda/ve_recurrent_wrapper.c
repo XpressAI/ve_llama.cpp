@@ -873,3 +873,57 @@ uint64_t ve_rms_norm_strided_hbm(
     }
     return 0;
 }
+
+/* ---------------------------------------------------------------------- */
+/* CPY F32 -> F16 (contiguous). Used by attention to convert the KQ mask
+ * before passing it into Flash Attention. NCC can't vectorise 16-bit
+ * stores so we pack two F16 values per 32-bit word; the inner loop runs
+ * at full speed.
+ */
+uint64_t ve_cpy_f32_to_f16_hbm(
+    VEDAdeviceptr dst_vptr,
+    VEDAdeviceptr src_vptr,
+    uint64_t n) {
+
+    uint16_t * dst;
+    const float * src;
+    if (vedaMemPtr((void **)&dst, dst_vptr) != 0) return 1;
+    if (vedaMemPtr((void **)(void*)&src, src_vptr) != 0) return 2;
+
+    const long N = (long) n;
+#pragma omp parallel for
+    for (long i = 0; i < N; ++i) {
+        float v = src[i];
+        /* IEEE 754 binary32 -> binary16 (round-to-nearest, ties-to-even).
+         * Matches GGML's ggml_compute_fp32_to_fp16. */
+        uint32_t f;
+        __builtin_memcpy(&f, &v, sizeof(uint32_t));
+        const uint32_t sign = (f >> 31) & 0x1;
+        const int32_t  exp  = (int32_t)((f >> 23) & 0xff) - 127;
+        const uint32_t mant = f & 0x7fffff;
+        uint16_t out;
+        if (exp == 128) {
+            /* inf or NaN */
+            out = (uint16_t)((sign << 15) | (0x1f << 10) | (mant ? 1 : 0));
+        } else if (exp > 15) {
+            /* overflow -> inf */
+            out = (uint16_t)((sign << 15) | (0x1f << 10));
+        } else if (exp < -14) {
+            /* underflow -> denormal or zero */
+            int shift = -14 - exp;
+            uint32_t m = (mant | 0x800000) >> (shift + 13);
+            uint32_t round = (mant | 0x800000) >> (shift + 12) & 1;
+            out = (uint16_t)((sign << 15) | (m + round));
+        } else {
+            /* normal half */
+            uint32_t round = (mant >> 12) & 1;
+            uint32_t m = mant >> 13;
+            uint32_t e = (uint32_t)(exp + 15);
+            uint32_t bits = (sign << 15) | (e << 10) | m;
+            bits += round;
+            out = (uint16_t) bits;
+        }
+        dst[i] = out;
+    }
+    return 0;
+}

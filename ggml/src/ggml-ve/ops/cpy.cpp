@@ -16,6 +16,17 @@ namespace ggml_ve {
 namespace ops {
 
 bool cpy_supports(const ggml_tensor * op) {
+    static const bool dbg = std::getenv("GGML_VE_DEBUG_CPY") != nullptr;
+    auto rej = [&](const char * why) {
+        if (dbg) fprintf(stderr, "[VE-CPY-rej] %s : %s %s -> %s src=[%lld,%lld,%lld,%lld] dst=[%lld,%lld,%lld,%lld]\n",
+                         op->name[0]?op->name:"?", why,
+                         op->src[0]?ggml_type_name(op->src[0]->type):"?",
+                         ggml_type_name(op->type),
+                         op->src[0]?(long long)op->src[0]->ne[0]:0, op->src[0]?(long long)op->src[0]->ne[1]:0,
+                         op->src[0]?(long long)op->src[0]->ne[2]:0, op->src[0]?(long long)op->src[0]->ne[3]:0,
+                         (long long)op->ne[0], (long long)op->ne[1], (long long)op->ne[2], (long long)op->ne[3]);
+        return false;
+    };
 
     switch (op->op) {
         case GGML_OP_CPY:
@@ -26,27 +37,27 @@ bool cpy_supports(const ggml_tensor * op) {
             return false;
     }
     const ggml_tensor * x = op->src[0];
-    if (x == nullptr) return false;
-    // Same dtype required.
-    if (x->type != op->type) return false;
-    // GGML's CPY requires matching total element count; logical shape
-    // may differ (the conv_state slide in Qwen3.5 takes a 3D view and
-    // copies into a 2D view of the recurrent cache).
-    if (ggml_nelements(x) != ggml_nelements(op)) return false;
+    if (x == nullptr) return rej("missing src");
+    if (ggml_nelements(x) != ggml_nelements(op)) return rej("nelements mismatch");
 
-    // Three paths in order of speed:
-    //  (a) both contiguous, identical ne  -> contiguous memcpy
-    //  (b) same ne, F32, stride-1 inner   -> strided per-row copy
-    //  (c) F32, any ne with matching count -> generic element-by-element
-    //      (Qwen3.5 conv_state slide / similar reshape-on-copy)
+    if (x->type != op->type) {
+        // F32 -> F16 conversion path (used for attention KQ mask).
+        if (x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16
+            && ggml_is_contiguous(x) && ggml_is_contiguous(op)) {
+            return true;
+        }
+        return rej("dtype mismatch");
+    }
+
     if (x->type != GGML_TYPE_F32) {
-        // Only the F32 fast path is wired today; non-F32 -> contiguous-only.
-        if (!ggml_is_contiguous(x) || !ggml_is_contiguous(op))   return false;
-        if (ggml_nbytes(x) != ggml_nbytes(op))                   return false;
+        if (!ggml_is_contiguous(x)) return rej("non-f32 x not contig");
+        if (!ggml_is_contiguous(op)) return rej("non-f32 dst not contig");
+        if (ggml_nbytes(x) != ggml_nbytes(op)) return rej("non-f32 nbytes mismatch");
         return true;
     }
 
-    if (x->nb[0] != sizeof(float) || op->nb[0] != sizeof(float)) return false;
+    if (x->nb[0] != sizeof(float)) return rej("x nb[0] != f32");
+    if (op->nb[0] != sizeof(float)) return rej("dst nb[0] != f32");
     return true;
 }
 
@@ -70,7 +81,14 @@ bool cpy_f32(backend_context * ctx, ggml_tensor * dst) {
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(cpy)")) return false;
 
     VEDAfunction fn = 0;
-    if (both_contig && same_bytes && same_ne) {
+    if (src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+        // F32 -> F16 conversion (KQ mask).
+        fn = ctx->fn(K_CPY_F32_TO_F16_HBM);
+        if (fn == 0) { vedaArgsDestroy(args); return false; }
+        vedaArgsSetVPtr(args, 0, y);
+        vedaArgsSetVPtr(args, 1, x);
+        vedaArgsSetU64 (args, 2, (uint64_t) ggml_nelements(dst));
+    } else if (both_contig && same_bytes && same_ne) {
         fn = ctx->fn(K_COPY_HBM_FULL);
         if (fn == 0) { vedaArgsDestroy(args); return false; }
         vedaArgsSetVPtr(args, 0, y);

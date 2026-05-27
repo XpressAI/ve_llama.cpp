@@ -188,6 +188,7 @@ const kernel_meta & meta(kernel_id id) {
         /* K_CONCAT_F32_HBM                           */ { "ve_concat_f32_hbm",                        KMOD_SGEMV  },
         /* K_ROPE_MROPE_F32_HBM                       */ { "ve_rope_mrope_f32_hbm",                    KMOD_SGEMV  },
         /* K_RMS_NORM_STRIDED_HBM                     */ { "ve_rms_norm_strided_hbm",                  KMOD_SGEMV  },
+        /* K_CPY_F32_TO_F16_HBM                       */ { "ve_cpy_f32_to_f16_hbm",                    KMOD_SGEMV  },
     };
     return table[id];
 }
