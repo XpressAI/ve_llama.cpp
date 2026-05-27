@@ -27,6 +27,14 @@ void sgemv_packed_bf16_unr(float *y, float *x, bf16 *w, int n, int d) {
     float zero[2] = {0.0f, 0.0f};
     __vr bf16mskl = _vel_vbrdl_vsl(0x00000000ffff0000, VLEN);
     __vr low32msk = _vel_vbrdl_vsl(0x00000000ffffffff, VLEN);
+    /* Truncate F32 input to BF16 precision before the FMA. CPU's GGML
+     * does this via vec_dot_type[BF16] = BF16 (it converts src1 from F32
+     * to BF16 via from_float before the dot). Matching that exactly here
+     * makes VE bit-perfect against the CPU baseline -- without this,
+     * Qwen3.5's GDN block (which is L2_NORM-precision-sensitive)
+     * diverges past ~token 20. Inline cost: one ANDM per j-chunk amortized
+     * across 16 FMAs, so effectively free. */
+    __vr bf16inputmsk = _vel_vbrdl_vsl(0xffff0000ffff0000UL, VLEN);
 
     if (d >= 16) {
         for (i = 0; i < d; i+=16) {
@@ -77,6 +85,7 @@ void sgemv_packed_bf16_unr(float *y, float *x, bf16 *w, int n, int d) {
                 } else {
                     xv = _vel_vld_vssl(8, (void *)(x + j), vl);
                 }
+                xv = _vel_vand_vvvl(xv, bf16inputmsk, vl);
 
                 load_bf16_to_packed_fp32(wv1,wp1+j,vl);
                 load_bf16_to_packed_fp32(wv2,wp2+j,vl);
@@ -146,6 +155,7 @@ void sgemv_packed_bf16_unr(float *y, float *x, bf16 *w, int n, int d) {
             } else {
                 xv = _vel_vld_vssl(8, (void *)(x + j), vl);
             }
+            xv = _vel_vand_vvvl(xv, bf16inputmsk, vl);
 
             load_bf16_to_packed_fp32(wv1,wp1+j,vl);
 
