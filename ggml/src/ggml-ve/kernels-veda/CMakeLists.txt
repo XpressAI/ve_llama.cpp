@@ -80,6 +80,7 @@ ggml_ve_add_ncc_object(ve_recurrent_wrapper.c OBJ_RECUR_WRAPPER)
 ggml_ve_add_llvm_object(flash_attn_bf16_intrinsics.c OBJ_FA_INTRIN)
 ggml_ve_add_llvm_object(flash_attn_bf16_fused.c      OBJ_FA_FUSED)
 ggml_ve_add_llvm_object(flash_attn_bf16_colmajor.c   OBJ_FA_COL)
+ggml_ve_add_llvm_object(flash_attn_bf16kv_tile_fast.c OBJ_FA_TILE_FAST)
 ggml_ve_add_llvm_object(ve_sgemv_bf16.c              OBJ_SGEMV_BF16)
 ggml_ve_add_llvm_object(bf16_sgemm_intrinsics.c      OBJ_BF16_SGEMM)
 ggml_ve_add_llvm_object(sgemv_packed_bf16_unr.c      OBJ_SGEMV_PACKED)
@@ -92,13 +93,13 @@ add_custom_command(
     OUTPUT  ${LIBVE_SGEMV}
     COMMAND ${GGML_VE_NCC} -shared -fopenmp -ftrace -o ${LIBVE_SGEMV}
         ${OBJ_SGEMV_WRAPPER} ${OBJ_KVCOL_WRAPPER} ${OBJ_RECUR_WRAPPER}
-        ${OBJ_FA_INTRIN} ${OBJ_FA_FUSED} ${OBJ_FA_COL}
+        ${OBJ_FA_INTRIN} ${OBJ_FA_FUSED} ${OBJ_FA_COL} ${OBJ_FA_TILE_FAST}
         ${OBJ_SGEMV_BF16} ${OBJ_BF16_SGEMM} ${OBJ_SGEMV_PACKED}
         -lm -L${GGML_VE_NLC_LIB} -lcblas -lblas_openmp
         -Wl,-rpath,${GGML_VE_NLC_LIB}
     DEPENDS
         ${OBJ_SGEMV_WRAPPER} ${OBJ_KVCOL_WRAPPER} ${OBJ_RECUR_WRAPPER}
-        ${OBJ_FA_INTRIN} ${OBJ_FA_FUSED} ${OBJ_FA_COL}
+        ${OBJ_FA_INTRIN} ${OBJ_FA_FUSED} ${OBJ_FA_COL} ${OBJ_FA_TILE_FAST}
         ${OBJ_SGEMV_BF16} ${OBJ_BF16_SGEMM} ${OBJ_SGEMV_PACKED}
     COMMENT "NCC link libve_sgemv.so"
     VERBATIM)

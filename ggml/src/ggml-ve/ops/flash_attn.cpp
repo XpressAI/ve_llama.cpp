@@ -247,16 +247,19 @@ bool flash_attn(backend_context * ctx, ggml_tensor * dst) {
         fn = ctx->fn(K_FLASH_ATTN_F32_HBM);
     } else if (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_BF16) {
         if (can_tile) {
-            // Default: the plain NCC tile kernel — still the fastest.
-            // GGML_VE_FA_TILE_VEXP=1   selects the __builtin_vec_expf
-            //   variant. Loses today (vec_expf overhead at vl=16, plus
-            //   unconditional softmax doubles the FMA work).
-            // GGML_VE_FA_TILE_INTRIN=1 selects the packed-BF16 intrinsics
-            //   variant. Also loses (no K-reuse across queries yet).
+            // Default: NCC tile kernel — still the fastest at typical
+            // head_dim=128 because packed VL=64 has the same FMA
+            // throughput as unpacked VL=128 but more vector-issue overhead.
+            // Three opt-in foothold variants:
+            //   GGML_VE_FA_TILE_INTRIN=1 — per-Q intrinsics (slower)
+            //   GGML_VE_FA_TILE_VEXP=1   — vec_expf path (slower)
+            //   GGML_VE_FA_TILE_FAST=1   — multi-Q packed intrinsics (slower)
             if (std::getenv("GGML_VE_FA_TILE_INTRIN") != nullptr) {
                 fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_INTRIN_HBM);
             } else if (std::getenv("GGML_VE_FA_TILE_VEXP") != nullptr) {
                 fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_VEXP_HBM);
+            } else if (std::getenv("GGML_VE_FA_TILE_FAST") != nullptr) {
+                fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_FAST_HBM);
             }
             if (fn == 0) {
                 fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_HBM);

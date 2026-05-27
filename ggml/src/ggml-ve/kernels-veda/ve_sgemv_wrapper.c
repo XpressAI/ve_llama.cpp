@@ -9373,6 +9373,157 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_vexp_hbm(
 }
 
 /*
+ * VEDA wrapper for the multi-Q intrinsics tile FA kernel.
+ *
+ * Inner per-(b,h,q_tile) work lives in flash_attn_bf16kv_tile_fast.c
+ * (compiled with LLVM-VE-RV for the velintrin.h packed-FP32 ops). This
+ * wrapper handles OMP parallelism, mask plumbing, and the dims plumbing
+ * to that inner function.
+ */
+extern void flash_attn_tile_inner_intrinsics(
+    float * VKQ,
+    float * M_state,
+    float * S_state,
+    const float * Q_tile,
+    const uint16_t * K_base,
+    const uint16_t * V_base,
+    const uint16_t * const * mask_rows,
+    int nq, int n_kv, int d, int dv,
+    int64_t nb_k1, int64_t nb_v1,
+    float scale, float slope, float logit_softcap);
+
+uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_fast_hbm(
+    VEDAdeviceptr dst_hbm,
+    VEDAdeviceptr q_hbm,
+    VEDAdeviceptr k_hbm,
+    VEDAdeviceptr v_hbm,
+    VEDAdeviceptr mask_hbm,
+    uint64_t D, uint64_t Dv,
+    uint64_t N, uint64_t S_kv,
+    uint64_t H, uint64_t Hk, uint64_t B,
+    uint64_t nb_q1, uint64_t nb_q2, uint64_t nb_q3,
+    uint64_t nb_k1, uint64_t nb_k2, uint64_t nb_k3,
+    uint64_t nb_v1, uint64_t nb_v2, uint64_t nb_v3,
+    uint64_t nb_m1, uint64_t nb_m2, uint64_t nb_m3,
+    uint64_t nb_o1, uint64_t nb_o2, uint64_t nb_o3,
+    uint64_t scale_bits, uint64_t max_bias_bits, uint64_t softcap_bits,
+    uint64_t mask_ne2, uint64_t mask_ne3)
+{
+    float* dst;
+    const float* q;
+    const uint16_t* k;
+    const uint16_t* v;
+    const uint16_t* mask = NULL;
+    if (vedaMemPtr((void**)&dst, dst_hbm) != 0) return 1;
+    if (vedaMemPtr((void**)&q, q_hbm) != 0) return 2;
+    if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
+    if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 5;
+
+    float scale, max_bias, logit_softcap;
+    {
+        uint32_t tmp;
+        tmp = (uint32_t)scale_bits;    __builtin_memcpy(&scale, &tmp, sizeof(float));
+        tmp = (uint32_t)max_bias_bits; __builtin_memcpy(&max_bias, &tmp, sizeof(float));
+        tmp = (uint32_t)softcap_bits;  __builtin_memcpy(&logit_softcap, &tmp, sizeof(float));
+    }
+    if (logit_softcap != 0.0f) scale /= logit_softcap;
+
+    const uint32_t n_head = (uint32_t)H;
+    const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)n_head));
+    const float m0 = powf(2.0f, -(max_bias) / (float)n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
+
+    const int64_t rk = (int64_t)(H / Hk);
+    const int64_t rv = (int64_t)(H / Hk);
+
+    const int d        = (int)D;
+    const int dv       = (int)Dv;
+    const int n_tokens = (int)N;
+    const int n_kv     = (int)S_kv;
+    const int n_heads  = (int)H;
+    const int n_batch  = (int)B;
+
+    #define NQ_TILE_F 16
+
+    const int n_q_tiles  = (n_tokens + NQ_TILE_F - 1) / NQ_TILE_F;
+    const int total_work = n_batch * n_heads * n_q_tiles;
+
+    #pragma omp parallel for
+    for (int work_id = 0; work_id < total_work; work_id++) {
+        const int ib       = work_id / (n_heads * n_q_tiles);
+        const int ih       = (work_id / n_q_tiles) % n_heads;
+        const int q_tile_i = work_id % n_q_tiles;
+        const int iq_base  = q_tile_i * NQ_TILE_F;
+        const int nq       = (iq_base + NQ_TILE_F <= n_tokens) ? NQ_TILE_F : (n_tokens - iq_base);
+
+        float slope = 1.0f;
+        if (max_bias > 0.0f) {
+            uint32_t hh = (uint32_t)ih;
+            slope = (hh < n_head_log2) ? powf(m0, (float)(hh + 1))
+                                        : powf(m1, (float)(2*(hh - n_head_log2) + 1));
+        }
+
+        const int ik_head = ih / (int)rk;
+        const int iv_head = ih / (int)rv;
+
+        /* Per-tile state on the stack. Q_tile + VKQ are 8-byte aligned
+         * for the packed intrinsic loads in the inner function. */
+        float Q_tile[NQ_TILE_F * 256] __attribute__((aligned(8)));
+        const uint16_t* mask_rows[NQ_TILE_F];
+        float M_state[NQ_TILE_F];
+        float S_state[NQ_TILE_F];
+        float VKQ[NQ_TILE_F * 256] __attribute__((aligned(8)));
+
+        /* Load Q tile + zero VKQ + init M/S + resolve mask rows. */
+        for (int j = 0; j < nq; j++) {
+            const float* q_vec = (const float*)((const char*)q
+                + (iq_base + j) * nb_q1 + ih * nb_q2 + ib * nb_q3);
+            #pragma _NEC ivdep
+            for (int i = 0; i < d; i++) Q_tile[j*d + i] = q_vec[i];
+            M_state[j] = -INFINITY;
+            S_state[j] = 0.0f;
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) VKQ[j*dv + i] = 0.0f;
+            if (mask != NULL) {
+                int im2 = ih % (int)mask_ne2;
+                int im3 = ib % (int)mask_ne3;
+                mask_rows[j] = (const uint16_t*)((const char*)mask
+                    + (iq_base + j) * nb_m1 + im2 * nb_m2 + im3 * nb_m3);
+            } else {
+                mask_rows[j] = NULL;
+            }
+        }
+
+        /* Per-(b, ih) K/V base; inner loop adds ic * nb_k1 / nb_v1. */
+        const uint16_t * K_base = (const uint16_t *)((const char*)k
+            + ik_head * nb_k2 + ib * nb_k3);
+        const uint16_t * V_base = (const uint16_t *)((const char*)v
+            + iv_head * nb_v2 + ib * nb_v3);
+
+        flash_attn_tile_inner_intrinsics(
+            VKQ, M_state, S_state, Q_tile, K_base, V_base, mask_rows,
+            nq, n_kv, d, dv,
+            (int64_t)nb_k1, (int64_t)nb_v1,
+            scale, slope, logit_softcap);
+
+        /* Final normalize + write out. */
+        for (int j = 0; j < nq; j++) {
+            float S_inv = (S_state[j] == 0.0f) ? 0.0f : 1.0f / S_state[j];
+            float* out_ptr = (float*)((char*)dst
+                + ib * nb_o3 + (iq_base + j) * nb_o2 + ih * nb_o1);
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) out_ptr[i] = VKQ[j*dv + i] * S_inv;
+        }
+    }
+
+    #undef NQ_TILE_F
+
+    asm volatile("fencem 2" ::: "memory");
+    return 0;
+}
+
+/*
  * VEDA-callable wrapper for LLVM-VE intrinsics flash attention
  * 
  * This converts HBM pointers and calls the intrinsics-based implementation.
