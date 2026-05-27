@@ -69,7 +69,7 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
             return ops::set_rows_supports(op);
         case GGML_OP_ROPE:
             if (std::getenv("GGML_VE_NO_ROPE") != nullptr) return false;
-            return ops::rope_supports(op);
+            return trace(ops::rope_supports(op));
         case GGML_OP_MUL_MAT_ID:
             return ops::mul_mat_id_supports(op);
         case GGML_OP_ADD_ID:

@@ -679,3 +679,140 @@ uint64_t ve_concat_f32_hbm(
     (void) aOff[0];
     return 0;
 }
+
+/* ---------------------------------------------------------------------- */
+/* MROPE (multi-section Rotary Position Embedding).
+ *
+ * Used by Qwen3.5 / Qwen3.6 / Qwen2.5-VL etc. The op param `sections`
+ * partitions the head dim into up to 4 sections, each consuming its own
+ * position channel (T, H, W, E) from src1.
+ *
+ * Inputs:
+ *   src0  F32 [ne0, n_heads, n_tokens, n_batch]   input Q or K rows
+ *   src1  I32 [n_tokens*4]                          positions, laid out
+ *                                                   contiguously as
+ *                                                   [pos_t..., pos_h...,
+ *                                                    pos_w..., pos_e...]
+ *   dst   F32 same shape as src0
+ *
+ * Pair layout: NEOX-style (i0 and i0 + n_dims/2). The trailing ne0 -
+ * n_dims channels (if any) are copied unrotated.
+ *
+ * sections[4]   per-section dim count (each section uses its own pos chan)
+ * freq_base     rope.freq_base
+ * freq_scale    1.0 by default (linear scaling factor)
+ * attn_factor   YaRN attention multiplier; 1.0 by default
+ * ext_factor    YaRN extrapolation mix; 0.0 disables YaRN
+ * n_dims        head dim that gets rotated (the rest is straight copy)
+ *
+ * For Qwen3.5: sections=[11,11,10,0], n_dims=64, ne0=256.
+ */
+uint64_t ve_rope_mrope_f32_hbm(
+    VEDAdeviceptr dst_vptr,
+    VEDAdeviceptr src_vptr,
+    VEDAdeviceptr pos_vptr,
+    uint64_t ne0,
+    uint64_t n_heads,
+    uint64_t n_tokens,
+    uint64_t n_batch,
+    uint64_t src_nb1_b, uint64_t src_nb2_b, uint64_t src_nb3_b,
+    uint64_t n_dims,
+    uint64_t s0, uint64_t s1, uint64_t s2, uint64_t s3,
+    uint64_t freq_base_bits,
+    uint64_t freq_scale_bits,
+    uint64_t attn_factor_bits,
+    uint64_t is_imrope_flag) {
+
+    float * dst;
+    const float * src;
+    const int32_t * pos;
+    if (vedaMemPtr((void **)&dst, dst_vptr) != 0) return 1;
+    if (vedaMemPtr((void **)(void*)&src, src_vptr) != 0) return 2;
+    if (vedaMemPtr((void **)(void*)&pos, pos_vptr) != 0) return 3;
+    const int is_imrope = (int) is_imrope_flag;
+
+    float freq_base, freq_scale, mscale;
+    __builtin_memcpy(&freq_base, &freq_base_bits, sizeof(float));
+    __builtin_memcpy(&freq_scale, &freq_scale_bits, sizeof(float));
+    __builtin_memcpy(&mscale, &attn_factor_bits, sizeof(float));
+
+    const int N0 = (int) ne0;
+    const int NH = (int) n_heads;
+    const int NT = (int) n_tokens;
+    const int NB = (int) n_batch;
+    const int ND = (int) n_dims;
+    const int sec[4] = { (int) s0, (int) s1, (int) s2, (int) s3 };
+    const int sect_dims = sec[0] + sec[1] + sec[2] + sec[3];
+    const int sec_w = sec[0] + sec[1];
+    const int sec_e = sec_w + sec[2];
+
+    /* Row strides in floats (dst is assumed contiguous, src can be a view). */
+    const int sN1 = (int) (src_nb1_b / sizeof(float));
+    const int sN2 = (int) (src_nb2_b / sizeof(float));
+    const int sN3 = (int) (src_nb3_b / sizeof(float));
+    const int dN0 = N0;
+    const int dN1 = N0 * NH;
+    const int dN2 = dN1 * NT;
+
+    const float theta_scale_per_pair = powf(freq_base, -2.0f / (float) ND);
+
+#pragma omp parallel for collapse(3) if (NB*NT*NH >= 8)
+    for (int b = 0; b < NB; ++b) {
+        for (int t = 0; t < NT; ++t) {
+            for (int h = 0; h < NH; ++h) {
+                const float * sr = src + b * sN3 + t * sN2 + h * sN1;
+                float       * dr = dst + b * dN2 + t * dN1 + h * dN0;
+
+                const int32_t p_t = pos[t + 0 * NT];
+                const int32_t p_h = pos[t + 1 * NT];
+                const int32_t p_w = pos[t + 2 * NT];
+                const int32_t p_e = pos[t + 3 * NT];
+
+                float theta_t = (float) p_t;
+                float theta_h = (float) p_h;
+                float theta_w = (float) p_w;
+                float theta_e = (float) p_e;
+
+                /* Rotate the first ND channels in NEOX pair layout
+                 * (pair indices are (i0/2, i0/2 + ND/2)). */
+                for (int i0 = 0; i0 < ND; i0 += 2) {
+                    const int ic = i0 / 2;
+                    const int sector = ic % sect_dims;
+
+                    float theta = theta_t;
+                    if (is_imrope) {
+                        /* Qwen3-VL interleaved MROPE: section assignment
+                         * is by sector % 3, with per-channel caps. */
+                        if      (sector % 3 == 1 && sector < 3 * sec[1]) theta = theta_h;
+                        else if (sector % 3 == 2 && sector < 3 * sec[2]) theta = theta_w;
+                        else if (sector % 3 == 0 && sector < 3 * sec[0]) theta = theta_t;
+                        else                                              theta = theta_e;
+                    } else {
+                        if (sector >= sec[0] && sector < sec_w)        theta = theta_h;
+                        else if (sector >= sec_w && sector < sec_e)    theta = theta_w;
+                        else if (sector >= sec_e)                      theta = theta_e;
+                    }
+
+                    const float t_scaled = freq_scale * theta;
+                    const float cos_t = cosf(t_scaled) * mscale;
+                    const float sin_t = sinf(t_scaled) * mscale;
+
+                    const float x0 = sr[ic];
+                    const float x1 = sr[ic + ND/2];
+
+                    dr[ic]          = x0 * cos_t - x1 * sin_t;
+                    dr[ic + ND/2]   = x0 * sin_t + x1 * cos_t;
+
+                    theta_t *= theta_scale_per_pair;
+                    theta_h *= theta_scale_per_pair;
+                    theta_w *= theta_scale_per_pair;
+                    theta_e *= theta_scale_per_pair;
+                }
+
+                /* Copy the unrotated remainder ne0 - n_dims pairs. */
+                for (int i0 = ND; i0 < N0; ++i0) dr[i0] = sr[i0];
+            }
+        }
+    }
+    return 0;
+}
