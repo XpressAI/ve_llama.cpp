@@ -81,7 +81,7 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
             return ops::soft_max_supports(op);
         case GGML_OP_MUL_MAT:
             if (std::getenv("GGML_VE_NO_MUL_MAT") != nullptr) return false;
-            return ops::mul_mat_supports(op) || ops::mul_mat_q_supports(op);
+            return trace(ops::mul_mat_supports(op) || ops::mul_mat_q_supports(op));
         case GGML_OP_SSM_CONV:
             if (std::getenv("GGML_VE_NO_SSM_CONV") != nullptr) return false;
             return ops::ssm_conv_supports(op);
@@ -113,7 +113,7 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
 
 bool compute_forward(backend_context * ctx, ggml_tensor * node) {
     static bool debug = (std::getenv("GGML_VE_DEBUG_DISPATCH") != nullptr);
-    if (debug && debug_dispatch_count < 200) {
+    if (debug && debug_dispatch_count < 5000) {
         debug_dispatch_count++;
         const char * src0_buft = "?";
         const char * src1_buft = "?";

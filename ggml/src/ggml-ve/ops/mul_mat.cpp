@@ -19,31 +19,43 @@ namespace ggml_ve {
 namespace ops {
 
 bool mul_mat_supports(const ggml_tensor * op) {
+    static const bool dbg = std::getenv("GGML_VE_DEBUG_MUL_MAT") != nullptr;
+    auto rej = [&](const char * why) {
+        if (dbg) fprintf(stderr, "[VE-MM-rej] %s : %s w=%s[%lld,%lld,%lld,%lld] x=%s[%lld,%lld,%lld,%lld]\n",
+                         op->name[0]?op->name:"?", why,
+                         op->src[0]?ggml_type_name(op->src[0]->type):"?",
+                         op->src[0]?(long long)op->src[0]->ne[0]:0, op->src[0]?(long long)op->src[0]->ne[1]:0,
+                         op->src[0]?(long long)op->src[0]->ne[2]:0, op->src[0]?(long long)op->src[0]->ne[3]:0,
+                         op->src[1]?ggml_type_name(op->src[1]->type):"?",
+                         op->src[1]?(long long)op->src[1]->ne[0]:0, op->src[1]?(long long)op->src[1]->ne[1]:0,
+                         op->src[1]?(long long)op->src[1]->ne[2]:0, op->src[1]?(long long)op->src[1]->ne[3]:0);
+        return false;
+    };
 
     if (op->op != GGML_OP_MUL_MAT || op->type != GGML_TYPE_F32) return false;
 
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];
-    if (w == nullptr || x == nullptr) return false;
-    if (x->type != GGML_TYPE_F32) return false;
-    if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16) return false;
+    if (w == nullptr || x == nullptr) return rej("missing srcs");
+    if (x->type != GGML_TYPE_F32) return rej("x not f32");
+    if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16) return rej("w type");
 
     // Shapes: dst = src0 @ src1^T  ->  K matches, M = src0 row dim, N = src1 row dim.
     const int64_t K = w->ne[0];
     const int64_t M = w->ne[1];
     const int64_t N = x->ne[1];
-    if (K != x->ne[0])   return false;        // K must match
-    if (op->ne[0] != M)  return false;        // dst rows = M
-    if (op->ne[1] != N)  return false;        // dst cols = N
+    if (K != x->ne[0])   return rej("K mismatch");
+    if (op->ne[0] != M)  return rej("dst rows");
+    if (op->ne[1] != N)  return rej("dst cols");
 
     // No broadcasting yet.
-    if (op->ne[2] != 1 || op->ne[3] != 1) return false;
-    if (w->ne[2]  != 1 || w->ne[3]  != 1) return false;
-    if (x->ne[2]  != 1 || x->ne[3]  != 1) return false;
+    if (op->ne[2] != 1 || op->ne[3] != 1) return rej("dst ne2/ne3");
+    if (w->ne[2]  != 1 || w->ne[3]  != 1) return rej("w ne2/ne3");
+    if (x->ne[2]  != 1 || x->ne[3]  != 1) return rej("x ne2/ne3");
 
-    if (!ggml_is_contiguous(w))  return false;
-    if (!ggml_is_contiguous(x))  return false;
-    if (!ggml_is_contiguous(op)) return false;
+    if (!ggml_is_contiguous(w))  return rej("w not contig");
+    if (!ggml_is_contiguous(x))  return rej("x not contig");
+    if (!ggml_is_contiguous(op)) return rej("dst not contig");
 
     // We need an all-HBM fast path; we don't yet have an HMEM-round-trip
     // fallback for the cases libve_sgemv.so only ships HMEM-IO kernels for.

@@ -591,14 +591,17 @@ bool dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) 
 bool dev_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
     // Ops VE wants to claim from CPU memory even when the scheduler's first
-    // choice would be CPU. MUL_MAT is the heaviest op; ADD is bandwidth-bound
-    // but trivial.
+    // choice would be CPU. We aggressively pull everything we have a kernel
+    // for — the project goal is "everything on VE," not "match CPU on perf."
     switch (op->op) {
         case GGML_OP_ADD:
+        case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_SCALE:
         case GGML_OP_UNARY:
+        case GGML_OP_GLU:
         case GGML_OP_RMS_NORM:
+        case GGML_OP_L2_NORM:
         case GGML_OP_CPY:
         case GGML_OP_CONT:
         case GGML_OP_DUP:
@@ -613,6 +616,10 @@ bool dev_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
         case GGML_OP_SOFT_MAX:
         case GGML_OP_SSM_CONV:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_SQR:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_REPEAT:
+        case GGML_OP_CONCAT:
             return true;
         default:
             return false;
