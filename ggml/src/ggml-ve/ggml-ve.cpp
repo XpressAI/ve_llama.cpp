@@ -394,6 +394,9 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
                     fprintf(stderr, "[VE-GC] execute failed for sig=%016lx — marked un-executable, falling back\n",
                             (unsigned long) sig);
                 }
+                // Drop any half-staged DtoH the failed execute may have left
+                // before the interpreter retries the same graph.
+                ctx->abort_pending();
             }
             // Anything else: silently fall through to the interpreter.
         } else {
@@ -425,6 +428,14 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
                 ctx->ops_total() += cgraph->n_nodes;
                 return GGML_STATUS_SUCCESS;
             }
+            // Compile or execute didn't pan out (or trace refused). Whatever
+            // partial work hit the VE-side queues from a failed execute()
+            // attempt must be drained before the interpreter takes over —
+            // otherwise stale kernel launches race with the interpreter and
+            // corrupt later results. abort_pending() drops queued ops without
+            // syncing; flush+sync would block on the unfinished work, which
+            // is what we don't want here.
+            ctx->abort_pending();
         }
     }
 
