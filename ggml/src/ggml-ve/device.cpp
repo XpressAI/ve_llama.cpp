@@ -176,6 +176,13 @@ const kernel_meta & meta(kernel_id id) {
         /* K_COPY_BYTES_F32_HBM                       */ { "ve_copy_bytes_f32_hbm",                    KMOD_SGEMV  },
         /* K_GATED_DELTA_NET_F32_HBM                  */ { "ve_gated_delta_net_f32_hbm",               KMOD_SGEMV  },
         /* K_F32_TRUNCATE_TO_BF16_INPLACE             */ { "ve_f32_truncate_to_bf16_precision_inplace", KMOD_SGEMV },
+        /* K_SIGMOID_HBM_FULL                         */ { "ve_sigmoid_hbm_full",                      KMOD_SGEMV  },
+        /* K_SOFTPLUS_HBM_FULL                        */ { "ve_softplus_hbm_full",                     KMOD_SGEMV  },
+        /* K_EXP_HBM_FULL                             */ { "ve_exp_hbm_full",                          KMOD_SGEMV  },
+        /* K_NEG_HBM_FULL                             */ { "ve_neg_hbm_full",                          KMOD_SGEMV  },
+        /* K_SQR_HBM_FULL                             */ { "ve_sqr_hbm_full",                          KMOD_SGEMV  },
+        /* K_SUB_HBM_FULL                             */ { "ve_sub_hbm_full",                          KMOD_SGEMV  },
+        /* K_L2_NORM_HBM_FULL                         */ { "ve_l2_norm_hbm_full",                      KMOD_SGEMV  },
     };
     return table[id];
 }

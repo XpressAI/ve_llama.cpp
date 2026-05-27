@@ -4867,18 +4867,190 @@ uint64_t ve_silu_hbm_full(VEDAdeviceptr y_vptr,
                            uint64_t n) {
     float* y;
     float* x;
-    
+
     vedaMemPtr((void**)&y, y_vptr);
     vedaMemPtr((void**)&x, x_vptr);
-    
+
     int n_int = (int)n;
-    
+
+    /* Clamp |x| <= 80 — NCC's vectorised expf returns NaN past ~|88| and
+     * SILU saturates to 0 (x<<0) or x (x>>0) anyway. */
     #pragma _NEC ivdep
     for (int i = 0; i < n_int; i++) {
         float xi = x[i];
+        if (xi < -80.0f) xi = -80.0f;
+        if (xi > 80.0f)  xi = 80.0f;
         y[i] = xi / (1.0f + expf(-xi));
     }
-    
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * SIGMOID:  y = 1 / (1 + exp(-x))
+ * ----------------------------------------------------------------------*/
+uint64_t ve_sigmoid_hbm_full(VEDAdeviceptr y_vptr,
+                             VEDAdeviceptr x_vptr,
+                             uint64_t n) {
+    float* y;
+    float* x;
+    if (vedaMemPtr((void**)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_vptr) != 0) return 2;
+
+    const int n_int = (int) n;
+    /* Clamp |x| <= 80 to dodge NCC vectorised-expf NaN. */
+    #pragma _NEC ivdep
+    for (int i = 0; i < n_int; i++) {
+        float xi = x[i];
+        if (xi < -80.0f) xi = -80.0f;
+        if (xi > 80.0f)  xi = 80.0f;
+        y[i] = 1.0f / (1.0f + expf(-xi));
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * SOFTPLUS:  y = log(1 + exp(x))
+ * For large x, log(1+exp(x)) -> x (the +1 is negligible).
+ * For very negative x, exp(x) underflows to 0 -> log(1) = 0.
+ * Use the numerically-stable formulation max(x, 0) + log1p(exp(-|x|)).
+ * ----------------------------------------------------------------------*/
+uint64_t ve_softplus_hbm_full(VEDAdeviceptr y_vptr,
+                              VEDAdeviceptr x_vptr,
+                              uint64_t n) {
+    float* y;
+    float* x;
+    if (vedaMemPtr((void**)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_vptr) != 0) return 2;
+
+    const int n_int = (int) n;
+    #pragma _NEC ivdep
+    for (int i = 0; i < n_int; i++) {
+        float xi = x[i];
+        float ax = (xi < 0.0f) ? -xi : xi;
+        if (ax > 80.0f) ax = 80.0f;          /* expf NaN guard */
+        float t = expf(-ax);
+        float lp = log1pf(t);
+        float m = (xi > 0.0f) ? xi : 0.0f;
+        y[i] = m + lp;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * EXP:  y = exp(x).  Clamp argument to the safe range.
+ * ----------------------------------------------------------------------*/
+uint64_t ve_exp_hbm_full(VEDAdeviceptr y_vptr,
+                         VEDAdeviceptr x_vptr,
+                         uint64_t n) {
+    float* y;
+    float* x;
+    if (vedaMemPtr((void**)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_vptr) != 0) return 2;
+
+    const int n_int = (int) n;
+    #pragma _NEC ivdep
+    for (int i = 0; i < n_int; i++) {
+        float xi = x[i];
+        if (xi > 80.0f)  xi = 80.0f;
+        if (xi < -80.0f) xi = -80.0f;
+        y[i] = expf(xi);
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * NEG:  y = -x
+ * ----------------------------------------------------------------------*/
+uint64_t ve_neg_hbm_full(VEDAdeviceptr y_vptr,
+                         VEDAdeviceptr x_vptr,
+                         uint64_t n) {
+    float* y;
+    float* x;
+    if (vedaMemPtr((void**)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_vptr) != 0) return 2;
+
+    const int n_int = (int) n;
+    #pragma _NEC ivdep
+    for (int i = 0; i < n_int; i++) y[i] = -x[i];
+    return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * SQR:  y = x*x
+ * ----------------------------------------------------------------------*/
+uint64_t ve_sqr_hbm_full(VEDAdeviceptr y_vptr,
+                         VEDAdeviceptr x_vptr,
+                         uint64_t n) {
+    float* y;
+    float* x;
+    if (vedaMemPtr((void**)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_vptr) != 0) return 2;
+
+    const int n_int = (int) n;
+    #pragma _NEC ivdep
+    for (int i = 0; i < n_int; i++) { float xi = x[i]; y[i] = xi * xi; }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * SUB:  y = a - b   (element-wise, same shape, all HBM)
+ * ----------------------------------------------------------------------*/
+uint64_t ve_sub_hbm_full(VEDAdeviceptr y_vptr,
+                         VEDAdeviceptr a_vptr,
+                         VEDAdeviceptr b_vptr,
+                         uint64_t n) {
+    float* y;
+    float* a;
+    float* b;
+    if (vedaMemPtr((void**)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void**)&a, a_vptr) != 0) return 2;
+    if (vedaMemPtr((void**)&b, b_vptr) != 0) return 3;
+
+    const int n_int = (int) n;
+    #pragma _NEC ivdep
+    for (int i = 0; i < n_int; i++) y[i] = a[i] - b[i];
+    return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * L2_NORM along innermost dimension.
+ *   For each row of `nc` floats:  scale = 1 / sqrt(sum(x[j]^2) + eps)
+ *                                 y[j]  = x[j] * scale
+ * ggml uses eps = 1e-6 by default for L2_NORM. Input and output strides
+ * are contiguous along ne[0]; we iterate rows in OMP.
+ * ----------------------------------------------------------------------*/
+uint64_t ve_l2_norm_hbm_full(VEDAdeviceptr y_vptr,
+                             VEDAdeviceptr x_vptr,
+                             uint64_t nc,
+                             uint64_t nr,
+                             uint64_t eps_bits) {
+    float* y;
+    float* x;
+    if (vedaMemPtr((void**)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_vptr) != 0) return 2;
+
+    float eps;
+    __builtin_memcpy(&eps, &eps_bits, sizeof(float));
+
+    const int cols = (int) nc;
+    const int rows = (int) nr;
+
+    #pragma omp parallel for
+    for (int r = 0; r < rows; r++) {
+        const float * xr = x + r * cols;
+        float       * yr = y + r * cols;
+        double sum_sq = 0.0;
+        #pragma _NEC ivdep
+        for (int j = 0; j < cols; j++) {
+            sum_sq += (double) xr[j] * (double) xr[j];
+        }
+        float scale = 1.0f / sqrtf((float) sum_sq + eps);
+        #pragma _NEC ivdep
+        for (int j = 0; j < cols; j++) {
+            yr[j] = xr[j] * scale;
+        }
+    }
     return 0;
 }
 

@@ -125,36 +125,159 @@ bool scale_f32(backend_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
-// ---------------- UNARY: SILU ----------------
+// ---------------- UNARY family ----------------
+// All claim the op only when src+dst are HBM-resident F32 with matching
+// element count. The supported unary kinds map to one kernel each:
+//
+//   SILU      -> ve_silu_hbm_full
+//   SIGMOID   -> ve_sigmoid_hbm_full
+//   EXP       -> ve_exp_hbm_full
+//   NEG       -> ve_neg_hbm_full
+//   SQR       -> ve_sqr_hbm_full
+//
+// SOFTPLUS lives in GGML_OP_SOFTPLUS (not UNARY); see softplus_* below.
+
+namespace {
+kernel_id unary_kernel_id(const ggml_tensor * op) {
+    switch (ggml_get_unary_op(op)) {
+        case GGML_UNARY_OP_SILU:     return K_SILU_HBM_FULL;
+        case GGML_UNARY_OP_SIGMOID:  return K_SIGMOID_HBM_FULL;
+        case GGML_UNARY_OP_EXP:      return K_EXP_HBM_FULL;
+        case GGML_UNARY_OP_NEG:      return K_NEG_HBM_FULL;
+        case GGML_UNARY_OP_SOFTPLUS: return K_SOFTPLUS_HBM_FULL;
+        default:                     return K_COUNT;  // unsupported
+    }
+}
+}  // namespace
+
 bool silu_supports(const ggml_tensor * op) {
     if (op->op != GGML_OP_UNARY) return false;
-    if (ggml_get_unary_op(op) != GGML_UNARY_OP_SILU) return false;
     const ggml_tensor * x = op->src[0];
     if (x == nullptr) return false;
-    // The kernel uses `x / (1 + expf(-x))` without clamping x. NCC's
-    // vectorised expf returns NaN for x < -88-ish, so the unit-test value
-    // range (~[-100, 100]) breaks it. Real model activations stay in a
-    // narrow band where it's fine. We claim the op only when both src and
-    // dst are HBM-resident (i.e. inside a normal model graph).
+    if (unary_kernel_id(op) == K_COUNT) return false;
     return single_f32(x, op);
 }
 
 bool silu_f32(backend_context * ctx, ggml_tensor * dst) {
-    VEDAfunction fn = ctx->fn(K_SILU_HBM_FULL);
-    if (fn == 0 || !silu_supports(dst)) return false;
+    if (!silu_supports(dst)) return false;
+    VEDAfunction fn = ctx->fn(unary_kernel_id(dst));
+    if (fn == 0) return false;
     const VEDAdeviceptr y = ctx->resolve_out(dst);
     const VEDAdeviceptr x = ctx->resolve_in(dst->src[0]);
     if (y == 0 || x == 0) return false;
 
     VEDAargs args = nullptr;
-    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(silu)")) return false;
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(unary)")) return false;
     vedaArgsSetVPtr(args, 0, y);
     vedaArgsSetVPtr(args, 1, x);
     vedaArgsSetU64 (args, 2, (uint64_t) ggml_nelements(dst));
 
-    uint64_t result = 0;
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
-                    "vedaLaunchKernelEx(silu_hbm_full)")) {
+                    "vedaLaunchKernelEx(unary_hbm_full)")) {
+        return false;
+    }
+    ctx->mark_sync_pending();
+    return true;
+}
+
+// ---------------- SQR (GGML_OP_SQR) ----------------
+bool sqr_supports(const ggml_tensor * op) {
+    if (op->op != GGML_OP_SQR) return false;
+    const ggml_tensor * x = op->src[0];
+    if (!x) return false;
+    return single_f32(x, op);
+}
+
+bool sqr_f32(backend_context * ctx, ggml_tensor * dst) {
+    if (!sqr_supports(dst)) return false;
+    VEDAfunction fn = ctx->fn(K_SQR_HBM_FULL);
+    if (fn == 0) return false;
+    const VEDAdeviceptr y = ctx->resolve_out(dst);
+    const VEDAdeviceptr x = ctx->resolve_in(dst->src[0]);
+    if (!y || !x) return false;
+
+    VEDAargs args = nullptr;
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(sqr)")) return false;
+    vedaArgsSetVPtr(args, 0, y);
+    vedaArgsSetVPtr(args, 1, x);
+    vedaArgsSetU64 (args, 2, (uint64_t) ggml_nelements(dst));
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
+                    "vedaLaunchKernelEx(sqr_hbm_full)")) {
+        return false;
+    }
+    ctx->mark_sync_pending();
+    return true;
+}
+
+// ---------------- SUB (element-wise, same-shape F32) ----------------
+bool sub_supports(const ggml_tensor * op) {
+    if (op->op != GGML_OP_SUB) return false;
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * b = op->src[1];
+    if (!a || !b || !same_elemcount_f32(a, b, op)) return false;
+    return true;
+}
+
+bool sub_f32(backend_context * ctx, ggml_tensor * dst) {
+    if (!sub_supports(dst)) return false;
+    VEDAfunction fn = ctx->fn(K_SUB_HBM_FULL);
+    if (fn == 0) return false;
+    const VEDAdeviceptr y = ctx->resolve_out(dst);
+    const VEDAdeviceptr a = ctx->resolve_in(dst->src[0]);
+    const VEDAdeviceptr b = ctx->resolve_in(dst->src[1]);
+    if (!y || !a || !b) return false;
+
+    VEDAargs args = nullptr;
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(sub)")) return false;
+    vedaArgsSetVPtr(args, 0, y);
+    vedaArgsSetVPtr(args, 1, a);
+    vedaArgsSetVPtr(args, 2, b);
+    vedaArgsSetU64 (args, 3, (uint64_t) ggml_nelements(dst));
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
+                    "vedaLaunchKernelEx(sub_hbm_full)")) {
+        return false;
+    }
+    ctx->mark_sync_pending();
+    return true;
+}
+
+// ---------------- L2_NORM (per-row normalisation) ----------------
+bool l2_norm_supports(const ggml_tensor * op) {
+    if (op->op != GGML_OP_L2_NORM) return false;
+    const ggml_tensor * x = op->src[0];
+    if (!x) return false;
+    if (x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(op)) return false;
+    if (ggml_nelements(x) != ggml_nelements(op)) return false;
+    return true;
+}
+
+bool l2_norm_f32(backend_context * ctx, ggml_tensor * dst) {
+    if (!l2_norm_supports(dst)) return false;
+    VEDAfunction fn = ctx->fn(K_L2_NORM_HBM_FULL);
+    if (fn == 0) return false;
+    const VEDAdeviceptr y = ctx->resolve_out(dst);
+    const VEDAdeviceptr x = ctx->resolve_in(dst->src[0]);
+    if (!y || !x) return false;
+
+    /* op_params[0] = eps (float). */
+    float eps = 1e-6f;
+    std::memcpy(&eps, dst->op_params, sizeof(float));
+    uint32_t eps_bits;
+    std::memcpy(&eps_bits, &eps, sizeof(uint32_t));
+
+    const uint64_t nc = (uint64_t) dst->ne[0];
+    const uint64_t nr = (uint64_t) (ggml_nelements(dst) / dst->ne[0]);
+
+    VEDAargs args = nullptr;
+    if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(l2_norm)")) return false;
+    vedaArgsSetVPtr(args, 0, y);
+    vedaArgsSetVPtr(args, 1, x);
+    vedaArgsSetU64 (args, 2, nc);
+    vedaArgsSetU64 (args, 3, nr);
+    vedaArgsSetU64 (args, 4, (uint64_t) eps_bits);
+    if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
+                    "vedaLaunchKernelEx(l2_norm_hbm_full)")) {
         return false;
     }
     ctx->mark_sync_pending();

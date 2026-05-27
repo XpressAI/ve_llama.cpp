@@ -42,6 +42,15 @@ bool scale_supports(const ggml_tensor * op);
 bool silu_f32(backend_context * ctx, ggml_tensor * dst);
 bool silu_supports(const ggml_tensor * op);
 
+bool sub_f32(backend_context * ctx, ggml_tensor * dst);
+bool sub_supports(const ggml_tensor * op);
+
+bool sqr_f32(backend_context * ctx, ggml_tensor * dst);
+bool sqr_supports(const ggml_tensor * op);
+
+bool l2_norm_f32(backend_context * ctx, ggml_tensor * dst);
+bool l2_norm_supports(const ggml_tensor * op);
+
 // Fused gated linear units. Currently handles GGML_GLU_OP_SWIGLU (split
 // gate/up F32 in HBM) — the FFN pattern in Llama-3 / Llama-3.2. Without
 // this the scheduler splits cgraphs at every FFN GLU node (codex

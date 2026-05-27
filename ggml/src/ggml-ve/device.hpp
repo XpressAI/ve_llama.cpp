@@ -174,6 +174,16 @@ enum kernel_id {
     K_GATED_DELTA_NET_F32_HBM,
     K_F32_TRUNCATE_TO_BF16_INPLACE,
 
+    /* Element-wise / unary additions (Qwen3.5 GDN block). All pure F32,
+     * fully HBM-resident. Append-only to keep cached .so files compatible. */
+    K_SIGMOID_HBM_FULL,
+    K_SOFTPLUS_HBM_FULL,
+    K_EXP_HBM_FULL,
+    K_NEG_HBM_FULL,
+    K_SQR_HBM_FULL,
+    K_SUB_HBM_FULL,
+    K_L2_NORM_HBM_FULL,
+
     K_COUNT,
 };
 

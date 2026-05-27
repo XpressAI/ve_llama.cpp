@@ -14,6 +14,21 @@ int debug_dispatch_count = 0;
 bool supports_op(const device * dev, const ggml_tensor * op) {
     if (dev == nullptr || !dev->initialized) return false;
 
+    static const bool dbg_support = std::getenv("GGML_VE_DEBUG_SUPPORT") != nullptr;
+    auto trace = [&](bool ok) {
+        if (dbg_support) {
+            const char * buft_name = "?";
+            if (op->buffer) {
+                ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(op->buffer);
+                if (bt) buft_name = ggml_backend_buft_name(bt);
+            }
+            fprintf(stderr, "[VE-SUPPORT] %-20s dst=%s name='%s' buft=%s -> %s\n",
+                    ggml_op_name(op->op), ggml_type_name(op->type),
+                    op->name[0]?op->name:"?", buft_name, ok ? "YES" : "no");
+        }
+        return ok;
+    };
+
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -73,6 +88,15 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
         case GGML_OP_GATED_DELTA_NET:
             if (std::getenv("GGML_VE_NO_GDN") != nullptr) return false;
             return ops::gated_delta_net_supports(op);
+        case GGML_OP_SUB:
+            if (std::getenv("GGML_VE_NO_SUB") != nullptr) return false;
+            return trace(ops::sub_supports(op));
+        case GGML_OP_SQR:
+            if (std::getenv("GGML_VE_NO_SQR") != nullptr) return false;
+            return trace(ops::sqr_supports(op));
+        case GGML_OP_L2_NORM:
+            if (std::getenv("GGML_VE_NO_L2_NORM") != nullptr) return false;
+            return trace(ops::l2_norm_supports(op));
         default:
             return false;
     }
@@ -107,12 +131,18 @@ bool compute_forward(backend_context * ctx, ggml_tensor * node) {
             return true;
         case GGML_OP_ADD:
             return ops::add_f32(ctx, node);
+        case GGML_OP_SUB:
+            return ops::sub_f32(ctx, node);
+        case GGML_OP_SQR:
+            return ops::sqr_f32(ctx, node);
         case GGML_OP_MUL:
             return ops::mul_f32(ctx, node);
         case GGML_OP_SCALE:
             return ops::scale_f32(ctx, node);
         case GGML_OP_UNARY:
             return ops::silu_f32(ctx, node);
+        case GGML_OP_L2_NORM:
+            return ops::l2_norm_f32(ctx, node);
         case GGML_OP_GLU:
             return ops::glu_f32(ctx, node);
         case GGML_OP_RMS_NORM:
