@@ -263,7 +263,12 @@ bool flash_attn(backend_context * ctx, ggml_tensor * dst) {
                 fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_HBM);
             } else if (std::getenv("GGML_VE_FA_TILE_UNR2") != nullptr) {
                 fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_UNR2_HBM);
+            } else if (std::getenv("GGML_VE_FA_TILE_UNR8") != nullptr) {
+                fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_UNR8_HBM);
             } else {
+                /* unr4 is the sweet spot; unr8 loses ~1-3% to register
+                 * pressure from 8 dot accumulators + 8 Q ptrs in the
+                 * inner loop. */
                 fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_UNR4_HBM);
                 if (fn == 0) fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_UNR2_HBM);
                 if (fn == 0) fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_HBM);
