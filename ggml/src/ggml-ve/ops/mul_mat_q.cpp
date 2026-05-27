@@ -20,11 +20,11 @@ namespace ops {
 namespace {
 
 bool is_supported_quant_type(ggml_type t) {
-    // Q8_0 only: it has a genuine all-HBM fused kernel.
-    // Q2_K's `ve_q2k_bf16_matvec_hbm` actually expects pre-dequantised BF16
-    // weights despite its name; running it on raw Q2_K bytes yields NaN.
-    // Re-enable via the dequantise-to-HBM strategy (the 147× legacy win).
-    return t == GGML_TYPE_Q8_0;
+    // Q8_0: all-HBM fused kernel.
+    // Q4_K: direct matvec, dequant in registers, weights stay in HBM (4.5 bpw).
+    // Q2_K's `ve_q2k_bf16_matvec_hbm` expects pre-dequantised BF16 weights
+    // despite its name; not wired up here pending a true direct kernel.
+    return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K;
 }
 
 // Block size for a given quant — used to validate K is aligned.
@@ -32,6 +32,7 @@ int blk_size(ggml_type t) {
     switch (t) {
         case GGML_TYPE_Q8_0: return 32;
         case GGML_TYPE_Q2_K: return 256;
+        case GGML_TYPE_Q4_K: return 256;
         default:             return 0;
     }
 }
@@ -128,6 +129,22 @@ bool mul_mat_q_supports(const ggml_tensor * op) {
     const int b = blk_size(w->type);
     if (b == 0 || (K % b) != 0) return false;
     if (M <= 0 || K <= 0) return false;
+
+    // Reject CPU_REPACK weights. llama.cpp's CPU backend repacks K-quant
+    // weights into SIMD-friendly interleaved layouts (e.g. block_q4_Kx8 —
+    // 8 blocks interleaved for AVX). Our kernels expect the canonical
+    // block_q4_K layout; running them on repacked bytes gives garbage.
+    // Falling back lets the CPU backend handle these (which understands
+    // its own repacked layout). To use VE, either disable repack at build
+    // (-DGGML_CPU_REPACK=OFF) or convert the GGUF.
+    if (w->buffer) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(w->buffer);
+        if (buft) {
+            const char * bn = ggml_backend_buft_name(buft);
+            if (bn && std::strcmp(bn, "CPU_REPACK") == 0) return false;
+        }
+    }
+
     return true;
 }
 
@@ -149,6 +166,11 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
     if (w->type == GGML_TYPE_Q8_0) {
         VEDAfunction fn = ctx->fn(K_Q8_0_FUSED_MATVEC_HBM_FULL);
         if (fn == 0) return false;
+        ok = launch_matvec_q8_0_full_hbm(fn, y_hbm, w_hbm, x_hbm, M, K);
+    } else if (w->type == GGML_TYPE_Q4_K) {
+        VEDAfunction fn = ctx->fn(K_Q4K_MATVEC_F32_HBM);
+        if (fn == 0) return false;
+        // Same all-HBM launch signature as Q8_0 (y, W, x, M, K).
         ok = launch_matvec_q8_0_full_hbm(fn, y_hbm, w_hbm, x_hbm, M, K);
     } else if (w->type == GGML_TYPE_Q2_K) {
         VEDAfunction fn = ctx->fn(K_Q2K_BF16_MATVEC_HBM);

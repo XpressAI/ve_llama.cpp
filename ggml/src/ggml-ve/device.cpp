@@ -70,6 +70,7 @@ const kernel_meta & meta(kernel_id id) {
         /* K_Q8_0_FUSED_MATVEC_HBM_FULL               */ { "ve_q8_0_fused_matvec_hbm_full",            KMOD_SGEMV  },
         /* K_Q8_0_FUSED_SGEMM_HBM                     */ { "ve_q8_0_fused_sgemm_hbm",                  KMOD_SGEMV  },
         /* K_Q2K_BF16_MATVEC_HBM                      */ { "ve_q2k_bf16_matvec_hbm",                   KMOD_SGEMV  },
+        /* K_Q4K_MATVEC_F32_HBM                       */ { "ve_q4k_matvec_f32_hbm",                    KMOD_SGEMV  },
         /* K_DEQUANT_Q2K_BF16                         */ { "ve_dequant_q2k_bf16",                      KMOD_SGEMV  },
         /* K_DEQUANT_Q8_0_BF16                        */ { "ve_dequant_q8_0_bf16",                     KMOD_SGEMV  },
         /* K_DEQUANT_MXFP4_BF16_HMEM                  */ { "ve_dequant_mxfp4_bf16_hmem",               KMOD_SGEMV  },

@@ -429,6 +429,28 @@ typedef struct __attribute__((packed)) {
     uint16_t dmin_q2k;        /* FP16 super-block min */
 } block_q2_K_wrapper;
 
+/* Q4_K block structure (144 bytes per 256 elements).
+ * Matches ggml-common.h block_q4_K layout. */
+typedef struct __attribute__((packed)) {
+    uint16_t d_q4k;             /* FP16 super-block scale for 6-bit sub-scales */
+    uint16_t dmin_q4k;          /* FP16 super-block scale for 6-bit sub-mins  */
+    uint8_t  scales_q4k[12];    /* Packed 6-bit sub-scales + sub-mins, 8 of each */
+    uint8_t  qs_q4k[128];       /* 4-bit quants: 256 values = 128 bytes */
+} block_q4_K_wrapper;
+
+/* Unpack one of the 8 sub-block (scale, min) 6-bit pairs from the 12-byte
+ * packed scales array. Direct port of ggml's get_scale_min_k4. */
+static inline void q4k_get_scale_min(int j, const uint8_t * q,
+                                     uint8_t * sc_out, uint8_t * m_out) {
+    if (j < 4) {
+        *sc_out = q[j] & 63;
+        *m_out  = q[j + 4] & 63;
+    } else {
+        *sc_out = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *m_out  = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
 /* Convert FP32 to BF16 (truncation) - defined here, used by dequant functions below */
 static inline bf16 f32_to_bf16(float f) {
     uint32_t bits;
@@ -561,9 +583,112 @@ uint64_t ve_q2k_bf16_matvec_hbm(VEDAdeviceptr y_vptr,
     return 0;
 }
 
+/* ============================================================================
+ * Q4_K direct matvec — dequant in registers, Q4_K weights stay in HBM.
+ *
+ * Key design point: we do NOT cache an expanded BF16 copy of the weights.
+ * Q4_K is 4.5 bits/element; a 27B model fits in HBM (13.5 GB) but its
+ * BF16-expanded form (53 GB) does not. Per-block dequant happens during
+ * the dot product itself, into vector registers / scalar locals.
+ *
+ *   y[m] = sum_k W[m][k] * x[k]
+ *
+ * Per Q4_K block (256 elements, 144 bytes):
+ *   d_super, dmin_super : fp16, super-block scales
+ *   scales[12]          : 8 sub-block 6-bit (sub_scale, sub_min) pairs packed
+ *   qs[128]             : 4-bit weight nibbles
+ *
+ * Per sub-block i in 0..7 (32 elements each):
+ *   d_sub = d_super * unpacked_sc_i      (per-sub-block scale)
+ *   m_sub = dmin_super * unpacked_m_i    (per-sub-block min)
+ *   weight[i*32 + l] = d_sub * (low or high nibble of qs[...]) - m_sub
+ *
+ * Inner-loop pattern: per 64-element chunk handles 2 sub-blocks (low
+ * nibbles for sub-block 0, high nibbles for sub-block 1 within the same
+ * 32 bytes of qs). NCC vectorises the 32-element FMA inner loops.
+ *
+ * One row per OMP thread for now; rows are independent. Future work:
+ * 16-row unroll like sgemv_packed_bf16_unr to share the x[k..k+31] load
+ * across multiple rows.
+ * ========================================================================*/
+uint64_t ve_q4k_matvec_f32_hbm(VEDAdeviceptr y_vptr,
+                                VEDAdeviceptr W_vptr,
+                                VEDAdeviceptr x_vptr,
+                                uint64_t M,
+                                uint64_t K) {
+    float * y;
+    float * x;
+    const uint8_t * W_bytes;
+    if (vedaMemPtr((void**)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void**)&x, x_vptr) != 0) return 2;
+    if (vedaMemPtr((void**)(void*)&W_bytes, W_vptr) != 0) return 3;
+
+    const int m = (int) M;
+    const int k = (int) K;
+    const int nb = k / 256;               /* blocks per row */
+    const int block_bytes = 144;
+    const int row_bytes = nb * block_bytes;
+
+    int nthr = omp_get_max_threads();
+    if (nthr > VE_MAX_CORES) nthr = VE_MAX_CORES;
+
+#pragma omp parallel for num_threads(nthr)
+    for (int row = 0; row < m; row++) {
+        const uint8_t * row_base = W_bytes + (size_t) row * row_bytes;
+        float acc = 0.0f;
+
+        for (int b = 0; b < nb; b++) {
+            /* Bullet-proof against any struct-padding quirks: index by raw
+             * byte offsets instead of relying on sizeof(block_q4_K_wrapper). */
+            const uint8_t * blk_base = row_base + (size_t) b * 144;
+            uint16_t d_raw, dmin_raw;
+            __builtin_memcpy(&d_raw,    blk_base + 0, 2);
+            __builtin_memcpy(&dmin_raw, blk_base + 2, 2);
+            const float d_super    = __gnu_h2f_ieee(d_raw);
+            const float dmin_super = __gnu_h2f_ieee(dmin_raw);
+            const uint8_t * scales = blk_base + 4;          /* 12 bytes */
+            const uint8_t * qs     = blk_base + 16;         /* 128 bytes */
+            const float   * xb     = x + b * 256;
+
+            /* Walk 4 pairs of sub-blocks (8 sub-blocks total). Each pair
+             * shares 32 bytes of qs (low nibbles for first sub-block,
+             * high nibbles for second). */
+            int is = 0;
+            for (int j = 0; j < 256; j += 64) {
+                uint8_t sc_lo_u8, m_lo_u8, sc_hi_u8, m_hi_u8;
+                q4k_get_scale_min(is + 0, scales, &sc_lo_u8, &m_lo_u8);
+                q4k_get_scale_min(is + 1, scales, &sc_hi_u8, &m_hi_u8);
+                const float d_lo = d_super    * (float) sc_lo_u8;
+                const float m_lo = dmin_super * (float) m_lo_u8;
+                const float d_hi = d_super    * (float) sc_hi_u8;
+                const float m_hi = dmin_super * (float) m_hi_u8;
+
+                const uint8_t * qs_pair = qs + (j >> 1);  /* 32 bytes covering 64 elements */
+                const float * x_lo = xb + j;
+                const float * x_hi = xb + j + 32;
+
+                float a_lo = 0.0f;
+                float a_hi = 0.0f;
+#pragma _NEC ivdep
+                for (int l = 0; l < 32; l++) {
+                    int q_l = qs_pair[l] & 0x0F;
+                    int q_h = qs_pair[l] >> 4;
+                    a_lo += (d_lo * (float) q_l - m_lo) * x_lo[l];
+                    a_hi += (d_hi * (float) q_h - m_hi) * x_hi[l];
+                }
+                acc += a_lo + a_hi;
+                is += 2;
+            }
+        }
+        y[row] = acc;
+    }
+
+    return 0;
+}
+
 /*
  * VEDA kernel: Combined dequant + matvec (for testing, not optimal)
- * 
+ *
  * This dequantizes on-the-fly. For production, pre-dequant to HBM.
  */
 uint64_t ve_q2k_matvec_dequant_bf16(void* y_hmem,
