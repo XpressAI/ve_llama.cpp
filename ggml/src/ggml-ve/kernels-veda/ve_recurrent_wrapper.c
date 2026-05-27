@@ -81,26 +81,27 @@ uint64_t ve_ssm_conv_f32_hbm(
     const int dn1   = (int) dst_nb1_floats;
     const int dn2   = (int) dst_nb2_floats;
 
-#pragma omp parallel for collapse(2)
-    for (int s = 0; s < ns; ++s) {
-        for (int t = 0; t < nt; ++t) {
-            float       * dout = dst  + s * dn2 + t * dn1;
-            const float * sin0 = src0 + s * sn2;
+    /* Parallelise over CHANNELS, not (s, t). For decode (n_t = n_seqs = 1)
+     * the old (s, t) outer left 7 of 8 cores idle on every SSM_CONV call --
+     * that's why the per-call cost looked huge in the profile despite the
+     * tiny FLOP count. di is typically 4096+ on Qwen3.5 / Mamba models, so
+     * channels-as-outer gives each core ~512 channels to chew through with
+     * full vectorisation on the inner ch chunk. */
+    const int outer = ns * nt;
 
-            /* Channel loop. NCC vectorises across `ch`; the inner k
-             * loop fully unrolls (d_conv == 4 in Qwen3.5). The two
-             * source strides (sn1 channel-step on src0, nc on src1)
-             * are stride-1-along-k inside per-channel rows. */
-#pragma _NEC ivdep
-            for (int ch = 0; ch < di; ++ch) {
-                const float * sk = sin0 + ch * sn1 + t;       /* [k]   */
-                const float * wk = src1 + ch * nc;            /* [k]   */
-                float sum = 0.0f;
-                for (int k = 0; k < nc; ++k) {
-                    sum += sk[k] * wk[k];
-                }
-                dout[ch] = sum;
+#pragma omp parallel for
+    for (int ch_thr = 0; ch_thr < di; ++ch_thr) {
+        const float * wk = src1 + ch_thr * nc;            /* [k] weights for this channel */
+        for (int o = 0; o < outer; ++o) {
+            const int s = o / nt;
+            const int t = o - s * nt;
+            float       * dout = dst  + s * dn2 + t * dn1;
+            const float * sk   = src0 + s * sn2 + ch_thr * sn1 + t;
+            float sum = 0.0f;
+            for (int k = 0; k < nc; ++k) {
+                sum += sk[k] * wk[k];
             }
+            dout[ch_thr] = sum;
         }
     }
     return 0;
