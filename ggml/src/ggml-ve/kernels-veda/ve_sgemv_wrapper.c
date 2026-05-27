@@ -9249,6 +9249,290 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_unr2_hbm(
 }
 
 /*
+ * Same idea as unr2 but unrolled 4-way. Each ic iteration processes 4
+ * queries simultaneously, sharing k_f32[i] / v_f32[i] across 4 parallel
+ * Sum-idiom reductions and FMA accumulates. If NCC can hold 4 dot
+ * accumulators without spilling, this halves the per-ic loop iterations
+ * again vs. unr2.
+ *
+ * Leftover handling: after the j+=4 main loop, fall back to a single-Q
+ * path for the remaining 1/2/3 queries (simplifies the code; the cost
+ * is negligible since leftover is <= 3 of nq=16).
+ */
+uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_unr4_hbm(
+    VEDAdeviceptr dst_hbm,
+    VEDAdeviceptr q_hbm,
+    VEDAdeviceptr k_hbm,
+    VEDAdeviceptr v_hbm,
+    VEDAdeviceptr mask_hbm,
+    uint64_t D, uint64_t Dv,
+    uint64_t N, uint64_t S_kv,
+    uint64_t H, uint64_t Hk, uint64_t B,
+    uint64_t nb_q1, uint64_t nb_q2, uint64_t nb_q3,
+    uint64_t nb_k1, uint64_t nb_k2, uint64_t nb_k3,
+    uint64_t nb_v1, uint64_t nb_v2, uint64_t nb_v3,
+    uint64_t nb_m1, uint64_t nb_m2, uint64_t nb_m3,
+    uint64_t nb_o1, uint64_t nb_o2, uint64_t nb_o3,
+    uint64_t scale_bits, uint64_t max_bias_bits, uint64_t softcap_bits,
+    uint64_t mask_ne2, uint64_t mask_ne3)
+{
+    float* dst;
+    const float* q;
+    const uint16_t* k;
+    const uint16_t* v;
+    const uint16_t* mask = NULL;
+    if (vedaMemPtr((void**)&dst, dst_hbm) != 0) return 1;
+    if (vedaMemPtr((void**)&q, q_hbm) != 0) return 2;
+    if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
+    if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 5;
+
+    float scale, max_bias, logit_softcap;
+    {
+        uint32_t tmp;
+        tmp = (uint32_t)scale_bits;    __builtin_memcpy(&scale, &tmp, sizeof(float));
+        tmp = (uint32_t)max_bias_bits; __builtin_memcpy(&max_bias, &tmp, sizeof(float));
+        tmp = (uint32_t)softcap_bits;  __builtin_memcpy(&logit_softcap, &tmp, sizeof(float));
+    }
+    if (logit_softcap != 0.0f) scale /= logit_softcap;
+
+    const uint32_t n_head = (uint32_t)H;
+    const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)n_head));
+    const float m0 = powf(2.0f, -(max_bias) / (float)n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
+
+    const int64_t rk = (int64_t)(H / Hk);
+    const int64_t rv = (int64_t)(H / Hk);
+
+    const int d        = (int)D;
+    const int dv       = (int)Dv;
+    const int n_tokens = (int)N;
+    const int n_kv     = (int)S_kv;
+    const int n_heads  = (int)H;
+    const int n_batch  = (int)B;
+    const int d_pairs  = d / 2;
+    const int dv_pairs = dv / 2;
+
+    #define NQ_TILE_4 16
+
+    const int n_q_tiles  = (n_tokens + NQ_TILE_4 - 1) / NQ_TILE_4;
+    const int total_work = n_batch * n_heads * n_q_tiles;
+
+    /* Helper: decode F16 mask to F32 scaled by slope. */
+    #define DECODE_MV(jx) \
+        do { \
+            mv##jx = 0.0f; \
+            if (mask_rows[j##jx] != NULL) { \
+                uint16_t mf16 = mask_rows[j##jx][ic]; \
+                uint32_t sign = (mf16 >> 15) & 0x1; \
+                uint32_t exp_b = (mf16 >> 10) & 0x1F; \
+                uint32_t mant = mf16 & 0x3FF; \
+                uint32_t f32; \
+                if (exp_b == 0)       f32 = (mant == 0) ? (sign << 31) : 0; \
+                else if (exp_b == 31) f32 = (sign << 31) | 0x7F800000 | (mant << 13); \
+                else                  f32 = (sign << 31) | ((exp_b + 127 - 15) << 23) | (mant << 13); \
+                __builtin_memcpy(&mv##jx, &f32, sizeof(float)); \
+                mv##jx *= slope; \
+            } \
+        } while (0)
+
+    /* Helper: per-Q softmax bookkeeping. Updates M/S state and computes vs. */
+    #define DO_SOFTMAX(jx) \
+        do { \
+            if (!skip##jx) { \
+                float M_old = M_state[j##jx]; \
+                if (s##jx > M_old) { \
+                    M_state[j##jx] = s##jx; \
+                    float ms = expf(M_old - s##jx); \
+                    _Pragma("_NEC ivdep") \
+                    for (int i = 0; i < dv; i++) VKQ[j##jx*dv + i] *= ms; \
+                    S_state[j##jx] *= ms; \
+                    vs##jx = 1.0f; \
+                } else { \
+                    vs##jx = expf(s##jx - M_state[j##jx]); \
+                } \
+                S_state[j##jx] += vs##jx; \
+            } else { \
+                vs##jx = 0.0f; \
+            } \
+        } while (0)
+
+    #pragma omp parallel for
+    for (int work_id = 0; work_id < total_work; work_id++) {
+        const int ib       = work_id / (n_heads * n_q_tiles);
+        const int ih       = (work_id / n_q_tiles) % n_heads;
+        const int q_tile_i = work_id % n_q_tiles;
+        const int iq_base  = q_tile_i * NQ_TILE_4;
+        const int nq       = (iq_base + NQ_TILE_4 <= n_tokens) ? NQ_TILE_4 : (n_tokens - iq_base);
+
+        float slope = 1.0f;
+        if (max_bias > 0.0f) {
+            uint32_t hh = (uint32_t)ih;
+            slope = (hh < n_head_log2) ? powf(m0, (float)(hh + 1))
+                                        : powf(m1, (float)(2*(hh - n_head_log2) + 1));
+        }
+
+        const int ik_head = ih / (int)rk;
+        const int iv_head = ih / (int)rv;
+
+        float Q_tile[NQ_TILE_4 * 256];
+        const uint16_t* mask_rows[NQ_TILE_4];
+        float M_state[NQ_TILE_4];
+        float S_state[NQ_TILE_4];
+        float VKQ[NQ_TILE_4 * 256];
+
+        for (int j = 0; j < nq; j++) {
+            const float* q_vec = (const float*)((const char*)q
+                + (iq_base + j) * nb_q1 + ih * nb_q2 + ib * nb_q3);
+            #pragma _NEC ivdep
+            for (int i = 0; i < d; i++) Q_tile[j*d + i] = q_vec[i];
+            M_state[j] = -INFINITY;
+            S_state[j] = 0.0f;
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) VKQ[j*dv + i] = 0.0f;
+            if (mask != NULL) {
+                int im2 = ih % (int)mask_ne2;
+                int im3 = ib % (int)mask_ne3;
+                mask_rows[j] = (const uint16_t*)((const char*)mask
+                    + (iq_base + j) * nb_m1 + im2 * nb_m2 + im3 * nb_m3);
+            } else {
+                mask_rows[j] = NULL;
+            }
+        }
+
+        for (int ic = 0; ic < n_kv; ic++) {
+            const uint32_t* k_u32 = (const uint32_t*)((const char*)k
+                + ic * nb_k1 + ik_head * nb_k2 + ib * nb_k3);
+            float k_f32[256];
+            #pragma _NEC ivdep
+            for (int i = 0; i < d_pairs; i++) {
+                uint32_t packed = k_u32[i];
+                uint32_t f32_lo = (packed & 0xFFFF) << 16;
+                uint32_t f32_hi = packed & 0xFFFF0000;
+                union { uint32_t u; float f; } cl, ch;
+                cl.u = f32_lo;  ch.u = f32_hi;
+                k_f32[2*i]     = cl.f;
+                k_f32[2*i + 1] = ch.f;
+            }
+
+            const uint32_t* v_u32 = (const uint32_t*)((const char*)v
+                + ic * nb_v1 + iv_head * nb_v2 + ib * nb_v3);
+            float v_f32[256];
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv_pairs; i++) {
+                uint32_t packed = v_u32[i];
+                uint32_t f32_lo = (packed & 0xFFFF) << 16;
+                uint32_t f32_hi = packed & 0xFFFF0000;
+                union { uint32_t u; float f; } cl, ch;
+                cl.u = f32_lo;  ch.u = f32_hi;
+                v_f32[2*i]     = cl.f;
+                v_f32[2*i + 1] = ch.f;
+            }
+
+            /* Main 4-way unrolled loop. */
+            int j = 0;
+            for (; j + 3 < nq; j += 4) {
+                const int j0 = j, j1 = j+1, j2 = j+2, j3 = j+3;
+
+                float mv0, mv1, mv2, mv3;
+                DECODE_MV(0); DECODE_MV(1); DECODE_MV(2); DECODE_MV(3);
+                const int skip0 = (mv0 == -INFINITY);
+                const int skip1 = (mv1 == -INFINITY);
+                const int skip2 = (mv2 == -INFINITY);
+                const int skip3 = (mv3 == -INFINITY);
+                if (skip0 && skip1 && skip2 && skip3) continue;
+
+                /* 4-way parallel dot products sharing k_f32. */
+                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+                const float * Q0 = Q_tile + (size_t)j0 * d;
+                const float * Q1 = Q_tile + (size_t)j1 * d;
+                const float * Q2 = Q_tile + (size_t)j2 * d;
+                const float * Q3 = Q_tile + (size_t)j3 * d;
+                #pragma _NEC ivdep
+                for (int i = 0; i < d; i++) {
+                    float ki = k_f32[i];
+                    s0 += Q0[i] * ki;
+                    s1 += Q1[i] * ki;
+                    s2 += Q2[i] * ki;
+                    s3 += Q3[i] * ki;
+                }
+                s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
+                if (logit_softcap != 0.0f) {
+                    s0 = logit_softcap * tanhf(s0);
+                    s1 = logit_softcap * tanhf(s1);
+                    s2 = logit_softcap * tanhf(s2);
+                    s3 = logit_softcap * tanhf(s3);
+                }
+                s0 += mv0; s1 += mv1; s2 += mv2; s3 += mv3;
+
+                float vs0, vs1, vs2, vs3;
+                DO_SOFTMAX(0); DO_SOFTMAX(1); DO_SOFTMAX(2); DO_SOFTMAX(3);
+
+                /* 4-way parallel VKQ accumulates sharing v_f32. */
+                float * VKQ0 = VKQ + (size_t)j0 * dv;
+                float * VKQ1 = VKQ + (size_t)j1 * dv;
+                float * VKQ2 = VKQ + (size_t)j2 * dv;
+                float * VKQ3 = VKQ + (size_t)j3 * dv;
+                #pragma _NEC ivdep
+                for (int i = 0; i < dv; i++) {
+                    float vi = v_f32[i];
+                    VKQ0[i] += vs0 * vi;
+                    VKQ1[i] += vs1 * vi;
+                    VKQ2[i] += vs2 * vi;
+                    VKQ3[i] += vs3 * vi;
+                }
+            }
+
+            /* Leftover (1, 2, or 3 queries). Single-Q path, simple. */
+            for (; j < nq; j++) {
+                const int j0 = j;
+                float mv0;
+                DECODE_MV(0);
+                if (mv0 == -INFINITY) continue;
+
+                float s = 0.0f;
+                #pragma _NEC ivdep
+                for (int i = 0; i < d; i++) s += Q_tile[j0*d + i] * k_f32[i];
+                s *= scale;
+                if (logit_softcap != 0.0f) s = logit_softcap * tanhf(s);
+                s += mv0;
+
+                float M_old = M_state[j0];
+                float vs;
+                if (s > M_old) {
+                    M_state[j0] = s;
+                    float ms = expf(M_old - s);
+                    #pragma _NEC ivdep
+                    for (int i = 0; i < dv; i++) VKQ[j0*dv + i] *= ms;
+                    S_state[j0] *= ms;
+                    vs = 1.0f;
+                } else {
+                    vs = expf(s - M_state[j0]);
+                }
+                S_state[j0] += vs;
+                #pragma _NEC ivdep
+                for (int i = 0; i < dv; i++) VKQ[j0*dv + i] += vs * v_f32[i];
+            }
+        }
+
+        for (int j = 0; j < nq; j++) {
+            float S_inv = (S_state[j] == 0.0f) ? 0.0f : 1.0f / S_state[j];
+            float* out_ptr = (float*)((char*)dst
+                + ib * nb_o3 + (iq_base + j) * nb_o2 + ih * nb_o1);
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) out_ptr[i] = VKQ[j*dv + i] * S_inv;
+        }
+    }
+
+    #undef NQ_TILE_4
+    #undef DECODE_MV
+    #undef DO_SOFTMAX
+
+    asm volatile("fencem 2" ::: "memory");
+    return 0;
+}
+
+/*
  * Tiled-Q + packed-BF16-intrinsics FA prefill (F32 Q + BF16 K/V).
  *
  * Same shape as ve_flash_attn_ext_f32q_bf16kv_tile_hbm above, but the
