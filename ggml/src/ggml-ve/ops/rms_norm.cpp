@@ -35,9 +35,12 @@ bool rms_norm_supports(const ggml_tensor * op) {
     if (op->op != GGML_OP_RMS_NORM || op->type != GGML_TYPE_F32) return false;
     const ggml_tensor * x = op->src[0];
     if (x == nullptr || x->type != GGML_TYPE_F32) return rej("x type");
-    if (!ggml_is_contiguous(x)) return rej("x not contig");
+    if (x->nb[0] != sizeof(float)) return rej("x inner stride != f32");
     if (!ggml_is_contiguous(op)) return rej("dst not contig");
-    if (x->ne[0] != op->ne[0] || ggml_nelements(x) != ggml_nelements(op)) return rej("shape mismatch");
+    if (x->ne[0] != op->ne[0]) return rej("ne0 mismatch");
+    if (x->ne[1] != op->ne[1] || x->ne[2] != op->ne[2] || x->ne[3] != op->ne[3]) {
+        return rej("ne1/ne2/ne3 mismatch");
+    }
     return true;
 }
 
@@ -49,8 +52,7 @@ bool rms_norm_f32(backend_context * ctx, ggml_tensor * dst) {
     VEDAdeviceptr x_vptr = ctx->resolve_in(x);
     if (y_vptr == 0 || x_vptr == 0) return false;
 
-    const int64_t ne00   = x->ne[0];                    // cols to normalise over
-    const int64_t n_rows = ggml_nelements(x) / ne00;    // total rows
+    const int64_t ne00 = x->ne[0];
 
     float eps = 0.0f;
     std::memcpy(&eps, dst->op_params, sizeof(float));
@@ -60,31 +62,49 @@ bool rms_norm_f32(backend_context * ctx, ggml_tensor * dst) {
     VEDAargs args = nullptr;
     if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(rms_norm)")) return false;
 
+    const bool x_contig =
+        x->nb[0] == sizeof(float) &&
+        x->nb[1] == x->ne[0] * sizeof(float) &&
+        x->nb[2] == x->ne[1] * x->nb[1] &&
+        x->nb[3] == x->ne[2] * x->nb[2];
+
     VEDAfunction fn = 0;
-    if (n_rows == 1) {
-        fn = ctx->fn(K_RMS_NORM_HBM_SIMPLE);
-        if (fn == 0) {
-            vedaArgsDestroy(args);
-            return false;
+    if (x_contig) {
+        const int64_t n_rows = ggml_nelements(x) / ne00;
+        if (n_rows == 1) {
+            fn = ctx->fn(K_RMS_NORM_HBM_SIMPLE);
+            if (fn == 0) { vedaArgsDestroy(args); return false; }
+            vedaArgsSetVPtr(args, 0, y_vptr);
+            vedaArgsSetVPtr(args, 1, x_vptr);
+            vedaArgsSetU64 (args, 2, (uint64_t) ne00);
+            vedaArgsSetU64 (args, 3, eps_bits);
+        } else {
+            fn = ctx->fn(K_RMS_NORM_HBM_OMP);
+            if (fn == 0) { vedaArgsDestroy(args); return false; }
+            vedaArgsSetVPtr(args, 0, y_vptr);
+            vedaArgsSetVPtr(args, 1, x_vptr);
+            vedaArgsSetU64 (args, 2, (uint64_t) ne00);
+            vedaArgsSetU64 (args, 3, (uint64_t) n_rows);
+            vedaArgsSetU64 (args, 4, eps_bits);
         }
-        vedaArgsSetVPtr(args, 0, y_vptr);
-        vedaArgsSetVPtr(args, 1, x_vptr);
-        vedaArgsSetU64 (args, 2, (uint64_t) ne00);
-        vedaArgsSetU64 (args, 3, eps_bits);
     } else {
-        fn = ctx->fn(K_RMS_NORM_HBM_OMP);
-        if (fn == 0) {
-            vedaArgsDestroy(args);
-            return false;
-        }
-        vedaArgsSetVPtr(args, 0, y_vptr);
-        vedaArgsSetVPtr(args, 1, x_vptr);
-        vedaArgsSetU64 (args, 2, (uint64_t) ne00);
-        vedaArgsSetU64 (args, 3, (uint64_t) n_rows);
-        vedaArgsSetU64 (args, 4, eps_bits);
+        // Strided 4D variant. Pass nb in float units. dst is contiguous
+        // (rms_norm_supports enforces matching ne[] and ggml_is_contiguous(op)).
+        fn = ctx->fn(K_RMS_NORM_STRIDED_HBM);
+        if (fn == 0) { vedaArgsDestroy(args); return false; }
+        auto f = [](size_t b) { return (uint64_t)(b / sizeof(float)); };
+        vedaArgsSetVPtr(args, 0,  y_vptr);
+        vedaArgsSetVPtr(args, 1,  x_vptr);
+        vedaArgsSetU64 (args, 2,  (uint64_t) x->ne[0]);
+        vedaArgsSetU64 (args, 3,  (uint64_t) x->ne[1]);
+        vedaArgsSetU64 (args, 4,  (uint64_t) x->ne[2]);
+        vedaArgsSetU64 (args, 5,  (uint64_t) x->ne[3]);
+        vedaArgsSetU64 (args, 6,  f(x->nb[1]));
+        vedaArgsSetU64 (args, 7,  f(x->nb[2]));
+        vedaArgsSetU64 (args, 8,  f(x->nb[3]));
+        vedaArgsSetU64 (args, 9,  eps_bits);
     }
 
-    uint64_t result = 0;
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(rms_norm_hbm)")) {
         return false;

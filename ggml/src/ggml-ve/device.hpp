@@ -188,6 +188,7 @@ enum kernel_id {
     K_REPEAT_F32_HBM,
     K_CONCAT_F32_HBM,
     K_ROPE_MROPE_F32_HBM,
+    K_RMS_NORM_STRIDED_HBM,
 
     K_COUNT,
 };

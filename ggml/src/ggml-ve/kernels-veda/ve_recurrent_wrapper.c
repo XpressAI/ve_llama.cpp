@@ -816,3 +816,60 @@ uint64_t ve_rope_mrope_f32_hbm(
     }
     return 0;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Strided RMS_NORM along the innermost dim. Like ve_rms_norm_hbm_omp but
+ * accepts arbitrary per-axis strides on src (in floats). dst is assumed
+ * contiguous (matches what the GGML scheduler hands us — RMS_NORM dst is
+ * always a freshly-allocated contiguous tensor).
+ *
+ * Used by Qwen3.5 attention layers where Q/K post-RoPE views land here.
+ * Shapes seen: [256, 16, 1, 1], [256, 16, 512, 1], [256, 16, 16, 1].
+ *
+ * src strides passed as nb-in-floats so the kernel can index directly:
+ *   row pointer = src + i3*sn3 + i2*sn2 + i1*sn1
+ * dst is contiguous: dst + (i3*ne2*ne1 + i2*ne1 + i1) * ne0
+ */
+uint64_t ve_rms_norm_strided_hbm(
+    VEDAdeviceptr y_vptr,
+    VEDAdeviceptr x_vptr,
+    uint64_t ne0, uint64_t ne1, uint64_t ne2, uint64_t ne3,
+    uint64_t sn1_f, uint64_t sn2_f, uint64_t sn3_f,
+    uint64_t eps_bits) {
+
+    float * y;
+    const float * x;
+    if (vedaMemPtr((void **)&y, y_vptr) != 0) return 1;
+    if (vedaMemPtr((void **)(void*)&x, x_vptr) != 0) return 2;
+
+    float eps;
+    __builtin_memcpy(&eps, &eps_bits, sizeof(float));
+
+    const int n0 = (int) ne0;
+    const int n1 = (int) ne1;
+    const int n2 = (int) ne2;
+    const int n3 = (int) ne3;
+    const int sn1 = (int) sn1_f, sn2 = (int) sn2_f, sn3 = (int) sn3_f;
+
+#pragma omp parallel for collapse(3) if (n1*n2*n3 >= 8)
+    for (int i3 = 0; i3 < n3; ++i3) {
+        for (int i2 = 0; i2 < n2; ++i2) {
+            for (int i1 = 0; i1 < n1; ++i1) {
+                const float * xr = x + i3 * sn3 + i2 * sn2 + i1 * sn1;
+                float       * yr = y + ((i3 * n2 + i2) * n1 + i1) * n0;
+
+                double sum_sq = 0.0;
+#pragma _NEC ivdep
+                for (int j = 0; j < n0; ++j) {
+                    sum_sq += (double) xr[j] * (double) xr[j];
+                }
+                float scale = 1.0f / sqrtf((float)(sum_sq / n0) + eps);
+#pragma _NEC ivdep
+                for (int j = 0; j < n0; ++j) {
+                    yr[j] = xr[j] * scale;
+                }
+            }
+        }
+    }
+    return 0;
+}
