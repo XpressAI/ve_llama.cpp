@@ -40,26 +40,35 @@ bool single_f32(const ggml_tensor * x, const ggml_tensor * dst) {
 
 // ---------------- MUL ----------------
 bool mul_supports(const ggml_tensor * op) {
+    static const bool dbg = std::getenv("GGML_VE_DEBUG_MUL") != nullptr;
+    auto rej = [&](const char * why) {
+        if (dbg) fprintf(stderr, "[VE-MUL-rej] %s : %s a=%s[%lld,%lld,%lld,%lld] b=%s[%lld,%lld,%lld,%lld]\n",
+                         op->name[0]?op->name:"?", why,
+                         op->src[0]?ggml_type_name(op->src[0]->type):"?",
+                         op->src[0]?(long long)op->src[0]->ne[0]:0, op->src[0]?(long long)op->src[0]->ne[1]:0,
+                         op->src[0]?(long long)op->src[0]->ne[2]:0, op->src[0]?(long long)op->src[0]->ne[3]:0,
+                         op->src[1]?ggml_type_name(op->src[1]->type):"?",
+                         op->src[1]?(long long)op->src[1]->ne[0]:0, op->src[1]?(long long)op->src[1]->ne[1]:0,
+                         op->src[1]?(long long)op->src[1]->ne[2]:0, op->src[1]?(long long)op->src[1]->ne[3]:0);
+        return false;
+    };
+
     if (op->op != GGML_OP_MUL) return false;
-    if (op->type != GGML_TYPE_F32) return false;
+    if (op->type != GGML_TYPE_F32) return rej("dst type");
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
-    if (!a || !b) return false;
-    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return false;
-    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) return false;
+    if (!a || !b) return rej("missing src");
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return rej("src type");
+    if (!ggml_is_contiguous(a)) return rej("a not contig");
+    if (!ggml_is_contiguous(b)) return rej("b not contig");
+    if (!ggml_is_contiguous(op)) return rej("dst not contig");
     const int64_t na = ggml_nelements(a);
     const int64_t nb = ggml_nelements(b);
     const int64_t nd = ggml_nelements(op);
-    if (nd != na) return false;
+    if (nd != na) return rej("nd!=na");
     if (nb != na) {
-        // Broadcast: nb must divide na evenly.
-        if (nb == 0 || (na % nb) != 0) return false;
+        if (nb == 0 || (na % nb) != 0) return rej("nb doesn't divide na");
     }
-    // Producer-consumer stale-CPU-memory guard for the same-shape path
-    // (see qwen35-correctness-open.md). Broadcast MUL doesn't hit the same
-    // pattern in practice (src1 is usually a small weight in HBM), so allow
-    // it through.
-    if (nb == na && (!tensor_is_hbm(a) || !tensor_is_hbm(b) || !tensor_is_hbm(op))) return false;
     return true;
 }
 

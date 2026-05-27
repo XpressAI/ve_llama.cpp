@@ -42,6 +42,19 @@ VEDAdeviceptr backend_context::resolve_in_slow(const ggml_tensor * t) {
         const char * name = (t->name && t->name[0]) ? t->name : nullptr;
         return cache_.get_or_upload_by_name(name, t->data, size);
     }
+    // PRODUCER-CONSUMER FRESH-DATA LOOKUP:
+    // Within a single VE graph split, if an earlier VE op wrote to this
+    // same CPU-backed tensor and queued the DtoH copy, the fresh data
+    // lives in temp_hbm. The CPU bytes are stale until flush() runs.
+    // Search REVERSE because resolve_out enforces uniqueness on host_dst
+    // (it drops stale entries when a new write hits the same address),
+    // so the latest matching entry is the only one. Return its temp_hbm
+    // directly -- no extra HtoD, no chance of reading stale host bytes.
+    for (auto it = deferred_dtoh_.rbegin(); it != deferred_dtoh_.rend(); ++it) {
+        if (it->host_dst == t->data && it->size == size) {
+            return it->temp_hbm;
+        }
+    }
     // Transient activation: temp HBM, freed after sync. With canary
     // mode on, allocate an extra trailer and seed it with 0xCD so we
     // can detect kernels that read past `size` (irrelevant here -- this
@@ -105,6 +118,23 @@ VEDAdeviceptr backend_context::resolve_out_slow(ggml_tensor * dst) {
             backend_context::CANARY_BYTES, 0);
         canaries_.push_back({tmp, size,
             (dst->name && dst->name[0]) ? dst->name : "?out?"});
+    }
+    // GGML's cgraph allocator reuses CPU buffer slots across tensor
+    // lifetimes -- two tensors at different points in the graph can share
+    // the same host_dst once the earlier one is dead. Keeping the old
+    // deferred_dtoh entry around would: (a) flush AFTER the new write and
+    // overwrite the live data, and (b) cause resolve_in_slow's fresh-hit
+    // lookup to return the WRONG temp_hbm. Drop the older entry. Its
+    // temp_hbm is still valid until the next sync, so any kernel that
+    // already enqueued a launch reading from it is safe; we just stop
+    // tracking it.
+    for (auto it = deferred_dtoh_.begin(); it != deferred_dtoh_.end();) {
+        if (it->host_dst == dst->data) {
+            vedaMemFreeAsync(it->temp_hbm, 0);
+            it = deferred_dtoh_.erase(it);
+        } else {
+            ++it;
+        }
     }
     // After the kernel runs, flush() copies tmp → dst->data directly
     // via vedaMemcpyDtoH and frees tmp. No HMEM intermediate.
