@@ -8950,6 +8950,305 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_hbm(
 }
 
 /*
+ * NCC tile kernel with manual j-by-2 unrolling.
+ *
+ * Same idea as the pack-2 intrinsics kernel (share K[i] and V[i] reads
+ * across 2 queries) but expressed in straight C so NCC's auto-vectorizer
+ * handles the dot reductions and VKQ FMAs. NCC's Sum-idiom and FMA
+ * codegen at unpacked VL=128 has the best instruction scheduling we've
+ * seen on VE; the hope is that it can pipeline two parallel reductions
+ * sharing the same K load, halving effective per-(Q, ic) cost while
+ * keeping all the cycles-per-vector-op wins of staying in NCC.
+ *
+ * Same online-softmax and mask handling as ve_flash_attn_ext_f32q_bf16kv_tile_hbm.
+ */
+uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_unr2_hbm(
+    VEDAdeviceptr dst_hbm,
+    VEDAdeviceptr q_hbm,
+    VEDAdeviceptr k_hbm,
+    VEDAdeviceptr v_hbm,
+    VEDAdeviceptr mask_hbm,
+    uint64_t D, uint64_t Dv,
+    uint64_t N, uint64_t S_kv,
+    uint64_t H, uint64_t Hk, uint64_t B,
+    uint64_t nb_q1, uint64_t nb_q2, uint64_t nb_q3,
+    uint64_t nb_k1, uint64_t nb_k2, uint64_t nb_k3,
+    uint64_t nb_v1, uint64_t nb_v2, uint64_t nb_v3,
+    uint64_t nb_m1, uint64_t nb_m2, uint64_t nb_m3,
+    uint64_t nb_o1, uint64_t nb_o2, uint64_t nb_o3,
+    uint64_t scale_bits, uint64_t max_bias_bits, uint64_t softcap_bits,
+    uint64_t mask_ne2, uint64_t mask_ne3)
+{
+    float* dst;
+    const float* q;
+    const uint16_t* k;
+    const uint16_t* v;
+    const uint16_t* mask = NULL;
+    if (vedaMemPtr((void**)&dst, dst_hbm) != 0) return 1;
+    if (vedaMemPtr((void**)&q, q_hbm) != 0) return 2;
+    if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
+    if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 5;
+
+    float scale, max_bias, logit_softcap;
+    {
+        uint32_t tmp;
+        tmp = (uint32_t)scale_bits;    __builtin_memcpy(&scale, &tmp, sizeof(float));
+        tmp = (uint32_t)max_bias_bits; __builtin_memcpy(&max_bias, &tmp, sizeof(float));
+        tmp = (uint32_t)softcap_bits;  __builtin_memcpy(&logit_softcap, &tmp, sizeof(float));
+    }
+    if (logit_softcap != 0.0f) scale /= logit_softcap;
+
+    const uint32_t n_head = (uint32_t)H;
+    const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)n_head));
+    const float m0 = powf(2.0f, -(max_bias) / (float)n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
+
+    const int64_t rk = (int64_t)(H / Hk);
+    const int64_t rv = (int64_t)(H / Hk);
+
+    const int d        = (int)D;
+    const int dv       = (int)Dv;
+    const int n_tokens = (int)N;
+    const int n_kv     = (int)S_kv;
+    const int n_heads  = (int)H;
+    const int n_batch  = (int)B;
+    const int d_pairs  = d / 2;
+    const int dv_pairs = dv / 2;
+
+    #define NQ_TILE_U 16
+
+    const int n_q_tiles  = (n_tokens + NQ_TILE_U - 1) / NQ_TILE_U;
+    const int total_work = n_batch * n_heads * n_q_tiles;
+
+    #pragma omp parallel for
+    for (int work_id = 0; work_id < total_work; work_id++) {
+        const int ib       = work_id / (n_heads * n_q_tiles);
+        const int ih       = (work_id / n_q_tiles) % n_heads;
+        const int q_tile_i = work_id % n_q_tiles;
+        const int iq_base  = q_tile_i * NQ_TILE_U;
+        const int nq       = (iq_base + NQ_TILE_U <= n_tokens) ? NQ_TILE_U : (n_tokens - iq_base);
+
+        float slope = 1.0f;
+        if (max_bias > 0.0f) {
+            uint32_t hh = (uint32_t)ih;
+            slope = (hh < n_head_log2) ? powf(m0, (float)(hh + 1))
+                                        : powf(m1, (float)(2*(hh - n_head_log2) + 1));
+        }
+
+        const int ik_head = ih / (int)rk;
+        const int iv_head = ih / (int)rv;
+
+        float Q_tile[NQ_TILE_U * 256];
+        const uint16_t* mask_rows[NQ_TILE_U];
+        float M_state[NQ_TILE_U];
+        float S_state[NQ_TILE_U];
+        float VKQ[NQ_TILE_U * 256];
+
+        for (int j = 0; j < nq; j++) {
+            const float* q_vec = (const float*)((const char*)q
+                + (iq_base + j) * nb_q1 + ih * nb_q2 + ib * nb_q3);
+            #pragma _NEC ivdep
+            for (int i = 0; i < d; i++) Q_tile[j*d + i] = q_vec[i];
+            M_state[j] = -INFINITY;
+            S_state[j] = 0.0f;
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) VKQ[j*dv + i] = 0.0f;
+            if (mask != NULL) {
+                int im2 = ih % (int)mask_ne2;
+                int im3 = ib % (int)mask_ne3;
+                mask_rows[j] = (const uint16_t*)((const char*)mask
+                    + (iq_base + j) * nb_m1 + im2 * nb_m2 + im3 * nb_m3);
+            } else {
+                mask_rows[j] = NULL;
+            }
+        }
+
+        for (int ic = 0; ic < n_kv; ic++) {
+            const uint32_t* k_u32 = (const uint32_t*)((const char*)k
+                + ic * nb_k1 + ik_head * nb_k2 + ib * nb_k3);
+            float k_f32[256];
+            #pragma _NEC ivdep
+            for (int i = 0; i < d_pairs; i++) {
+                uint32_t packed = k_u32[i];
+                uint32_t f32_lo = (packed & 0xFFFF) << 16;
+                uint32_t f32_hi = packed & 0xFFFF0000;
+                union { uint32_t u; float f; } cl, ch;
+                cl.u = f32_lo;  ch.u = f32_hi;
+                k_f32[2*i]     = cl.f;
+                k_f32[2*i + 1] = ch.f;
+            }
+
+            const uint32_t* v_u32 = (const uint32_t*)((const char*)v
+                + ic * nb_v1 + iv_head * nb_v2 + ib * nb_v3);
+            float v_f32[256];
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv_pairs; i++) {
+                uint32_t packed = v_u32[i];
+                uint32_t f32_lo = (packed & 0xFFFF) << 16;
+                uint32_t f32_hi = packed & 0xFFFF0000;
+                union { uint32_t u; float f; } cl, ch;
+                cl.u = f32_lo;  ch.u = f32_hi;
+                v_f32[2*i]     = cl.f;
+                v_f32[2*i + 1] = ch.f;
+            }
+
+            /* Per-PAIR update against the shared K/V[ic]. */
+            int j = 0;
+            for (; j + 1 < nq; j += 2) {
+                const int j0 = j, j1 = j + 1;
+
+                /* Mask decode for both queries. */
+                float mv0 = 0.0f, mv1 = 0.0f;
+                if (mask_rows[j0] != NULL) {
+                    uint16_t mf16 = mask_rows[j0][ic];
+                    uint32_t sign = (mf16 >> 15) & 0x1;
+                    uint32_t exp_b = (mf16 >> 10) & 0x1F;
+                    uint32_t mant = mf16 & 0x3FF;
+                    uint32_t f32;
+                    if (exp_b == 0)      f32 = (mant == 0) ? (sign << 31) : 0;
+                    else if (exp_b == 31) f32 = (sign << 31) | 0x7F800000 | (mant << 13);
+                    else                  f32 = (sign << 31) | ((exp_b + 127 - 15) << 23) | (mant << 13);
+                    __builtin_memcpy(&mv0, &f32, sizeof(float));
+                    mv0 *= slope;
+                }
+                if (mask_rows[j1] != NULL) {
+                    uint16_t mf16 = mask_rows[j1][ic];
+                    uint32_t sign = (mf16 >> 15) & 0x1;
+                    uint32_t exp_b = (mf16 >> 10) & 0x1F;
+                    uint32_t mant = mf16 & 0x3FF;
+                    uint32_t f32;
+                    if (exp_b == 0)      f32 = (mant == 0) ? (sign << 31) : 0;
+                    else if (exp_b == 31) f32 = (sign << 31) | 0x7F800000 | (mant << 13);
+                    else                  f32 = (sign << 31) | ((exp_b + 127 - 15) << 23) | (mant << 13);
+                    __builtin_memcpy(&mv1, &f32, sizeof(float));
+                    mv1 *= slope;
+                }
+                const int skip0 = (mv0 == -INFINITY);
+                const int skip1 = (mv1 == -INFINITY);
+                if (skip0 && skip1) continue;
+
+                /* Parallel dot products — same k_f32[] read, two reductions.
+                 * NCC should recognize both as Sum-idioms and pipeline. */
+                float s0 = 0.0f, s1 = 0.0f;
+                const float * Q0 = Q_tile + (size_t)j0 * d;
+                const float * Q1 = Q_tile + (size_t)j1 * d;
+                #pragma _NEC ivdep
+                for (int i = 0; i < d; i++) {
+                    float ki = k_f32[i];
+                    s0 += Q0[i] * ki;
+                    s1 += Q1[i] * ki;
+                }
+                s0 *= scale; s1 *= scale;
+                if (logit_softcap != 0.0f) {
+                    s0 = logit_softcap * tanhf(s0);
+                    s1 = logit_softcap * tanhf(s1);
+                }
+                s0 += mv0; s1 += mv1;
+
+                /* Per-Q softmax bookkeeping. */
+                float vs0 = 0.0f, vs1 = 0.0f;
+                if (!skip0) {
+                    float M_old0 = M_state[j0];
+                    float ms0 = 1.0f;
+                    if (s0 > M_old0) {
+                        M_state[j0] = s0;
+                        ms0 = expf(M_old0 - s0);
+                        #pragma _NEC ivdep
+                        for (int i = 0; i < dv; i++) VKQ[j0*dv + i] *= ms0;
+                        S_state[j0] *= ms0;
+                        vs0 = 1.0f;
+                    } else {
+                        vs0 = expf(s0 - M_state[j0]);
+                    }
+                    S_state[j0] += vs0;
+                }
+                if (!skip1) {
+                    float M_old1 = M_state[j1];
+                    float ms1 = 1.0f;
+                    if (s1 > M_old1) {
+                        M_state[j1] = s1;
+                        ms1 = expf(M_old1 - s1);
+                        #pragma _NEC ivdep
+                        for (int i = 0; i < dv; i++) VKQ[j1*dv + i] *= ms1;
+                        S_state[j1] *= ms1;
+                        vs1 = 1.0f;
+                    } else {
+                        vs1 = expf(s1 - M_state[j1]);
+                    }
+                    S_state[j1] += vs1;
+                }
+
+                /* Parallel VKQ accumulates — same v_f32[] read, two FMAs. */
+                float * VKQ0 = VKQ + (size_t)j0 * dv;
+                float * VKQ1 = VKQ + (size_t)j1 * dv;
+                #pragma _NEC ivdep
+                for (int i = 0; i < dv; i++) {
+                    float vi = v_f32[i];
+                    VKQ0[i] += vs0 * vi;
+                    VKQ1[i] += vs1 * vi;
+                }
+            }
+
+            /* Leftover odd query. */
+            if (j < nq) {
+                const int j0 = j;
+                float mv = 0.0f;
+                if (mask_rows[j0] != NULL) {
+                    uint16_t mf16 = mask_rows[j0][ic];
+                    uint32_t sign = (mf16 >> 15) & 0x1;
+                    uint32_t exp_b = (mf16 >> 10) & 0x1F;
+                    uint32_t mant = mf16 & 0x3FF;
+                    uint32_t f32;
+                    if (exp_b == 0)      f32 = (mant == 0) ? (sign << 31) : 0;
+                    else if (exp_b == 31) f32 = (sign << 31) | 0x7F800000 | (mant << 13);
+                    else                  f32 = (sign << 31) | ((exp_b + 127 - 15) << 23) | (mant << 13);
+                    __builtin_memcpy(&mv, &f32, sizeof(float));
+                    mv *= slope;
+                }
+                if (mv == -INFINITY) continue;
+
+                float s = 0.0f;
+                #pragma _NEC ivdep
+                for (int i = 0; i < d; i++) s += Q_tile[j0*d + i] * k_f32[i];
+                s *= scale;
+                if (logit_softcap != 0.0f) s = logit_softcap * tanhf(s);
+                s += mv;
+
+                float M_old = M_state[j0];
+                float vs = 0.0f;
+                if (s > M_old) {
+                    M_state[j0] = s;
+                    float ms = expf(M_old - s);
+                    #pragma _NEC ivdep
+                    for (int i = 0; i < dv; i++) VKQ[j0*dv + i] *= ms;
+                    S_state[j0] *= ms;
+                    vs = 1.0f;
+                } else {
+                    vs = expf(s - M_state[j0]);
+                }
+                S_state[j0] += vs;
+                #pragma _NEC ivdep
+                for (int i = 0; i < dv; i++) VKQ[j0*dv + i] += vs * v_f32[i];
+            }
+        }
+
+        for (int j = 0; j < nq; j++) {
+            float S_inv = (S_state[j] == 0.0f) ? 0.0f : 1.0f / S_state[j];
+            float* out_ptr = (float*)((char*)dst
+                + ib * nb_o3 + (iq_base + j) * nb_o2 + ih * nb_o1);
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) out_ptr[i] = VKQ[j*dv + i] * S_inv;
+        }
+    }
+
+    #undef NQ_TILE_U
+
+    asm volatile("fencem 2" ::: "memory");
+    return 0;
+}
+
+/*
  * Tiled-Q + packed-BF16-intrinsics FA prefill (F32 Q + BF16 K/V).
  *
  * Same shape as ve_flash_attn_ext_f32q_bf16kv_tile_hbm above, but the
@@ -9391,6 +9690,147 @@ extern void flash_attn_tile_inner_intrinsics(
     int nq, int n_kv, int d, int dv,
     int64_t nb_k1, int64_t nb_v1,
     float scale, float slope, float logit_softcap);
+
+extern void flash_attn_tile_inner_pack2_intrinsics(
+    float * VKQ,
+    float * M_state,
+    float * S_state,
+    const float * Q_tile,
+    const uint16_t * K_base,
+    const uint16_t * V_base,
+    const uint16_t * const * mask_rows,
+    int nq, int n_kv, int d, int dv,
+    int64_t nb_k1, int64_t nb_v1,
+    float scale, float slope, float logit_softcap);
+
+/* Pack-2 wrapper. Same setup as the fast wrapper below; only difference
+ * is which inner function it calls. Pack-2 puts 2 queries per packed
+ * slot, sharing the K_dup register across both — half the chains. */
+uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_pack2_hbm(
+    VEDAdeviceptr dst_hbm,
+    VEDAdeviceptr q_hbm,
+    VEDAdeviceptr k_hbm,
+    VEDAdeviceptr v_hbm,
+    VEDAdeviceptr mask_hbm,
+    uint64_t D, uint64_t Dv,
+    uint64_t N, uint64_t S_kv,
+    uint64_t H, uint64_t Hk, uint64_t B,
+    uint64_t nb_q1, uint64_t nb_q2, uint64_t nb_q3,
+    uint64_t nb_k1, uint64_t nb_k2, uint64_t nb_k3,
+    uint64_t nb_v1, uint64_t nb_v2, uint64_t nb_v3,
+    uint64_t nb_m1, uint64_t nb_m2, uint64_t nb_m3,
+    uint64_t nb_o1, uint64_t nb_o2, uint64_t nb_o3,
+    uint64_t scale_bits, uint64_t max_bias_bits, uint64_t softcap_bits,
+    uint64_t mask_ne2, uint64_t mask_ne3)
+{
+    float* dst;
+    const float* q;
+    const uint16_t* k;
+    const uint16_t* v;
+    const uint16_t* mask = NULL;
+    if (vedaMemPtr((void**)&dst, dst_hbm) != 0) return 1;
+    if (vedaMemPtr((void**)&q, q_hbm) != 0) return 2;
+    if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
+    if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 5;
+
+    float scale, max_bias, logit_softcap;
+    {
+        uint32_t tmp;
+        tmp = (uint32_t)scale_bits;    __builtin_memcpy(&scale, &tmp, sizeof(float));
+        tmp = (uint32_t)max_bias_bits; __builtin_memcpy(&max_bias, &tmp, sizeof(float));
+        tmp = (uint32_t)softcap_bits;  __builtin_memcpy(&logit_softcap, &tmp, sizeof(float));
+    }
+    if (logit_softcap != 0.0f) scale /= logit_softcap;
+
+    const uint32_t n_head = (uint32_t)H;
+    const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)n_head));
+    const float m0 = powf(2.0f, -(max_bias) / (float)n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
+
+    const int64_t rk = (int64_t)(H / Hk);
+    const int64_t rv = (int64_t)(H / Hk);
+
+    const int d        = (int)D;
+    const int dv       = (int)Dv;
+    const int n_tokens = (int)N;
+    const int n_kv     = (int)S_kv;
+    const int n_heads  = (int)H;
+    const int n_batch  = (int)B;
+
+    #define NQ_TILE_P 16
+
+    const int n_q_tiles  = (n_tokens + NQ_TILE_P - 1) / NQ_TILE_P;
+    const int total_work = n_batch * n_heads * n_q_tiles;
+
+    #pragma omp parallel for
+    for (int work_id = 0; work_id < total_work; work_id++) {
+        const int ib       = work_id / (n_heads * n_q_tiles);
+        const int ih       = (work_id / n_q_tiles) % n_heads;
+        const int q_tile_i = work_id % n_q_tiles;
+        const int iq_base  = q_tile_i * NQ_TILE_P;
+        const int nq       = (iq_base + NQ_TILE_P <= n_tokens) ? NQ_TILE_P : (n_tokens - iq_base);
+
+        float slope = 1.0f;
+        if (max_bias > 0.0f) {
+            uint32_t hh = (uint32_t)ih;
+            slope = (hh < n_head_log2) ? powf(m0, (float)(hh + 1))
+                                        : powf(m1, (float)(2*(hh - n_head_log2) + 1));
+        }
+
+        const int ik_head = ih / (int)rk;
+        const int iv_head = ih / (int)rv;
+
+        float Q_tile[NQ_TILE_P * 256] __attribute__((aligned(8)));
+        const uint16_t* mask_rows[NQ_TILE_P];
+        float M_state[NQ_TILE_P];
+        float S_state[NQ_TILE_P];
+        float VKQ[NQ_TILE_P * 256] __attribute__((aligned(8)));
+
+        for (int j = 0; j < nq; j++) {
+            const float* q_vec = (const float*)((const char*)q
+                + (iq_base + j) * nb_q1 + ih * nb_q2 + ib * nb_q3);
+            #pragma _NEC ivdep
+            for (int i = 0; i < d; i++) Q_tile[j*d + i] = q_vec[i];
+            M_state[j] = -INFINITY;
+            S_state[j] = 0.0f;
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) VKQ[j*dv + i] = 0.0f;
+            if (mask != NULL) {
+                int im2 = ih % (int)mask_ne2;
+                int im3 = ib % (int)mask_ne3;
+                mask_rows[j] = (const uint16_t*)((const char*)mask
+                    + (iq_base + j) * nb_m1 + im2 * nb_m2 + im3 * nb_m3);
+            } else {
+                mask_rows[j] = NULL;
+            }
+        }
+
+        const uint16_t * K_base = (const uint16_t *)((const char*)k
+            + ik_head * nb_k2 + ib * nb_k3);
+        const uint16_t * V_base = (const uint16_t *)((const char*)v
+            + iv_head * nb_v2 + ib * nb_v3);
+
+        flash_attn_tile_inner_pack2_intrinsics(
+            VKQ, M_state, S_state, Q_tile, K_base, V_base, mask_rows,
+            nq, n_kv, d, dv,
+            (int64_t)nb_k1, (int64_t)nb_v1,
+            scale, slope, logit_softcap);
+
+        for (int j = 0; j < nq; j++) {
+            float S_inv = (S_state[j] == 0.0f) ? 0.0f : 1.0f / S_state[j];
+            float* out_ptr = (float*)((char*)dst
+                + ib * nb_o3 + (iq_base + j) * nb_o2 + ih * nb_o1);
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) out_ptr[i] = VKQ[j*dv + i] * S_inv;
+        }
+    }
+
+    #undef NQ_TILE_P
+
+    asm volatile("fencem 2" ::: "memory");
+    return 0;
+}
 
 uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_fast_hbm(
     VEDAdeviceptr dst_hbm,
