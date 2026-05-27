@@ -1,6 +1,15 @@
 #include "ops.hpp"
+#include "common.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <veda.h>
 
 namespace ggml_ve {
 
@@ -9,6 +18,80 @@ namespace ggml_ve {
 // real model but passes unit tests.
 namespace {
 int debug_dispatch_count = 0;
+
+// Per-op profiling. Enabled by GGML_VE_PROFILE_PEROP=1. Syncs the VE
+// context after every op so the elapsed time reflects actual kernel
+// runtime (most VE ops are queued + deferred-sync). The sync itself
+// adds overhead — this mode is for diagnosis, not production.
+struct perop_stat {
+    uint64_t ns_total = 0;
+    uint64_t calls    = 0;
+    // For MUL_MAT we also bucket by the inner-batch dim N to expose
+    // O(N²)-ish scaling in cblas / FA paths.
+    uint64_t ns_by_nbucket[6] = {0};  // N: 1, 2-7, 8-31, 32-127, 128-511, 512+
+    uint64_t calls_by_nbucket[6] = {0};
+};
+
+std::mutex                                  g_perop_mu;
+std::unordered_map<std::string, perop_stat> g_perop;
+std::atomic<bool>                           g_perop_registered{false};
+
+int nbucket(int64_t N) {
+    if (N <= 1)   return 0;
+    if (N < 8)    return 1;
+    if (N < 32)   return 2;
+    if (N < 128)  return 3;
+    if (N < 512)  return 4;
+    return 5;
+}
+
+const char * nbucket_name(int b) {
+    static const char * names[6] = { "N=1", "N=2-7", "N=8-31", "N=32-127", "N=128-511", "N>=512" };
+    return names[b];
+}
+
+void perop_print() {
+    std::lock_guard<std::mutex> lk(g_perop_mu);
+    if (g_perop.empty()) return;
+
+    std::vector<std::pair<std::string, perop_stat>> rows(g_perop.begin(), g_perop.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const auto & a, const auto & b) { return a.second.ns_total > b.second.ns_total; });
+
+    uint64_t grand_total_ns = 0;
+    uint64_t grand_total_calls = 0;
+    for (const auto & r : rows) { grand_total_ns += r.second.ns_total; grand_total_calls += r.second.calls; }
+
+    fprintf(stderr, "\n========== VE per-op profile ==========\n");
+    fprintf(stderr, "%-22s %10s %12s %12s %7s\n", "op", "calls", "total_ms", "avg_us", "pct");
+    for (const auto & r : rows) {
+        const auto & s = r.second;
+        double total_ms = s.ns_total / 1e6;
+        double avg_us   = s.calls ? (s.ns_total / 1e3) / (double) s.calls : 0;
+        double pct      = grand_total_ns ? 100.0 * s.ns_total / grand_total_ns : 0;
+        fprintf(stderr, "%-22s %10llu %12.2f %12.2f %6.1f%%\n",
+                r.first.c_str(),
+                (unsigned long long) s.calls, total_ms, avg_us, pct);
+        // Per-N breakdown if any bucket has calls.
+        for (int b = 0; b < 6; ++b) {
+            if (!s.calls_by_nbucket[b]) continue;
+            double bt_ms = s.ns_by_nbucket[b] / 1e6;
+            double ba_us = (s.ns_by_nbucket[b] / 1e3) / (double) s.calls_by_nbucket[b];
+            fprintf(stderr, "    %-18s %10llu %12.2f %12.2f\n",
+                    nbucket_name(b),
+                    (unsigned long long) s.calls_by_nbucket[b], bt_ms, ba_us);
+        }
+    }
+    fprintf(stderr, "------\n%-22s %10llu %12.2f\n",
+            "TOTAL", (unsigned long long) grand_total_calls, grand_total_ns / 1e6);
+    fprintf(stderr, "=======================================\n\n");
+}
+
+static inline uint64_t now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
 }
 
 bool supports_op(const device * dev, const ggml_tensor * op) {
@@ -111,7 +194,60 @@ bool supports_op(const device * dev, const ggml_tensor * op) {
     }
 }
 
+static bool compute_forward_inner(backend_context * ctx, ggml_tensor * node);
+
 bool compute_forward(backend_context * ctx, ggml_tensor * node) {
+    static const bool profile = (std::getenv("GGML_VE_PROFILE_PEROP") != nullptr);
+    if (!profile) {
+        return compute_forward_inner(ctx, node);
+    }
+    // Register atexit print once.
+    if (!g_perop_registered.exchange(true)) {
+        std::atexit(perop_print);
+    }
+    // Drain prior ops so the timer measures THIS op's runtime, not the
+    // queue tail of whatever was launched earlier in this graph.
+    ctx->flush("perop pre");
+    uint64_t t0 = now_ns();
+    bool ok = compute_forward_inner(ctx, node);
+    // Sync again so the op we just launched actually finishes before we
+    // stop the clock.
+    ctx->flush("perop post");
+    vedaCtxSynchronize();
+    uint64_t dt = now_ns() - t0;
+
+    // Pick a label. For MUL_MAT we also bucket by N (src1->ne[1]) so we
+    // can see how cost scales with the prompt batch.
+    const char * op_name = ggml_op_name(node->op);
+    std::string label    = op_name;
+    if (node->op == GGML_OP_UNARY) {
+        // GGML_OP_UNARY hides a sub-op (SILU/SIGMOID/EXP/...) we want to
+        // distinguish in the histogram.
+        label = std::string("UNARY:") + ggml_unary_op_name(ggml_get_unary_op(node));
+    } else if (node->op == GGML_OP_GLU) {
+        label = std::string("GLU:") + ggml_glu_op_name(ggml_get_glu_op(node));
+    }
+    int b = -1;
+    if (node->op == GGML_OP_MUL_MAT && node->src[1]) {
+        b = nbucket(node->src[1]->ne[1]);
+    } else if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0]) {
+        // Q rows = batch dimension for FA prefill.
+        b = nbucket(node->src[0]->ne[1]);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_perop_mu);
+        auto & s = g_perop[label];
+        s.ns_total += dt;
+        s.calls    += 1;
+        if (b >= 0 && b < 6) {
+            s.ns_by_nbucket[b]    += dt;
+            s.calls_by_nbucket[b] += 1;
+        }
+    }
+    return ok;
+}
+
+static bool compute_forward_inner(backend_context * ctx, ggml_tensor * node) {
     static bool debug = (std::getenv("GGML_VE_DEBUG_DISPATCH") != nullptr);
     if (debug && debug_dispatch_count < 5000) {
         debug_dispatch_count++;
