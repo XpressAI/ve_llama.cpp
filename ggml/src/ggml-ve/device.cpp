@@ -79,6 +79,7 @@ const kernel_meta & meta(kernel_id id) {
         /* K_FLASH_ATTN_EXT_F32Q_BF16KV_HBM           */ { "ve_flash_attn_ext_f32q_bf16kv_hbm",        KMOD_SGEMV  },
         /* K_FLASH_ATTN_EXT_F32Q_BF16KV_HBM_F32MASK   */ { "ve_flash_attn_ext_f32q_bf16kv_hbm_f32mask", KMOD_SGEMV },
         /* K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_HBM      */ { "ve_flash_attn_ext_f32q_bf16kv_tile_hbm",   KMOD_SGEMV  },
+        /* K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_INTRIN_HBM */ { "ve_flash_attn_ext_f32q_bf16kv_tile_intrin_hbm", KMOD_SGEMV },
         /* K_FLASH_ATTN_EXT_F32Q_BF16KV_HMEM          */ { "ve_flash_attn_ext_f32q_bf16kv_hmem",       KMOD_SGEMV  },
         /* K_FLASH_ATTN_EXT_F32Q_F16KV_HMEM           */ { "ve_flash_attn_ext_f32q_f16kv_hmem",        KMOD_SGEMV  },
         /* K_FLASH_ATTN_EXT_F32_F32MASK_HMEM          */ { "ve_flash_attn_ext_f32_f32mask_hmem",       KMOD_SGEMV  },

@@ -8950,6 +8950,187 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_hbm(
 }
 
 /*
+ * Tiled-Q + packed-BF16-intrinsics FA prefill (F32 Q + BF16 K/V).
+ *
+ * Same shape as ve_flash_attn_ext_f32q_bf16kv_tile_hbm above, but the
+ * inner per-Q operations go through the LLVM-VE-RV intrinsics helpers
+ * (dot_bf16_fp32_intrinsics / accumulate_bf16_intrinsics /
+ *  scale_fp32_intrinsics) which use packed-FP32 mode for the FMA — 2x
+ * the FMA throughput vs. NCC's unpacked-vector codegen. K/V live in
+ * the LLC across the per-Q loop (128KB total K per (b,h) for typical
+ * d=128 / n_kv=512), so reloading from BF16 per query is cheap.
+ *
+ * Online-softmax and mask handling identical to the NCC tile kernel;
+ * outputs match bit-for-bit on the test_flash_attn_tile cases. Wired
+ * up behind GGML_VE_FA_TILE_INTRIN=1 (default off) until we confirm
+ * the perf gain holds outside benchmarks.
+ */
+extern float dot_bf16_fp32_intrinsics(const uint16_t* k_ptr, const float* q_ptr, int n);
+extern void  accumulate_bf16_intrinsics(float* result, const uint16_t* v_ptr, float weight, int n);
+extern void  scale_fp32_intrinsics(float* result, float scale, int n);
+
+uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_intrin_hbm(
+    VEDAdeviceptr dst_hbm,
+    VEDAdeviceptr q_hbm,
+    VEDAdeviceptr k_hbm,
+    VEDAdeviceptr v_hbm,
+    VEDAdeviceptr mask_hbm,
+    uint64_t D, uint64_t Dv,
+    uint64_t N, uint64_t S_kv,
+    uint64_t H, uint64_t Hk, uint64_t B,
+    uint64_t nb_q1, uint64_t nb_q2, uint64_t nb_q3,
+    uint64_t nb_k1, uint64_t nb_k2, uint64_t nb_k3,
+    uint64_t nb_v1, uint64_t nb_v2, uint64_t nb_v3,
+    uint64_t nb_m1, uint64_t nb_m2, uint64_t nb_m3,
+    uint64_t nb_o1, uint64_t nb_o2, uint64_t nb_o3,
+    uint64_t scale_bits, uint64_t max_bias_bits, uint64_t softcap_bits,
+    uint64_t mask_ne2, uint64_t mask_ne3)
+{
+    float* dst;
+    const float* q;
+    const uint16_t* k;
+    const uint16_t* v;
+    const uint16_t* mask = NULL;
+    if (vedaMemPtr((void**)&dst, dst_hbm) != 0) return 1;
+    if (vedaMemPtr((void**)&q, q_hbm) != 0) return 2;
+    if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
+    if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 5;
+
+    float scale, max_bias, logit_softcap;
+    {
+        uint32_t tmp;
+        tmp = (uint32_t)scale_bits;    __builtin_memcpy(&scale, &tmp, sizeof(float));
+        tmp = (uint32_t)max_bias_bits; __builtin_memcpy(&max_bias, &tmp, sizeof(float));
+        tmp = (uint32_t)softcap_bits;  __builtin_memcpy(&logit_softcap, &tmp, sizeof(float));
+    }
+    if (logit_softcap != 0.0f) scale /= logit_softcap;
+
+    const uint32_t n_head = (uint32_t)H;
+    const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)n_head));
+    const float m0 = powf(2.0f, -(max_bias) / (float)n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
+
+    const int64_t rk = (int64_t)(H / Hk);
+    const int64_t rv = (int64_t)(H / Hk);
+
+    const int d        = (int)D;
+    const int dv       = (int)Dv;
+    const int n_tokens = (int)N;
+    const int n_kv     = (int)S_kv;
+    const int n_heads  = (int)H;
+    const int n_batch  = (int)B;
+
+    #define NQ_TILE_I 16
+
+    const int n_q_tiles  = (n_tokens + NQ_TILE_I - 1) / NQ_TILE_I;
+    const int total_work = n_batch * n_heads * n_q_tiles;
+
+    #pragma omp parallel for
+    for (int work_id = 0; work_id < total_work; work_id++) {
+        const int ib       = work_id / (n_heads * n_q_tiles);
+        const int ih       = (work_id / n_q_tiles) % n_heads;
+        const int q_tile_i = work_id % n_q_tiles;
+        const int iq_base  = q_tile_i * NQ_TILE_I;
+        const int nq       = (iq_base + NQ_TILE_I <= n_tokens) ? NQ_TILE_I : (n_tokens - iq_base);
+
+        float slope = 1.0f;
+        if (max_bias > 0.0f) {
+            uint32_t hh = (uint32_t)ih;
+            slope = (hh < n_head_log2) ? powf(m0, (float)(hh + 1))
+                                        : powf(m1, (float)(2*(hh - n_head_log2) + 1));
+        }
+
+        const int ik_head = ih / (int)rk;
+        const int iv_head = ih / (int)rv;
+
+        /* Per-Q pointers + state. VKQ is per-Q, 8B-aligned for packed
+         * intrinsics. */
+        const float* q_ptr[NQ_TILE_I];
+        const uint16_t* mask_rows[NQ_TILE_I];
+        float M_state[NQ_TILE_I];
+        float S_state[NQ_TILE_I];
+        float VKQ[NQ_TILE_I * 256] __attribute__((aligned(8)));
+
+        for (int j = 0; j < nq; j++) {
+            q_ptr[j] = (const float*)((const char*)q
+                + (iq_base + j) * nb_q1 + ih * nb_q2 + ib * nb_q3);
+            M_state[j] = -INFINITY;
+            S_state[j] = 0.0f;
+            for (int i = 0; i < dv; i++) VKQ[j*dv + i] = 0.0f;
+            if (mask != NULL) {
+                int im2 = ih % (int)mask_ne2;
+                int im3 = ib % (int)mask_ne3;
+                mask_rows[j] = (const uint16_t*)((const char*)mask
+                    + (iq_base + j) * nb_m1 + im2 * nb_m2 + im3 * nb_m3);
+            } else {
+                mask_rows[j] = NULL;
+            }
+        }
+
+        for (int ic = 0; ic < n_kv; ic++) {
+            const uint16_t* k_row = (const uint16_t*)((const char*)k
+                + ic * nb_k1 + ik_head * nb_k2 + ib * nb_k3);
+            const uint16_t* v_row = (const uint16_t*)((const char*)v
+                + ic * nb_v1 + iv_head * nb_v2 + ib * nb_v3);
+
+            for (int j = 0; j < nq; j++) {
+                float mv = 0.0f;
+                if (mask_rows[j] != NULL) {
+                    uint16_t mf16 = mask_rows[j][ic];
+                    uint32_t sign  = (mf16 >> 15) & 0x1;
+                    uint32_t exp_b = (mf16 >> 10) & 0x1F;
+                    uint32_t mant  = mf16 & 0x3FF;
+                    uint32_t f32;
+                    if (exp_b == 0) {
+                        f32 = (mant == 0) ? (sign << 31) : 0;
+                    } else if (exp_b == 31) {
+                        f32 = (sign << 31) | 0x7F800000 | (mant << 13);
+                    } else {
+                        f32 = (sign << 31) | ((exp_b + 127 - 15) << 23) | (mant << 13);
+                    }
+                    __builtin_memcpy(&mv, &f32, sizeof(float));
+                    mv *= slope;
+                }
+                if (mv == -INFINITY) continue;
+
+                /* Packed-BF16 Q.K. K stays in LLC across nq queries. */
+                float s = dot_bf16_fp32_intrinsics(k_row, q_ptr[j], d);
+                s *= scale;
+                if (logit_softcap != 0.0f) s = logit_softcap * tanhf(s);
+                s += mv;
+
+                float M_old = M_state[j];
+                float ms = 1.0f, vs = 1.0f;
+                if (s > M_state[j]) {
+                    M_state[j] = s;
+                    ms = expf(M_old - M_state[j]);
+                    scale_fp32_intrinsics(VKQ + j*dv, ms, dv);
+                    S_state[j] *= ms;
+                } else {
+                    vs = expf(s - M_state[j]);
+                }
+                accumulate_bf16_intrinsics(VKQ + j*dv, v_row, vs, dv);
+                S_state[j] += vs;
+            }
+        }
+
+        for (int j = 0; j < nq; j++) {
+            float S_inv = (S_state[j] == 0.0f) ? 0.0f : 1.0f / S_state[j];
+            float* out_ptr = (float*)((char*)dst
+                + ib * nb_o3 + (iq_base + j) * nb_o2 + ih * nb_o1);
+            scale_fp32_intrinsics(VKQ + j*dv, S_inv, dv);
+            for (int i = 0; i < dv; i++) out_ptr[i] = VKQ[j*dv + i];
+        }
+    }
+
+    #undef NQ_TILE_I
+
+    asm volatile("fencem 2" ::: "memory");
+    return 0;
+}
+
+/*
  * VEDA-callable wrapper for LLVM-VE intrinsics flash attention
  * 
  * This converts HBM pointers and calls the intrinsics-based implementation.

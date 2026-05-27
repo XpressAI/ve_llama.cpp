@@ -247,7 +247,15 @@ bool flash_attn(backend_context * ctx, ggml_tensor * dst) {
         fn = ctx->fn(K_FLASH_ATTN_F32_HBM);
     } else if (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_BF16) {
         if (can_tile) {
-            fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_HBM);
+            // GGML_VE_FA_TILE_INTRIN=1 selects the packed-BF16 intrinsics
+            // variant. Default is the NCC-vectorized tile kernel which is
+            // proven correct + ~2x over the row-major reference.
+            if (std::getenv("GGML_VE_FA_TILE_INTRIN") != nullptr) {
+                fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_INTRIN_HBM);
+            }
+            if (fn == 0) {
+                fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_HBM);
+            }
         }
         if (fn == 0) {
             fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_HBM);
