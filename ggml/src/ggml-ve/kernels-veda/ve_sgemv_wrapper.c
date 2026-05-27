@@ -6165,13 +6165,29 @@ uint64_t ve_get_rows_bf16_f32_hbm_hbm(VEDAdeviceptr y_hbm,
     
     int cols = (int)nc;
     int rows = (int)nr;
-    
+
+    /* Decode-time fast path: 1 row of nc cols. OMP team startup (~50us)
+     * dwarfs the ~10us of actual work. Run serial; NCC vectorises the
+     * cols loop. */
+    if (rows == 1) {
+        int32_t row_idx = idx[0];
+        const uint16_t* src_row = (const uint16_t*)((const char*)x + row_idx * nb_src);
+        float* dst_row = (float*)y;
+        #pragma _NEC ivdep
+        for (int j = 0; j < cols; j++) {
+            uint32_t bf16_val = (uint32_t)src_row[j] << 16;
+            float* fp32_ptr = (float*)&bf16_val;
+            dst_row[j] = *fp32_ptr;
+        }
+        return 0;
+    }
+
     #pragma omp parallel for
     for (int i = 0; i < rows; i++) {
         int32_t row_idx = idx[i];
         const uint16_t* src_row = (const uint16_t*)((const char*)x + row_idx * nb_src);
         float* dst_row = (float*)((char*)y + i * nb_dst);
-        
+
         #pragma _NEC ivdep
         for (int j = 0; j < cols; j++) {
             /* BF16 to F32: shift left by 16 bits */
@@ -6180,13 +6196,13 @@ uint64_t ve_get_rows_bf16_f32_hbm_hbm(VEDAdeviceptr y_hbm,
             dst_row[j] = *fp32_ptr;
         }
     }
-    
+
     return 0;
 }
 
 /*
  * GET_ROWS F32 source HBM -> F32 HBM output
- * 
+ *
  * Both embedding table and output are in HBM - optimal path!
  */
 uint64_t ve_get_rows_f32_f32_hbm_hbm(VEDAdeviceptr y_hbm,
@@ -6210,22 +6226,34 @@ uint64_t ve_get_rows_f32_f32_hbm_hbm(VEDAdeviceptr y_hbm,
 
     err = vedaMemPtr((void**)&idx, idx_hbm);
     if (err != VEDA_SUCCESS) return err;
-    
+
     int cols = (int)nc;
     int rows = (int)nr;
-    
+
+    /* Decode-time fast path: see BF16 variant above. */
+    if (rows == 1) {
+        int32_t row_idx = idx[0];
+        const float* src_row = (const float*)((const char*)x + row_idx * nb_src);
+        float* dst_row = (float*)y;
+        #pragma _NEC ivdep
+        for (int j = 0; j < cols; j++) {
+            dst_row[j] = src_row[j];
+        }
+        return 0;
+    }
+
     #pragma omp parallel for
     for (int i = 0; i < rows; i++) {
         int32_t row_idx = idx[i];
         const float* src_row = (const float*)((const char*)x + row_idx * nb_src);
         float* dst_row = (float*)((char*)y + i * nb_dst);
-        
+
         #pragma _NEC ivdep
         for (int j = 0; j < cols; j++) {
             dst_row[j] = src_row[j];
         }
     }
-    
+
     return 0;
 }
 
