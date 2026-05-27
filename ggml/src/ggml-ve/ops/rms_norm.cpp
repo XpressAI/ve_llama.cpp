@@ -20,13 +20,24 @@ namespace ggml_ve {
 namespace ops {
 
 bool rms_norm_supports(const ggml_tensor * op) {
+    static const bool dbg = std::getenv("GGML_VE_DEBUG_RMS_NORM") != nullptr;
+    auto rej = [&](const char * why) {
+        if (dbg) fprintf(stderr, "[VE-RMS-rej] %s : %s x=%s[%lld,%lld,%lld,%lld] op=%s[%lld,%lld,%lld,%lld]\n",
+                         op->name[0]?op->name:"?", why,
+                         op->src[0]?ggml_type_name(op->src[0]->type):"?",
+                         op->src[0]?(long long)op->src[0]->ne[0]:0, op->src[0]?(long long)op->src[0]->ne[1]:0,
+                         op->src[0]?(long long)op->src[0]->ne[2]:0, op->src[0]?(long long)op->src[0]->ne[3]:0,
+                         ggml_type_name(op->type),
+                         (long long)op->ne[0], (long long)op->ne[1], (long long)op->ne[2], (long long)op->ne[3]);
+        return false;
+    };
 
     if (op->op != GGML_OP_RMS_NORM || op->type != GGML_TYPE_F32) return false;
     const ggml_tensor * x = op->src[0];
-    if (x == nullptr || x->type != GGML_TYPE_F32) return false;
-    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(op)) return false;
-    if (x->ne[0] != op->ne[0] || ggml_nelements(x) != ggml_nelements(op)) return false;
-    // No batched / 4D tensors yet — we collapse to (ne00, n_rows).
+    if (x == nullptr || x->type != GGML_TYPE_F32) return rej("x type");
+    if (!ggml_is_contiguous(x)) return rej("x not contig");
+    if (!ggml_is_contiguous(op)) return rej("dst not contig");
+    if (x->ne[0] != op->ne[0] || ggml_nelements(x) != ggml_nelements(op)) return rej("shape mismatch");
     return true;
 }
 
