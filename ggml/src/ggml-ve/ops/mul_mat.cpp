@@ -57,24 +57,17 @@ bool mul_mat_supports(const ggml_tensor * op) {
     if (!ggml_is_contiguous(x))  return rej("x not contig");
     if (!ggml_is_contiguous(op)) return rej("dst not contig");
 
-    // We need an all-HBM fast path; we don't yet have an HMEM-round-trip
-    // fallback for the cases libve_sgemv.so only ships HMEM-IO kernels for.
-    // The kernels we actually have full-HBM variants of:
+    // Kernels we have:
     //   BF16  N=1  : ve_bf16_matvec_hbm_full
     //   BF16  N>1  : ve_bf16_matmul_hbm_full     (sgemv_packed_bf16_unr per batch)
     //    F32  N=1  : ve_f32_matvec_hbm_full
-    //    F32  N>1  : (no all-HBM kernel)  -> reject for now
-    if (w->type == GGML_TYPE_F32 && N > 1) {
-        return false;
-    }
-    // The packed BF16 sgemv kernel uses 16-way unrolling on K, so K must be
-    // a multiple of 16 to stay inside the row.
+    //    F32  N>1  : ve_f32_sgemm_batched_cblas_hbm  (NLC cblas_sgemm)
     if (w->type == GGML_TYPE_BF16 && (K % 16) != 0) {
-        return false;
+        // The packed BF16 sgemv unrolls 16 across K, so K must be a multiple
+        // of 16 to stay inside the row.
+        return rej("BF16 K%16 != 0");
     }
-    // FP32 matvec kernel inner loop assumes K >= 1 (trivially true) but we
-    // still need M > 0 and K > 0.
-    if (M <= 0 || K <= 0 || N <= 0) return false;
+    if (M <= 0 || K <= 0 || N <= 0) return rej("zero dim");
 
     return true;
 }
@@ -214,6 +207,33 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
         if (N == 1) {
             fn = ctx->fn(K_F32_MATVEC_HBM_FULL);
         } else {
+            // NLC's cblas_sgemm is comprehensively tuned for VE and beats
+            // anything we'd hand-roll. ve_f32_sgemm_batched_cblas_hbm just
+            // reinterprets W[M,K] / x[K,N] as col-major and calls
+            // cblas_sgemm(ColMajor, Trans, NoTrans, ...) -- that produces the
+            // exact GGML MUL_MAT semantics dst[m,n] = sum_k W[m,k] * x[n,k].
+            // CBLAS hangs the VE if launches stack async, so we sync inline.
+            VEDAfunction fn_cblas = ctx->fn(K_F32_SGEMM_BATCHED_CBLAS_HBM);
+            if (fn_cblas != 0) {
+                VEDAargs args = nullptr;
+                if (ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(f32_sgemm_cblas)")) {
+                    vedaArgsSetVPtr(args, 0, y_vptr);
+                    vedaArgsSetVPtr(args, 1, w_vptr);
+                    vedaArgsSetVPtr(args, 2, x_vptr);
+                    vedaArgsSetU64 (args, 3, M);
+                    vedaArgsSetU64 (args, 4, K);
+                    vedaArgsSetU64 (args, 5, N);
+                    if (ggml_ve_ok(vedaLaunchKernelEx(fn_cblas, 0, args, /*destroyArgs=*/1, nullptr),
+                                   "vedaLaunchKernelEx(f32_sgemm_cblas)")) {
+                        vedaCtxSynchronize();
+                        ctx->ops_mul_mat()++;
+                        ctx->ops_hbm()++;
+                        return true;
+                    }
+                }
+            }
+            // Fallback: hand-rolled F32 matmul. Slower but doesn't depend on
+            // NLC being loadable.
             fn        = ctx->fn(K_F32_MATMUL_HBM_OMP);
             include_N = true;
         }
