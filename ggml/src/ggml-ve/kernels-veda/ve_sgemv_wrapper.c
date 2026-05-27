@@ -8707,12 +8707,245 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_hbm(
             }
         }
     }
-    
+
     /* Final debug disabled - see below */
-    
+
     /* Force memory fence to ensure all HBM writes are visible before return */
     asm volatile("fencem 2" ::: "memory");  /* Full memory barrier for stores */
-    
+
+    return 0;
+}
+
+/*
+ * Tiled-Q flash attention for prefill (F32 Q, BF16 K/V).
+ *
+ * The non-tiled kernel above parallelises over (batch * head * n_tokens),
+ * giving each (b,h,iq) work item its own loop over n_kv. Every work
+ * item independently reloads + BF16->F32-converts K[ic] and V[ic] for
+ * the same (ic) -- so the same KV element is fetched n_tokens times
+ * per (b,h) layer.
+ *
+ * This kernel groups NQ_TILE queries per work item. The K/V loads and
+ * BF16->F32 conversions happen ONCE per (b,h,Q_tile,ic); the inner
+ * loop reuses the cached k_f32 / v_f32 tile against NQ_TILE queries.
+ * That's an NQ_TILE-fold reduction in HBM bandwidth and BF16-decode
+ * work, which is what dominates the row-major prefill path.
+ *
+ * Algorithm is the same online-softmax FlashAttention used by the
+ * single-Q kernel; per-Q state (M, S, VKQ) is maintained in stack
+ * arrays sized to NQ_TILE. Mask / ALiBi / softcap handling is
+ * per-query, matching the reference kernel exactly.
+ */
+uint64_t ve_flash_attn_ext_f32q_bf16kv_tile_hbm(
+    VEDAdeviceptr dst_hbm,
+    VEDAdeviceptr q_hbm,
+    VEDAdeviceptr k_hbm,
+    VEDAdeviceptr v_hbm,
+    VEDAdeviceptr mask_hbm,
+    uint64_t D,
+    uint64_t Dv,
+    uint64_t N,
+    uint64_t S_kv,
+    uint64_t H,
+    uint64_t Hk,
+    uint64_t B,
+    uint64_t nb_q1, uint64_t nb_q2, uint64_t nb_q3,
+    uint64_t nb_k1, uint64_t nb_k2, uint64_t nb_k3,
+    uint64_t nb_v1, uint64_t nb_v2, uint64_t nb_v3,
+    uint64_t nb_m1, uint64_t nb_m2, uint64_t nb_m3,
+    uint64_t nb_o1, uint64_t nb_o2, uint64_t nb_o3,
+    uint64_t scale_bits,
+    uint64_t max_bias_bits,
+    uint64_t softcap_bits,
+    uint64_t mask_ne2,
+    uint64_t mask_ne3)
+{
+    float* dst;
+    const float* q;
+    const uint16_t* k;
+    const uint16_t* v;
+    const uint16_t* mask = NULL;
+
+    if (vedaMemPtr((void**)&dst, dst_hbm) != 0) return 1;
+    if (vedaMemPtr((void**)&q, q_hbm) != 0) return 2;
+    if (vedaMemPtr((void**)&k, k_hbm) != 0) return 3;
+    if (vedaMemPtr((void**)&v, v_hbm) != 0) return 4;
+    if (mask_hbm && vedaMemPtr((void**)&mask, mask_hbm) != 0) return 5;
+
+    float scale, max_bias, logit_softcap;
+    {
+        uint32_t tmp;
+        tmp = (uint32_t)scale_bits;     __builtin_memcpy(&scale, &tmp, sizeof(float));
+        tmp = (uint32_t)max_bias_bits;  __builtin_memcpy(&max_bias, &tmp, sizeof(float));
+        tmp = (uint32_t)softcap_bits;   __builtin_memcpy(&logit_softcap, &tmp, sizeof(float));
+    }
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head = (uint32_t)H;
+    const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)n_head));
+    const float m0 = powf(2.0f, -(max_bias) / (float)n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
+
+    const int64_t rk = (int64_t)(H / Hk);
+    const int64_t rv = (int64_t)(H / Hk);
+
+    const int d        = (int)D;
+    const int dv       = (int)Dv;
+    const int n_tokens = (int)N;
+    const int n_kv     = (int)S_kv;
+    const int n_heads  = (int)H;
+    const int n_batch  = (int)B;
+    const int d_pairs  = d / 2;
+    const int dv_pairs = dv / 2;
+
+    /* NQ_TILE drives the BF16-K/V reuse factor. 16 is a sweet spot: 16x
+     * fewer HBM loads + BF16 conversions vs. the row-major kernel, while
+     * keeping per-thread state (Q_tile + VKQ ~= 16*128*4 + 16*128*4 =
+     * 16 KB) inside L1. Bigger tiles need to spill. */
+    #define NQ_TILE 16
+
+    const int n_q_tiles  = (n_tokens + NQ_TILE - 1) / NQ_TILE;
+    const int total_work = n_batch * n_heads * n_q_tiles;
+
+    #pragma omp parallel for
+    for (int work_id = 0; work_id < total_work; work_id++) {
+        const int ib       = work_id / (n_heads * n_q_tiles);
+        const int ih       = (work_id / n_q_tiles) % n_heads;
+        const int q_tile_i = work_id % n_q_tiles;
+        const int iq_base  = q_tile_i * NQ_TILE;
+        const int nq       = (iq_base + NQ_TILE <= n_tokens) ? NQ_TILE : (n_tokens - iq_base);
+
+        float slope = 1.0f;
+        if (max_bias > 0.0f) {
+            uint32_t hh = (uint32_t)ih;
+            slope = (hh < n_head_log2) ? powf(m0, (float)(hh + 1))
+                                        : powf(m1, (float)(2*(hh - n_head_log2) + 1));
+        }
+
+        const int ik_head = ih / (int)rk;
+        const int iv_head = ih / (int)rv;
+
+        /* Per-tile state. NQ_TILE * 256 floats each. */
+        float Q_tile[NQ_TILE * 256];
+        const uint16_t* mask_rows[NQ_TILE];
+        float M_state[NQ_TILE];
+        float S_state[NQ_TILE];
+        float VKQ[NQ_TILE * 256];
+
+        for (int j = 0; j < nq; j++) {
+            const float* q_vec = (const float*)((const char*)q
+                + (iq_base + j) * nb_q1 + ih * nb_q2 + ib * nb_q3);
+            #pragma _NEC ivdep
+            for (int i = 0; i < d; i++) Q_tile[j*d + i] = q_vec[i];
+            M_state[j] = -INFINITY;
+            S_state[j] = 0.0f;
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) VKQ[j*dv + i] = 0.0f;
+            if (mask != NULL) {
+                int im2 = ih % (int)mask_ne2;
+                int im3 = ib % (int)mask_ne3;
+                mask_rows[j] = (const uint16_t*)((const char*)mask
+                    + (iq_base + j) * nb_m1 + im2 * nb_m2 + im3 * nb_m3);
+            } else {
+                mask_rows[j] = NULL;
+            }
+        }
+
+        for (int ic = 0; ic < n_kv; ic++) {
+            /* Load + convert K[ic] once. Reused across nq queries below. */
+            const uint32_t* k_u32 = (const uint32_t*)((const char*)k
+                + ic * nb_k1 + ik_head * nb_k2 + ib * nb_k3);
+            float k_f32[256];
+            #pragma _NEC ivdep
+            for (int i = 0; i < d_pairs; i++) {
+                uint32_t packed = k_u32[i];
+                uint32_t f32_lo = (packed & 0xFFFF) << 16;
+                uint32_t f32_hi = packed & 0xFFFF0000;
+                union { uint32_t u; float f; } cl, ch;
+                cl.u = f32_lo;  ch.u = f32_hi;
+                k_f32[2*i]     = cl.f;
+                k_f32[2*i + 1] = ch.f;
+            }
+
+            /* Same for V[ic]. */
+            const uint32_t* v_u32 = (const uint32_t*)((const char*)v
+                + ic * nb_v1 + iv_head * nb_v2 + ib * nb_v3);
+            float v_f32[256];
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv_pairs; i++) {
+                uint32_t packed = v_u32[i];
+                uint32_t f32_lo = (packed & 0xFFFF) << 16;
+                uint32_t f32_hi = packed & 0xFFFF0000;
+                union { uint32_t u; float f; } cl, ch;
+                cl.u = f32_lo;  ch.u = f32_hi;
+                v_f32[2*i]     = cl.f;
+                v_f32[2*i + 1] = ch.f;
+            }
+
+            /* Per-query update against the shared K/V[ic]. */
+            for (int j = 0; j < nq; j++) {
+                /* Decode F16 mask -> F32 (matches reference kernel above). */
+                float mv = 0.0f;
+                if (mask_rows[j] != NULL) {
+                    uint16_t mf16 = mask_rows[j][ic];
+                    uint32_t sign  = (mf16 >> 15) & 0x1;
+                    uint32_t exp_b = (mf16 >> 10) & 0x1F;
+                    uint32_t mant  = mf16 & 0x3FF;
+                    uint32_t f32;
+                    if (exp_b == 0) {
+                        f32 = (mant == 0) ? (sign << 31) : 0;
+                    } else if (exp_b == 31) {
+                        f32 = (sign << 31) | 0x7F800000 | (mant << 13);
+                    } else {
+                        f32 = (sign << 31) | ((exp_b + 127 - 15) << 23) | (mant << 13);
+                    }
+                    __builtin_memcpy(&mv, &f32, sizeof(float));
+                    mv *= slope;
+                }
+
+                if (mv == -INFINITY) continue;
+
+                /* Q[j] . K[ic] */
+                float s = 0.0f;
+                #pragma _NEC ivdep
+                for (int i = 0; i < d; i++) {
+                    s += Q_tile[j*d + i] * k_f32[i];
+                }
+                s *= scale;
+                if (logit_softcap != 0.0f) s = logit_softcap * tanhf(s);
+                s += mv;
+
+                float M_old = M_state[j];
+                float ms = 1.0f, vs = 1.0f;
+                if (s > M_state[j]) {
+                    M_state[j] = s;
+                    ms = expf(M_old - M_state[j]);
+                    #pragma _NEC ivdep
+                    for (int i = 0; i < dv; i++) VKQ[j*dv + i] *= ms;
+                    S_state[j] *= ms;
+                } else {
+                    vs = expf(s - M_state[j]);
+                }
+                #pragma _NEC ivdep
+                for (int i = 0; i < dv; i++) VKQ[j*dv + i] += vs * v_f32[i];
+                S_state[j] += vs;
+            }
+        }
+
+        for (int j = 0; j < nq; j++) {
+            float S_inv = (S_state[j] == 0.0f) ? 0.0f : 1.0f / S_state[j];
+            float* out_ptr = (float*)((char*)dst
+                + ib * nb_o3 + (iq_base + j) * nb_o2 + ih * nb_o1);
+            #pragma _NEC ivdep
+            for (int i = 0; i < dv; i++) out_ptr[i] = VKQ[j*dv + i] * S_inv;
+        }
+    }
+
+    #undef NQ_TILE
+
+    asm volatile("fencem 2" ::: "memory");
     return 0;
 }
 

@@ -234,12 +234,24 @@ bool flash_attn(backend_context * ctx, ggml_tensor * dst) {
     const VEDAdeviceptr dst_hbm = ctx->resolve_out(dst);
     if (q_hbm == 0 || k_hbm == 0 || v_hbm == 0 || dst_hbm == 0) return false;
 
-    // Pick kernel by Q/K/V dtypes.
+    // Pick kernel by Q/K/V dtypes. For (F32 Q, BF16 K/V) prefill (N>1) the
+    // tile-batched variant reuses each BF16 K/V load + decode across NQ_TILE
+    // queries, cutting HBM traffic ~Nq× — that's the dominant cost in the
+    // row-major prefill path. Decode (N=1) and the colmajor shadow path
+    // remain untouched.
     VEDAfunction fn = 0;
+    const bool can_tile = (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_BF16 &&
+                           q->ne[1] > 1 &&
+                           std::getenv("GGML_VE_NO_FA_TILE") == nullptr);
     if (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32) {
         fn = ctx->fn(K_FLASH_ATTN_F32_HBM);
     } else if (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_BF16) {
-        fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_HBM);
+        if (can_tile) {
+            fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_TILE_HBM);
+        }
+        if (fn == 0) {
+            fn = ctx->fn(K_FLASH_ATTN_EXT_F32Q_BF16KV_HBM);
+        }
     } else if (q->type == GGML_TYPE_BF16) {
         fn = ctx->fn(K_FLASH_ATTN_BF16_INTRINSICS_HBM);
     }
