@@ -475,22 +475,37 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     // and uploads the embedding to HBM as a side effect. The next cgraph
     // that touches the same weight will see it on HBM and compile
     // cleanly.
+    // execute() walks the slot table assuming every real tensor lives in
+    // VE_HBM; if any operand sits on CPU memory the slot fills with NULL
+    // and the launch aborts. Trivial subgraphs that the scheduler hands us
+    // for warmup or small ubatches sometimes have CPU-resident operands
+    // even when the weights ARE on HBM. Refuse those before we waste a
+    // 30-second NCC compile on a graph the executor can't run.
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         if (!n) continue;
         const ggml_tensor * srcs[GGML_MAX_SRC + 1] = { n, n->src[0], n->src[1], n->src[2] };
         for (const ggml_tensor * t : srcs) {
-            if (!t || !is_weight(t)) continue;
+            if (!t) continue;
+            // Pure-metadata ops (VIEW / RESHAPE / PERMUTE / TRANSPOSE) carry
+            // no data of their own; their canonical tensor's buffer is what
+            // matters. Skip them here so we don't reject a graph for a
+            // VIEW-of-an-HBM-tensor that the canonical-resolver handles fine.
+            if (t->op == GGML_OP_VIEW    || t->op == GGML_OP_RESHAPE ||
+                t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) {
+                continue;
+            }
             ggml_backend_buffer_type_t buft = t->buffer ? ggml_backend_buffer_get_type(t->buffer) : nullptr;
             const char * bn = buft ? ggml_backend_buft_name(buft) : nullptr;
-            if (!bn || std::strncmp(bn, "VE", 2) != 0 || !std::strstr(bn, "_HBM")) {
-                if (debug_enabled()) {
-                    fprintf(stderr, "[VE-GC] refuse: weight '%s' is on non-HBM buffer (%s) at op #%d\n",
-                            t->name ? t->name : "?", bn ? bn : "<no-buffer>", i);
-                }
-                trace_valid_ = false;
-                return false;
+            const bool host = !bn || std::strncmp(bn, "VE", 2) != 0 || !std::strstr(bn, "_HBM");
+            if (!host) continue;
+            if (debug_enabled()) {
+                fprintf(stderr, "[VE-GC] refuse: %s '%s' is on non-HBM buffer (%s) at op #%d\n",
+                        is_weight(t) ? "weight" : "tensor",
+                        t->name ? t->name : "?", bn ? bn : "<no-buffer>", i);
             }
+            trace_valid_ = false;
+            return false;
         }
     }
 

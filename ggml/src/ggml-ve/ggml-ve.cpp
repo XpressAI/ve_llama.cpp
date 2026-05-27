@@ -443,6 +443,24 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (!compute_forward(ctx, node)) {
+            const char * src0_buft = "?";
+            const char * src1_buft = "?";
+            if (node->src[0] && node->src[0]->buffer) {
+                auto * b = ggml_backend_buffer_get_type(node->src[0]->buffer);
+                src0_buft = b ? ggml_backend_buft_name(b) : "?";
+            }
+            if (node->src[1] && node->src[1]->buffer) {
+                auto * b = ggml_backend_buffer_get_type(node->src[1]->buffer);
+                src1_buft = b ? ggml_backend_buft_name(b) : "?";
+            }
+            fprintf(stderr,
+                    "[VE] compute_forward FAILED node[%d]: op=%s type=%s name='%s' "
+                    "src0=%s/%s src1=%s/%s\n",
+                    i, ggml_op_name(node->op),
+                    ggml_type_name(node->type),
+                    node->name,
+                    node->src[0] ? ggml_type_name(node->src[0]->type) : "-", src0_buft,
+                    node->src[1] ? ggml_type_name(node->src[1]->type) : "-", src1_buft);
             ctx->abort_pending();
             return GGML_STATUS_FAILED;
         }

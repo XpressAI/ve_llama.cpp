@@ -138,6 +138,16 @@ bool compute_forward(backend_context * ctx, ggml_tensor * node) {
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
             return true;
+    }
+    // Zero-size tensors: scheduler dry-run / reserve passes hand us 1-node
+    // chunks whose dst (and inputs) have ne[k]=0 in some dimension. There
+    // is no work to do — matches the CPU backend's behavior of silently
+    // doing nothing. Must come before the per-op dispatch so empty inputs
+    // don't reach kernel launch code with nbytes=0.
+    if (ggml_nbytes(node) == 0) {
+        return true;
+    }
+    switch (node->op) {
         case GGML_OP_ADD:
             return ops::add_f32(ctx, node);
         case GGML_OP_SUB:
