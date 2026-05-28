@@ -21,9 +21,16 @@ namespace {
 
 bool is_supported_quant_type(ggml_type t) {
     // Q8_0: all-HBM fused kernel.
-    // Q4_K: direct matvec, dequant in registers, weights stay in HBM (4.5 bpw).
-    // Q2_K's `ve_q2k_bf16_matvec_hbm` expects pre-dequantised BF16 weights
-    // despite its name; not wired up here pending a true direct kernel.
+    // Q4_K: direct matvec exists (ve_q4k_matvec_f32_hbm) and passes all
+    //       standalone correctness shapes bit-exact. BUT enabling it on
+    //       real Q-quant models triggers a separate VE↔CPU intermediate
+    //       transfer bug that produces garbage regardless of whether the
+    //       Q4_K kernel runs (verified: a dummy kernel body that just
+    //       writes y[i] = constant produces the same broken output as
+    //       my real kernel; even disabling the kernel entirely and
+    //       routing all Q4_K to CPU produces the same garbage).
+    //       Until that boundary bug is found, leave Q4_K opt-in.
+    if (std::getenv("GGML_VE_Q4K") == nullptr) return t == GGML_TYPE_Q8_0;
     return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K;
 }
 
