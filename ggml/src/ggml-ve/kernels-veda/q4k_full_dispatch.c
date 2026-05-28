@@ -67,26 +67,11 @@ uint64_t ve_q4k_matvec_full_hbm(uint64_t y_vptr, uint64_t qs_vptr,
     if (x_perm == 0) return 5;
     q4k_build_x_perm_extern(x, x_perm, (int) K);
 
-    /* Process rows in groups of 8. */
-    const uint64_t M8 = M & ~(uint64_t) 7;
+    /* Single-row only for now. The 8-row variant allocates 8x ~2KB of
+     * stack arrays per call which may overflow VE thread stacks on
+     * deep models (64-layer Qwen3.6-27B crashed in node 57). */
     #pragma omp parallel for num_threads(nthr)
-    for (uint64_t m = 0; m < M8; m += 8) {
-        const uint8_t *qs_r[8]  = {
-            qs  + (m+0) * row_qs_bytes, qs  + (m+1) * row_qs_bytes,
-            qs  + (m+2) * row_qs_bytes, qs  + (m+3) * row_qs_bytes,
-            qs  + (m+4) * row_qs_bytes, qs  + (m+5) * row_qs_bytes,
-            qs  + (m+6) * row_qs_bytes, qs  + (m+7) * row_qs_bytes };
-        const uint8_t *hdr_r[8] = {
-            hdr + (m+0) * row_hdr_bytes, hdr + (m+1) * row_hdr_bytes,
-            hdr + (m+2) * row_hdr_bytes, hdr + (m+3) * row_hdr_bytes,
-            hdr + (m+4) * row_hdr_bytes, hdr + (m+5) * row_hdr_bytes,
-            hdr + (m+6) * row_hdr_bytes, hdr + (m+7) * row_hdr_bytes };
-        float *y_out[8] = {
-            &y[m+0], &y[m+1], &y[m+2], &y[m+3],
-            &y[m+4], &y[m+5], &y[m+6], &y[m+7] };
-        q4k_full_8rows_xperm_extern(qs_r, hdr_r, x_perm, y_out, nb);
-    }
-    for (uint64_t m = M8; m < M; m++) {
+    for (uint64_t m = 0; m < M; m++) {
         y[m] = q4k_full_row_dot_xperm_extern(qs  + m * row_qs_bytes,
                                               hdr + m * row_hdr_bytes,
                                               x_perm, nb);

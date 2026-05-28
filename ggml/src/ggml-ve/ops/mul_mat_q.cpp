@@ -120,15 +120,26 @@ bool mul_mat_q_supports(const ggml_tensor * op) {
     const int64_t M = w->ne[1];
     const int64_t N = x->ne[1];
 
-    if (N != 1) return false;                                 // matvec only
-    if (op->ne[0] != M || op->ne[1] != N) return false;
-    if (w->ne[0]  != x->ne[0]) return false;                  // K must match
-    if (op->ne[2] != 1 || op->ne[3] != 1) return false;
-    if (w->ne[2]  != 1 || w->ne[3]  != 1) return false;
-    if (x->ne[2]  != 1 || x->ne[3]  != 1) return false;
-    if (!ggml_is_contiguous(w))  return false;
-    if (!ggml_is_contiguous(x))  return false;
-    if (!ggml_is_contiguous(op)) return false;
+    auto reject = [&](const char *why) {
+        if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+            fprintf(stderr, "[Q4K-REJECT] %s op=%s w=%s w_ne=[%ld,%ld,%ld,%ld] x_ne=[%ld,%ld,%ld,%ld] dst_ne=[%ld,%ld,%ld,%ld]\n",
+                    why, op->name, w->name,
+                    (long)w->ne[0], (long)w->ne[1], (long)w->ne[2], (long)w->ne[3],
+                    (long)x->ne[0], (long)x->ne[1], (long)x->ne[2], (long)x->ne[3],
+                    (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
+        }
+        return false;
+    };
+
+    if (N != 1) return reject("N!=1");
+    if (op->ne[0] != M || op->ne[1] != N) return reject("op_ne mismatch");
+    if (w->ne[0]  != x->ne[0]) return reject("K mismatch");
+    if (op->ne[2] != 1 || op->ne[3] != 1) return reject("op_ne23");
+    if (w->ne[2]  != 1 || w->ne[3]  != 1) return reject("w_ne23");
+    if (x->ne[2]  != 1 || x->ne[3]  != 1) return reject("x_ne23");
+    if (!ggml_is_contiguous(w))  return reject("w not contig");
+    if (!ggml_is_contiguous(x))  return reject("x not contig");
+    if (!ggml_is_contiguous(op)) return reject("op not contig");
 
     const int b = blk_size(w->type);
     if (b == 0 || (K % b) != 0) return false;
@@ -153,15 +164,32 @@ bool mul_mat_q_supports(const ggml_tensor * op) {
 }
 
 bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
-    if (!mul_mat_q_supports(dst)) return false;
+    if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+        fprintf(stderr, "[mul_mat_q ENTRY] dst=%s w=%s/%s\n",
+            dst->name, dst->src[0]?dst->src[0]->name:"?",
+            dst->src[0]?ggml_type_name(dst->src[0]->type):"?");
+        fflush(stderr);
+    }
+    if (!mul_mat_q_supports(dst)) {
+        if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+            fprintf(stderr, "[mul_mat_q REJECTED]\n");
+            fflush(stderr);
+        }
+        return false;
+    }
 
     const ggml_tensor * w = dst->src[0];
     const ggml_tensor * x = dst->src[1];
 
     const VEDAdeviceptr y_hbm = ctx->resolve_out(dst);
-    const VEDAdeviceptr w_hbm = ctx->resolve_in(w);
     const VEDAdeviceptr x_hbm = ctx->resolve_in(x);
-    if (y_hbm == 0 || w_hbm == 0 || x_hbm == 0) return false;
+    // For Q4_K we use the canonical-split cache below (qs+hdr) instead of
+    // the raw-weight cache, so skip resolve_in(w) -- otherwise the same
+    // weight gets uploaded TWICE (raw + canonical-split), doubling the
+    // HBM footprint and OOMing 27B-class models around layer 42.
+    const VEDAdeviceptr w_hbm = (w->type == GGML_TYPE_Q4_K) ? 0 : ctx->resolve_in(w);
+    if (y_hbm == 0 || x_hbm == 0) return false;
+    if (w->type != GGML_TYPE_Q4_K && w_hbm == 0) return false;
 
     const uint64_t M = (uint64_t) w->ne[1];
     const uint64_t K = (uint64_t) w->ne[0];
@@ -177,9 +205,20 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
         if (fn == 0) return false;
         VEDAdeviceptr qs_v = 0, hdr_v = 0;
         const char * name = (w->name && w->name[0]) ? w->name : nullptr;
+        if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+            fprintf(stderr, "[Q4K-DEBUG] name=%s M=%ld K=%ld y_hbm=%lx x_hbm=%lx ...",
+                    name ? name : "?", (long)M, (long)K,
+                    (long)y_hbm, (long)x_hbm);
+            fflush(stderr);
+        }
         if (!ctx->cache().get_or_upload_q4k_canon(
                 name, w->data, (uint64_t) M, (uint64_t) K, &qs_v, &hdr_v)) {
+            if (std::getenv("GGML_VE_Q4K_DEBUG")) fprintf(stderr, " UPLOAD FAIL\n");
             return false;
+        }
+        if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+            fprintf(stderr, " qs_v=%lx hdr_v=%lx ", (long)qs_v, (long)hdr_v);
+            fflush(stderr);
         }
         VEDAargs args = nullptr;
         if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(q4k_full)")) return false;
@@ -191,6 +230,8 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
         vedaArgsSetU64 (args, 5, (uint64_t) K);
         ok = ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, 1, nullptr),
                         "vedaLaunchKernelEx(q4k_matvec_full_hbm)");
+        if (ok && std::getenv("GGML_VE_Q4K_SYNC")) vedaCtxSynchronize();
+        if (std::getenv("GGML_VE_Q4K_DEBUG")) fprintf(stderr, " OK\n");
     } else if (w->type == GGML_TYPE_Q2_K) {
         VEDAfunction fn = ctx->fn(K_Q2K_BF16_MATVEC_HBM);
         if (fn == 0) return false;
