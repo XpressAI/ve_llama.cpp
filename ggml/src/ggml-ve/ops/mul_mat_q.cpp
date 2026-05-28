@@ -211,12 +211,47 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
         if (fn == 0) return false;
         ok = launch_matvec_q8_0_full_hbm(fn, y_hbm, w_hbm, x_hbm, M, K);
     } else if (w->type == GGML_TYPE_Q4_K) {
+        const char * name = (w->name && w->name[0]) ? w->name : nullptr;
+        const int64_t N = dst->ne[1];
+
+        /* GGML_VE_Q4K_DIRECT=1: direct-dispatch on the standard 144-B/blk
+         * layout. NO canon cache, NO 192/144 storage blow-up, NO host
+         * bounce. Slower per-call than the canon path (low VL=8 vs 256)
+         * but it's the only way 27B Q4_K_M fits on a single 48 GB VE when
+         * we also need raw weights on VE_HBM. */
+        if (std::getenv("GGML_VE_Q4K_DIRECT") != nullptr) {
+            VEDAfunction fn_std = ctx->fn(K_Q4K_MATVEC_STD_HBM);
+            if (fn_std == 0) return false;
+            const VEDAdeviceptr w_raw_hbm = ctx->resolve_in(w);
+            if (w_raw_hbm == 0) return false;
+            ok = true;
+            for (int64_t n = 0; n < N && ok; n++) {
+                VEDAargs args = nullptr;
+                if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(q4k_std)")) {
+                    ok = false; break;
+                }
+                VEDAdeviceptr y_col = (VEDAdeviceptr)((uintptr_t) y_hbm + n * M * sizeof(float));
+                VEDAdeviceptr x_col = (VEDAdeviceptr)((uintptr_t) x_hbm + n * K * sizeof(float));
+                vedaArgsSetVPtr(args, 0, y_col);
+                vedaArgsSetVPtr(args, 1, w_raw_hbm);
+                vedaArgsSetVPtr(args, 2, x_col);
+                vedaArgsSetU64 (args, 3, (uint64_t) M);
+                vedaArgsSetU64 (args, 4, (uint64_t) K);
+                ok = ggml_ve_ok(vedaLaunchKernelEx(fn_std, 0, args, 1, nullptr),
+                                "vedaLaunchKernelEx(q4k_matvec_std_hbm)");
+            }
+            if (ok) {
+                ctx->mark_sync_pending();
+                ctx->ops_mul_mat()++;
+                ctx->ops_hbm()++;
+            }
+            return ok;
+        }
+
         // Canonical-split kernel: takes y, qs_split, hdr_split, x, M, K.
         VEDAfunction fn = ctx->fn(K_Q4K_MATVEC_FULL_HBM);
         if (fn == 0) return false;
         VEDAdeviceptr qs_v = 0, hdr_v = 0;
-        const char * name = (w->name && w->name[0]) ? w->name : nullptr;
-        const int64_t N = dst->ne[1];
         if (std::getenv("GGML_VE_Q4K_DEBUG")) {
             fprintf(stderr, "[Q4K-DEBUG] name=%s M=%ld K=%ld N=%ld\n",
                     name ? name : "?", (long)M, (long)K, (long)N);

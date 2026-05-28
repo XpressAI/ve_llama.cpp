@@ -76,6 +76,7 @@ ggml_ve_add_ncc_object(ve_sgemv_wrapper.c    OBJ_SGEMV_WRAPPER)
 ggml_ve_add_ncc_object(ve_kvcolmajor_wrapper.c OBJ_KVCOL_WRAPPER)
 ggml_ve_add_ncc_object(ve_recurrent_wrapper.c OBJ_RECUR_WRAPPER)
 ggml_ve_add_ncc_object(q4k_full_dispatch.c   OBJ_Q4K_DISPATCH)
+ggml_ve_add_ncc_object(q4k_std_dispatch.c    OBJ_Q4K_STD_DISPATCH)
 
 # Intrinsics objects (LLVM-VE-RV: velintrin.h).
 ggml_ve_add_llvm_object(flash_attn_bf16_intrinsics.c OBJ_FA_INTRIN)
@@ -86,6 +87,7 @@ ggml_ve_add_llvm_object(ve_sgemv_bf16.c              OBJ_SGEMV_BF16)
 ggml_ve_add_llvm_object(bf16_sgemm_intrinsics.c      OBJ_BF16_SGEMM)
 ggml_ve_add_llvm_object(sgemv_packed_bf16_unr.c      OBJ_SGEMV_PACKED)
 ggml_ve_add_llvm_object(q4k_full_intrin.c            OBJ_Q4K_FULL)
+ggml_ve_add_llvm_object(q4k_std_intrin.c             OBJ_Q4K_STD)
 
 # Link with NCC because we need its OpenMP runtime symbols. ftrace flag
 # is on so per-function profiling works in shadow benchmark runs; turn
@@ -95,18 +97,18 @@ add_custom_command(
     OUTPUT  ${LIBVE_SGEMV}
     COMMAND ${GGML_VE_NCC} -shared -fopenmp -ftrace -o ${LIBVE_SGEMV}
         ${OBJ_SGEMV_WRAPPER} ${OBJ_KVCOL_WRAPPER} ${OBJ_RECUR_WRAPPER}
-        ${OBJ_Q4K_DISPATCH}
+        ${OBJ_Q4K_DISPATCH} ${OBJ_Q4K_STD_DISPATCH}
         ${OBJ_FA_INTRIN} ${OBJ_FA_FUSED} ${OBJ_FA_COL} ${OBJ_FA_TILE_FAST}
         ${OBJ_SGEMV_BF16} ${OBJ_BF16_SGEMM} ${OBJ_SGEMV_PACKED}
-        ${OBJ_Q4K_FULL}
+        ${OBJ_Q4K_FULL} ${OBJ_Q4K_STD}
         -lm -L${GGML_VE_NLC_LIB} -lcblas -lblas_openmp
         -Wl,-rpath,${GGML_VE_NLC_LIB}
     DEPENDS
         ${OBJ_SGEMV_WRAPPER} ${OBJ_KVCOL_WRAPPER} ${OBJ_RECUR_WRAPPER}
-        ${OBJ_Q4K_DISPATCH}
+        ${OBJ_Q4K_DISPATCH} ${OBJ_Q4K_STD_DISPATCH}
         ${OBJ_FA_INTRIN} ${OBJ_FA_FUSED} ${OBJ_FA_COL} ${OBJ_FA_TILE_FAST}
         ${OBJ_SGEMV_BF16} ${OBJ_BF16_SGEMM} ${OBJ_SGEMV_PACKED}
-        ${OBJ_Q4K_FULL}
+        ${OBJ_Q4K_FULL} ${OBJ_Q4K_STD}
     COMMENT "NCC link libve_sgemv.so"
     VERBATIM)
 
