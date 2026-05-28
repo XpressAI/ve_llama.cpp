@@ -1,7 +1,9 @@
 /* NCC-side dispatcher for q4k_std_intrin.c (direct-dispatch Q4_K matvec).
  *
- * Builds x_low_perm and x_high_perm ONCE per matvec, then dispatches
- * OMP-parallel rows that each call the VL=32 inner kernel. */
+ * Builds bp-major x_low_perm and x_high_perm ONCE per matvec, then
+ * dispatches OMP-parallel rows. Each row's inner kernel uses a
+ * per-thread qs scratch buffer (cn*128 bytes) to pack qs from raw
+ * blocks contiguously, then issues VL=cn*32 chunked FMAs. */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -17,15 +19,24 @@ extern void  q4k_std_8rows_xperm_extern(const uint8_t * const blk_rows[8],
                                           const float *x_low_perm,
                                           const float *x_high_perm,
                                           float *y_out[8], int nb);
+extern float q4k_std_row_dot_chunked_extern(const uint8_t *blk_row,
+                                              const float *x_low_perm,
+                                              const float *x_high_perm,
+                                              uint8_t *qs_scratch,
+                                              int nb);
 extern void  q4k_std_build_x_perm_extern(const float *x,
                                           float *x_low_perm,
                                           float *x_high_perm, int K);
 
-/* Reusable permuted-x buffers; grow monotonically. Single VEDA kernel
- * context per matvec call so static state is safe. */
+/* Reusable per-matvec buffers; grow monotonically. */
 static float * g_xlo_perm = NULL;
 static float * g_xhi_perm = NULL;
-static size_t  g_xperm_cap = 0;  /* in bytes */
+static size_t  g_xperm_cap = 0;
+
+/* Per-thread qs scratch pool. Sized for nb*128 bytes * nthr_cap. */
+static uint8_t * g_qs_pool = NULL;
+static size_t    g_qs_per_thread = 0;
+static int       g_qs_nthr_cap = 0;
 
 uint64_t ve_q4k_matvec_std_hbm(uint64_t y_vptr, uint64_t W_vptr,
                                 uint64_t x_vptr,
@@ -42,8 +53,9 @@ uint64_t ve_q4k_matvec_std_hbm(uint64_t y_vptr, uint64_t W_vptr,
     int nthr = omp_get_max_threads();
     if (nthr < 1) nthr = 1;
     if (nthr > 8) nthr = 8;
+    if (getenv("GGML_VE_Q4K_STD_ST")) nthr = 1;
 
-    /* Grow permuted-x buffers if needed. Each holds K floats. */
+    /* Grow permuted-x buffers if needed. */
     const size_t need_bytes = (size_t) K * sizeof(float);
     if (need_bytes > g_xperm_cap) {
         if (g_xlo_perm) free(g_xlo_perm);
@@ -59,7 +71,36 @@ uint64_t ve_q4k_matvec_std_hbm(uint64_t y_vptr, uint64_t W_vptr,
     /* GGML_VE_Q4K_STD_TILE=1 to try the 8-row tile (slower at the moment
      * due to register pressure -- left in for future tuning). */
     const int use_tile = (getenv("GGML_VE_Q4K_STD_TILE") != NULL);
-    if (use_tile) {
+    /* GGML_VE_Q4K_STD_CHUNK=1 to use cross-block chunking (VL up to 256). */
+    const int use_chunk = (getenv("GGML_VE_Q4K_STD_CHUNK") != NULL);
+
+    if (use_chunk) {
+        /* Grow per-thread qs scratch. nb*128 bytes per thread. */
+        const size_t qs_need = (size_t) nb * 128;
+        if (qs_need > g_qs_per_thread || nthr > g_qs_nthr_cap) {
+            if (g_qs_pool) free(g_qs_pool);
+            g_qs_per_thread = qs_need;
+            g_qs_nthr_cap = nthr;
+            /* 64-byte aligned, total = nthr * qs_per_thread. */
+            const size_t aligned_per = (qs_need + 63) & ~(size_t) 63;
+            g_qs_per_thread = aligned_per;
+            g_qs_pool = (uint8_t *) aligned_alloc(64,
+                (size_t) nthr * aligned_per);
+            if (g_qs_pool == NULL) return 6;
+        }
+
+        #pragma omp parallel num_threads(nthr)
+        {
+            int tid = omp_get_thread_num();
+            uint8_t *qs_scratch = g_qs_pool + (size_t) tid * g_qs_per_thread;
+            #pragma omp for
+            for (uint64_t m = 0; m < M; m++) {
+                const uint8_t *blk_row = W + m * row_bytes;
+                y[m] = q4k_std_row_dot_chunked_extern(blk_row,
+                    g_xlo_perm, g_xhi_perm, qs_scratch, nb);
+            }
+        }
+    } else if (use_tile) {
         const uint64_t M8 = M & ~(uint64_t) 7;
         #pragma omp parallel for num_threads(nthr)
         for (uint64_t m = 0; m < M8; m += 8) {
