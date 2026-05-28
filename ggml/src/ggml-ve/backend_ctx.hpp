@@ -232,6 +232,16 @@ public:
         needs_sync_ = false;
     }
 
+    // Mark all entries in the deferred queue as initialized. Called by
+    // compute_forward at the END of each op (the kernels have been
+    // launched and added to the VE stream, so subsequent kernels that
+    // read from these tmp_hbm buffers see the producer's writes via
+    // VEDA's intra-stream ordering). After this call, resolve_in_slow's
+    // fresh-hit can return these entries.
+    void commit_pending_initialized() {
+        for (auto & d : deferred_dtoh_) d.initialized = true;
+    }
+
     // Drop the queue without syncing. Used on error paths.
     void abort_pending() {
         for (auto & o : pending_outputs_) pool_.release(o.hmem);
@@ -299,6 +309,14 @@ public:
         VEDAdeviceptr temp_hbm = 0;
         void *        host_dst = nullptr;
         size_t        size     = 0;
+        // True once the producing op has finished compute_forward (so the
+        // kernel that wrote to temp_hbm has been issued AND added to the
+        // VE stream). resolve_in_slow's fresh-hit will only return entries
+        // marked initialized -- this prevents in-place op self-aliasing
+        // (resolve_out for dst, then resolve_in for src=dst, finding the
+        // just-allocated empty temp_hbm) and matches the BF16 fast-path
+        // semantics where in-place ops upload src from CPU normally.
+        bool          initialized = false;
     };
     std::vector<deferred_dtoh> deferred_dtoh_;
 

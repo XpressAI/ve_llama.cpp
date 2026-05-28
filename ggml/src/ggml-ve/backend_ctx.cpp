@@ -61,11 +61,18 @@ VEDAdeviceptr backend_context::resolve_in_slow(const ggml_tensor * t) {
     // + correctness on Q4_K_M (vs the broken default). The minimal
     // correct fix is open in task #60.
     static const bool no_fresh_hit =
-        std::getenv("GGML_VE_NO_FRESH_HIT") != nullptr ||
-        std::getenv("GGML_VE_QUANT_SAFE_MODE") != nullptr;
+        std::getenv("GGML_VE_NO_FRESH_HIT") != nullptr;
     if (!no_fresh_hit) {
+        // Only return entries that have been MARKED INITIALIZED by a
+        // prior op's commit_pending_initialized() call. Skipping
+        // uninitialized entries handles the in-place op case correctly:
+        // resolve_out adds an entry for dst BEFORE the kernel runs (so
+        // the temp_hbm is empty); if src aliases dst the naive fresh-hit
+        // would return that empty buffer. The initialized flag ensures
+        // we walk back to the LATEST genuinely-written entry, or fall
+        // through to a clean CPU upload if none exists.
         for (auto it = deferred_dtoh_.rbegin(); it != deferred_dtoh_.rend(); ++it) {
-            if (it->host_dst == t->data && it->size == size) {
+            if (it->host_dst == t->data && it->size == size && it->initialized) {
                 return it->temp_hbm;
             }
         }
@@ -134,26 +141,23 @@ VEDAdeviceptr backend_context::resolve_out_slow(ggml_tensor * dst) {
         canaries_.push_back({tmp, size,
             (dst->name && dst->name[0]) ? dst->name : "?out?"});
     }
-    // GGML's cgraph allocator reuses CPU buffer slots across tensor
-    // lifetimes -- two tensors at different points in the graph can share
-    // the same host_dst once the earlier one is dead. Keeping the old
-    // deferred_dtoh entry around would: (a) flush AFTER the new write and
-    // overwrite the live data, and (b) cause resolve_in_slow's fresh-hit
-    // lookup to return the WRONG temp_hbm. Drop the older entry. Its
-    // temp_hbm is still valid until the next sync, so any kernel that
-    // already enqueued a launch reading from it is safe; we just stop
-    // tracking it.
-    for (auto it = deferred_dtoh_.begin(); it != deferred_dtoh_.end();) {
-        if (it->host_dst == dst->data) {
-            vedaMemFreeAsync(it->temp_hbm, 0);
-            it = deferred_dtoh_.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    // DELIBERATELY NO PURGE here. Keeping older entries with the same
+    // host_dst preserves the "prior data" for in-place ops:
+    //   resolve_out(dst) adds a fresh uninitialized entry; resolve_in(src)
+    //   with src->data == dst->data walks back, skips this uninitialized
+    //   entry, and returns the PRIOR initialized entry's temp_hbm.
+    // flush() copies all entries with the same host_dst in insertion
+    // order, so the LATEST write wins in CPU memory. The cgraph-reuse
+    // case (X dies, Z reuses addr P) is safe because the scheduler
+    // already calls backend_synchronize between graph splits, which
+    // runs flush() and clears the queue.
     // After the kernel runs, flush() copies tmp → dst->data directly
-    // via vedaMemcpyDtoH and frees tmp. No HMEM intermediate.
-    deferred_dtoh_.push_back({tmp, dst->data, size});
+    // via vedaMemcpyDtoH and frees tmp. No HMEM intermediate. Mark
+    // initialized=false so resolve_in_slow's fresh-hit won't return this
+    // entry until the producing op's compute_forward completes (the
+    // backend_context::commit_pending_initialized() call at the end of
+    // each op walks deferred_dtoh_ and flips initialized=true).
+    deferred_dtoh_.push_back({tmp, dst->data, size, /*initialized=*/false});
     needs_sync_ = true;
     return tmp;
 }

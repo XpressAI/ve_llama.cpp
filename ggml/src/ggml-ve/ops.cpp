@@ -199,20 +199,24 @@ static bool compute_forward_inner(backend_context * ctx, ggml_tensor * node);
 bool compute_forward(backend_context * ctx, ggml_tensor * node) {
     static const bool profile = (std::getenv("GGML_VE_PROFILE_PEROP") != nullptr);
     static const bool quant_safe = (std::getenv("GGML_VE_QUANT_SAFE_MODE") != nullptr);
-    // Plain fast path — no per-op work.
+    // FAST PATH (no profiling, no quant-safe). Always called now: the
+    // boundary bug for Q-quant models is fixed by the deferred_dtoh
+    // 'initialized' flag (resolve_in_slow's fresh-hit skips entries
+    // that haven't completed their producing op -- prevents in-place
+    // op self-aliasing). compute_forward marks entries initialized
+    // AFTER the op completes (commit_pending_initialized), so any
+    // subsequent op's resolve_in sees a consistent snapshot.
     if (!profile && !quant_safe) {
-        return compute_forward_inner(ctx, node);
+        bool ok = compute_forward_inner(ctx, node);
+        ctx->commit_pending_initialized();
+        return ok;
     }
-    // QUANT_SAFE_MODE: per-op flush. Required for correctness on Q-quant
-    // models (see backend_ctx.cpp fresh-hit KNOWN-BUG comment + task #60).
-    // Single POST-flush guarantees CPU memory is fresh by the time the
-    // next op starts -- which means the next op's resolve_in_slow can
-    // read from CPU and get valid bytes. A separate pre-flush is
-    // redundant: the prior op's post-flush already drained the queue.
-    // (Saves ~50us of vedaCtxSynchronize per op = ~2x throughput on
-    // Q-quant models compared to the previous pre+post variant.)
+    // QUANT_SAFE_MODE still supported as a kill-switch (in case the
+    // initialized-flag fix misses some case) -- forces per-op sync
+    // and flush. ~10% slower than the fast path on BF16 models.
     if (quant_safe && !profile) {
         bool ok = compute_forward_inner(ctx, node);
+        ctx->commit_pending_initialized();
         ctx->flush("quant_safe post");
         return ok;
     }
@@ -225,6 +229,7 @@ bool compute_forward(backend_context * ctx, ggml_tensor * node) {
     ctx->flush("perop pre");
     uint64_t t0 = now_ns();
     bool ok = compute_forward_inner(ctx, node);
+    ctx->commit_pending_initialized();
     // Sync again so the op we just launched actually finishes before we
     // stop the clock.
     ctx->flush("perop post");
