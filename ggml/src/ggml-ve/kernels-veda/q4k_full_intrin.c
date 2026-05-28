@@ -119,6 +119,39 @@ uint64_t ve_q4k_full_reorder_hmem(void *src, void *qs_out, void *hdr_out,
 float q4k_full_row_dot_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
                               const float *x, int nb);
 
+/* Permuted-x variant: x_perm[k * n_lanes + i] = x[16*i + k] where
+ * n_lanes = nb * 16. Caller builds once per matvec to make x loads
+ * sequential inside the inner extract loop. */
+float q4k_full_row_dot_xperm_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
+                                     const float *x_perm, int nb);
+
+/* Build x_perm. Called once per matvec by the dispatcher. */
+void q4k_build_x_perm_extern(const float *x, float *x_perm, int K) {
+    const int n_lanes = K / 16;
+    for (int k = 0; k < 16; k++) {
+        for (int i = 0; i < n_lanes; i++) {
+            x_perm[k * n_lanes + i] = x[16 * i + k];
+        }
+    }
+}
+
+/* Packed-mode x permute: for pair (k_even, k_odd) build per-lane uint64
+ * with x[16i+k_even] in lower 32 bits, x[16i+k_odd] in upper 32 bits.
+ * Layout: x_pk[p * n_lanes + i] for p in 0..7, i in 0..n_lanes-1. */
+void q4k_build_x_pk_extern(const float *x, uint64_t *x_pk, int K) {
+    const int n_lanes = K / 16;
+    for (int p = 0; p < 8; p++) {
+        for (int i = 0; i < n_lanes; i++) {
+            uint32_t lo_bits, hi_bits;
+            float fl = x[16 * i + 2*p];
+            float fh = x[16 * i + 2*p + 1];
+            memcpy(&lo_bits, &fl, 4);
+            memcpy(&hi_bits, &fh, 4);
+            x_pk[p * n_lanes + i] = ((uint64_t) hi_bits << 32) | lo_bits;
+        }
+    }
+}
+
 float q4k_full_row_dot_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
                               const float *x, int nb) {
     float acc_scalar = 0.0f;
@@ -188,6 +221,398 @@ float q4k_full_row_dot_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
         blk_offset += chunk_nb;
     }
     return acc_scalar;
+}
+
+/* xperm variant: x already permuted so x_perm[k * n_lanes + i] = x[16i + k].
+ * Loads are now SEQUENTIAL (stride=4). Also fuses vfmuls + vfsubs into a
+ * single vfmads by pre-negating m: w = d*nib - m  →  vfmads(neg_m, d, nib). */
+float q4k_full_row_dot_xperm_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
+                                     const float *x_perm, int nb) {
+    float acc_scalar = 0.0f;
+    const int n_lanes_total = nb * 16;
+    int blk_offset = 0;
+    while (blk_offset < nb) {
+        int chunk_nb = nb - blk_offset;
+        if (chunk_nb > MAX_CHUNK_BLOCKS) chunk_nb = MAX_CHUNK_BLOCKS;
+        const int VL = chunk_nb * 16;
+
+        const uint8_t *qs_chunk  = qs_row  + (size_t) blk_offset * 128;
+        const uint8_t *hdr_chunk = hdr_row + (size_t) blk_offset * 16;
+        const int      lane_off  = blk_offset * 16;
+
+        float dlane[MAX_CHUNK_VL];
+        float neg_mlane[MAX_CHUNK_VL]; /* pre-negated so we can fuse via vfmads */
+        for (int b = 0; b < chunk_nb; b++) {
+            const uint8_t *hdr = hdr_chunk + (size_t) b * 16;
+            uint16_t d_raw, dmin_raw;
+            memcpy(&d_raw,    hdr,     2);
+            memcpy(&dmin_raw, hdr + 2, 2);
+            const float d_super    = h2f(d_raw);
+            const float dmin_super = h2f(dmin_raw);
+            const uint8_t *sc12 = hdr + 4;
+            for (int s = 0; s < 8; s++) {
+                uint8_t sc, mn;
+                q4k_sm(s, sc12, &sc, &mn);
+                const float d = d_super    * (float) sc;
+                const float m = dmin_super * (float) mn;
+                int lane0 = b * 16 + s * 2;
+                dlane[lane0    ] = d;
+                dlane[lane0 + 1] = d;
+                neg_mlane[lane0    ] = -m;
+                neg_mlane[lane0 + 1] = -m;
+            }
+        }
+
+        __vr qs_v       = _vel_vld_vssl(8, (void *)qs_chunk, VL);
+        __vr mask_f     = _vel_vbrdl_vsl(0x0FUL, VL);
+        __vr dlane_v    = _vel_vldu_vssl(4, (void *) dlane, VL);
+        __vr neg_mlane_v = _vel_vldu_vssl(4, (void *) neg_mlane, VL);
+
+        /* 4 parallel accumulators to break the FMA dependency chain.
+         * Without this, each acc_v = vfmads(acc_v, w, x) waits for the
+         * previous FMA's 5-cycle latency. With 4 independent chains, the
+         * pipeline stays full. */
+        __vr acc0 = _vel_vbrds_vsl(0.0f, VL);
+        __vr acc1 = _vel_vbrds_vsl(0.0f, VL);
+        __vr acc2 = _vel_vbrds_vsl(0.0f, VL);
+        __vr acc3 = _vel_vbrds_vsl(0.0f, VL);
+        __vr * accs[4] = {&acc0, &acc1, &acc2, &acc3};
+
+        for (int k = 0; k < 16; k++) {
+            __vr nib = _vel_vand_vvvl(_vel_vsrl_vvsl(qs_v, 4 * k, VL),
+                                      mask_f, VL);
+            __vr nib_f = _vel_vcvtsw_vvl(nib, VL);
+            __vr xv = _vel_vldu_vssl(4,
+                (void *)(x_perm + k * n_lanes_total + lane_off), VL);
+            __vr w = _vel_vfmads_vvvvl(neg_mlane_v, dlane_v, nib_f, VL);
+            *accs[k & 3] = _vel_vfmads_vvvvl(*accs[k & 3], w, xv, VL);
+        }
+        /* Sum accumulators, then reduce. */
+        acc0 = _vel_vfadds_vvvl(acc0, acc1, VL);
+        acc2 = _vel_vfadds_vvvl(acc2, acc3, VL);
+        acc0 = _vel_vfadds_vvvl(acc0, acc2, VL);
+        acc0 = _vel_vfsums_vvl(acc0, VL);
+        acc_scalar += _vel_lvss_svs(acc0, 0);
+        blk_offset += chunk_nb;
+    }
+    return acc_scalar;
+}
+
+/* PACKED-FP32 variant. Processes 2 nibble positions per FMA via VE's
+ * packed-fp32 ops (pvfmad). Halves the inner-loop count from 16 to 8.
+ *
+ *   For pair p in 0..7, nibble positions 2p and 2p+1:
+ *     - lower 32 bits of packed lane holds the value for k = 2p
+ *     - upper 32 bits holds the value for k = 2p+1
+ *
+ *   Same dlane/mlane apply (since 16i + 2p and 16i + 2p+1 are in the same
+ *   /32 sub-block bucket). dlane_pk[i] = pack(d, d) per lane.
+ *
+ * Expects x_pk built by q4k_build_x_pk_extern. */
+float q4k_full_row_dot_packed_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
+                                      const uint64_t *x_pk, int nb);
+
+float q4k_full_row_dot_packed_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
+                                      const uint64_t *x_pk, int nb) {
+    float acc_scalar = 0.0f;
+    const int n_lanes_total = nb * 16;
+    int blk_offset = 0;
+    while (blk_offset < nb) {
+        int chunk_nb = nb - blk_offset;
+        if (chunk_nb > MAX_CHUNK_BLOCKS) chunk_nb = MAX_CHUNK_BLOCKS;
+        const int VL = chunk_nb * 16;
+
+        const uint8_t *qs_chunk  = qs_row  + (size_t) blk_offset * 128;
+        const uint8_t *hdr_chunk = hdr_row + (size_t) blk_offset * 16;
+        const int      lane_off  = blk_offset * 16;
+
+        /* Build packed dlane / neg_mlane: each lane holds (d, d) and (-m, -m). */
+        uint64_t dlane_pk[MAX_CHUNK_VL];
+        uint64_t neg_mlane_pk[MAX_CHUNK_VL];
+        for (int b = 0; b < chunk_nb; b++) {
+            const uint8_t *hdr = hdr_chunk + (size_t) b * 16;
+            uint16_t d_raw, dmin_raw;
+            memcpy(&d_raw,    hdr,     2);
+            memcpy(&dmin_raw, hdr + 2, 2);
+            const float d_super    = h2f(d_raw);
+            const float dmin_super = h2f(dmin_raw);
+            const uint8_t *sc12 = hdr + 4;
+            for (int s = 0; s < 8; s++) {
+                uint8_t sc, mn;
+                q4k_sm(s, sc12, &sc, &mn);
+                const float d  = d_super    * (float) sc;
+                const float nm = -(dmin_super * (float) mn);
+                uint32_t d_bits, nm_bits;
+                memcpy(&d_bits,  &d,  4);
+                memcpy(&nm_bits, &nm, 4);
+                const uint64_t d_pk  = ((uint64_t) d_bits  << 32) | d_bits;
+                const uint64_t nm_pk = ((uint64_t) nm_bits << 32) | nm_bits;
+                int lane0 = b * 16 + s * 2;
+                dlane_pk[lane0    ] = d_pk;
+                dlane_pk[lane0 + 1] = d_pk;
+                neg_mlane_pk[lane0    ] = nm_pk;
+                neg_mlane_pk[lane0 + 1] = nm_pk;
+            }
+        }
+
+        __vr qs_v        = _vel_vld_vssl(8, (void *)qs_chunk, VL);
+        __vr dlane_pk_v  = _vel_vld_vssl(8, (void *) dlane_pk, VL);
+        __vr neg_mlane_pk_v = _vel_vld_vssl(8, (void *) neg_mlane_pk, VL);
+        __vr mask_lo_pk  = _vel_vbrdl_vsl(0x0000000F0000000FUL, VL); /* low nibble in each fp32 half */
+
+        /* 4 parallel packed accumulators for ILP. */
+        __vr acc0 = _vel_vbrdl_vsl(0, VL);
+        __vr acc1 = _vel_vbrdl_vsl(0, VL);
+        __vr acc2 = _vel_vbrdl_vsl(0, VL);
+        __vr acc3 = _vel_vbrdl_vsl(0, VL);
+        __vr * accs[4] = {&acc0, &acc1, &acc2, &acc3};
+
+        /* 8 packed iterations covering 16 nibble positions. */
+        for (int p = 0; p < 8; p++) {
+            /* Extract nibbles at positions 2p (lower 32) and 2p+1 (upper 32).
+             * For each lane: bits [8p..8p+3] go to low fp32 position; bits
+             * [8p+4..8p+7] go to high fp32 position. We can compute both
+             * by shifting qs_v right by 8p, then ANDing with mask
+             * 0x0000000F0000000F (selects bits 0..3 in lower 32 AND bits
+             * 0..3 in upper 32 simultaneously). For the upper 32 we want
+             * bits 4..7 of the original byte, so we need a different shift
+             * for the upper half.
+             *
+             * Simpler: build the packed nibble register from two unpacked
+             * extracts. low = vand(vsrl(qs, 8p), 0xF); high = vand(vsrl(qs,
+             * 8p + 4), 0xF); packed = low | (high << 32). */
+            __vr nib_lo = _vel_vand_vsvl(0x0FUL,
+                              _vel_vsrl_vvsl(qs_v, 8 * p,     VL), VL);
+            __vr nib_hi = _vel_vand_vsvl(0x0FUL,
+                              _vel_vsrl_vvsl(qs_v, 8 * p + 4, VL), VL);
+            __vr nib_pk = _vel_vor_vvvl(nib_lo,
+                              _vel_vsll_vvsl(nib_hi, 32, VL), VL);
+
+            /* Packed int32 → packed fp32. */
+            __vr nib_f_pk = _vel_pvcvtsw_vvl(nib_pk, VL);
+
+            /* w = neg_m + d * nib (packed FMA -- 2 elements per lane). */
+            __vr w_pk = _vel_pvfmad_vvvvl(neg_mlane_pk_v, dlane_pk_v, nib_f_pk, VL);
+
+            /* Load packed x for this pair. */
+            __vr xv_pk = _vel_vld_vssl(8,
+                (void *)(x_pk + p * n_lanes_total + lane_off), VL);
+
+            /* acc += w * x  (packed). 4-way ILP via 4 accumulators. */
+            *accs[p & 3] = _vel_pvfmad_vvvvl(*accs[p & 3], w_pk, xv_pk, VL);
+        }
+
+        /* Combine 4 packed accumulators, then reduce upper+lower halves
+         * and finally lane-wise sum. */
+        acc0 = _vel_pvfadd_vvvl(acc0, acc1, VL);
+        acc2 = _vel_pvfadd_vvvl(acc2, acc3, VL);
+        acc0 = _vel_pvfadd_vvvl(acc0, acc2, VL);
+        /* Sum upper + lower halves of each packed lane into low half. */
+        __vr acc_lo32 = _vel_vand_vvvl(acc0,
+                            _vel_vbrdl_vsl(0x00000000FFFFFFFFUL, VL), VL);
+        __vr acc_hi32 = _vel_vsrl_vvsl(acc0, 32, VL);
+        acc_lo32 = _vel_vsll_vvsl(acc_lo32, 32, VL);  /* low → upper position for vfadds */
+        __vr acc_sum = _vel_vfadds_vvvl(acc_lo32, _vel_vsll_vvsl(acc_hi32, 32, VL), VL);
+        acc_sum = _vel_vfsums_vvl(acc_sum, VL);
+        acc_scalar += _vel_lvss_svs(acc_sum, 0);
+        blk_offset += chunk_nb;
+    }
+    return acc_scalar;
+}
+
+/* 4-row unrolled variant. Processes 4 rows in parallel, sharing one x_perm
+ * load across all 4 rows for each nibble position. The dlane/mlane builds
+ * are still per-row but the inner FMA chains share x loads, which halves
+ * the x-load issue rate and exposes 4x more independent FMA chains. */
+void q4k_full_4rows_xperm_extern(const uint8_t *qs_r0, const uint8_t *qs_r1,
+                                  const uint8_t *qs_r2, const uint8_t *qs_r3,
+                                  const uint8_t *hdr_r0, const uint8_t *hdr_r1,
+                                  const uint8_t *hdr_r2, const uint8_t *hdr_r3,
+                                  const float *x_perm,
+                                  float *y0_out, float *y1_out,
+                                  float *y2_out, float *y3_out, int nb);
+
+void q4k_full_4rows_xperm_extern(const uint8_t *qs_r0, const uint8_t *qs_r1,
+                                  const uint8_t *qs_r2, const uint8_t *qs_r3,
+                                  const uint8_t *hdr_r0, const uint8_t *hdr_r1,
+                                  const uint8_t *hdr_r2, const uint8_t *hdr_r3,
+                                  const float *x_perm,
+                                  float *y0_out, float *y1_out,
+                                  float *y2_out, float *y3_out, int nb) {
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    const int n_lanes_total = nb * 16;
+    int blk_offset = 0;
+    while (blk_offset < nb) {
+        int chunk_nb = nb - blk_offset;
+        if (chunk_nb > MAX_CHUNK_BLOCKS) chunk_nb = MAX_CHUNK_BLOCKS;
+        const int VL = chunk_nb * 16;
+
+        const uint8_t *qs_chunks[4] = {
+            qs_r0 + (size_t) blk_offset * 128,
+            qs_r1 + (size_t) blk_offset * 128,
+            qs_r2 + (size_t) blk_offset * 128,
+            qs_r3 + (size_t) blk_offset * 128,
+        };
+        const uint8_t *hdr_chunks[4] = {
+            hdr_r0 + (size_t) blk_offset * 16,
+            hdr_r1 + (size_t) blk_offset * 16,
+            hdr_r2 + (size_t) blk_offset * 16,
+            hdr_r3 + (size_t) blk_offset * 16,
+        };
+        const int lane_off = blk_offset * 16;
+
+        float dlane[4][MAX_CHUNK_VL];
+        float neg_mlane[4][MAX_CHUNK_VL];
+        for (int r = 0; r < 4; r++) {
+            for (int b = 0; b < chunk_nb; b++) {
+                const uint8_t *hdr = hdr_chunks[r] + (size_t) b * 16;
+                uint16_t d_raw, dmin_raw;
+                memcpy(&d_raw,    hdr,     2);
+                memcpy(&dmin_raw, hdr + 2, 2);
+                const float d_super    = h2f(d_raw);
+                const float dmin_super = h2f(dmin_raw);
+                const uint8_t *sc12 = hdr + 4;
+                for (int s = 0; s < 8; s++) {
+                    uint8_t sc, mn;
+                    q4k_sm(s, sc12, &sc, &mn);
+                    const float d  = d_super    * (float) sc;
+                    const float nm = -(dmin_super * (float) mn);
+                    int lane0 = b * 16 + s * 2;
+                    dlane[r][lane0    ] = d;
+                    dlane[r][lane0 + 1] = d;
+                    neg_mlane[r][lane0    ] = nm;
+                    neg_mlane[r][lane0 + 1] = nm;
+                }
+            }
+        }
+
+        __vr qs0_v = _vel_vld_vssl(8, (void *) qs_chunks[0], VL);
+        __vr qs1_v = _vel_vld_vssl(8, (void *) qs_chunks[1], VL);
+        __vr qs2_v = _vel_vld_vssl(8, (void *) qs_chunks[2], VL);
+        __vr qs3_v = _vel_vld_vssl(8, (void *) qs_chunks[3], VL);
+        __vr mask_f = _vel_vbrdl_vsl(0x0FUL, VL);
+        __vr d0_v   = _vel_vldu_vssl(4, (void *) dlane[0], VL);
+        __vr d1_v   = _vel_vldu_vssl(4, (void *) dlane[1], VL);
+        __vr d2_v   = _vel_vldu_vssl(4, (void *) dlane[2], VL);
+        __vr d3_v   = _vel_vldu_vssl(4, (void *) dlane[3], VL);
+        __vr nm0_v  = _vel_vldu_vssl(4, (void *) neg_mlane[0], VL);
+        __vr nm1_v  = _vel_vldu_vssl(4, (void *) neg_mlane[1], VL);
+        __vr nm2_v  = _vel_vldu_vssl(4, (void *) neg_mlane[2], VL);
+        __vr nm3_v  = _vel_vldu_vssl(4, (void *) neg_mlane[3], VL);
+        __vr acc0 = _vel_vbrds_vsl(0.0f, VL);
+        __vr acc1 = _vel_vbrds_vsl(0.0f, VL);
+        __vr acc2 = _vel_vbrds_vsl(0.0f, VL);
+        __vr acc3 = _vel_vbrds_vsl(0.0f, VL);
+
+        for (int k = 0; k < 16; k++) {
+            /* SHARED x load (4 rows share). */
+            __vr xv = _vel_vldu_vssl(4,
+                (void *)(x_perm + k * n_lanes_total + lane_off), VL);
+
+            /* 4 independent extract + FMA chains. */
+            __vr nib0 = _vel_vand_vvvl(_vel_vsrl_vvsl(qs0_v, 4 * k, VL), mask_f, VL);
+            __vr nib1 = _vel_vand_vvvl(_vel_vsrl_vvsl(qs1_v, 4 * k, VL), mask_f, VL);
+            __vr nib2 = _vel_vand_vvvl(_vel_vsrl_vvsl(qs2_v, 4 * k, VL), mask_f, VL);
+            __vr nib3 = _vel_vand_vvvl(_vel_vsrl_vvsl(qs3_v, 4 * k, VL), mask_f, VL);
+            __vr nf0  = _vel_vcvtsw_vvl(nib0, VL);
+            __vr nf1  = _vel_vcvtsw_vvl(nib1, VL);
+            __vr nf2  = _vel_vcvtsw_vvl(nib2, VL);
+            __vr nf3  = _vel_vcvtsw_vvl(nib3, VL);
+            __vr w0   = _vel_vfmads_vvvvl(nm0_v, d0_v, nf0, VL);
+            __vr w1   = _vel_vfmads_vvvvl(nm1_v, d1_v, nf1, VL);
+            __vr w2   = _vel_vfmads_vvvvl(nm2_v, d2_v, nf2, VL);
+            __vr w3   = _vel_vfmads_vvvvl(nm3_v, d3_v, nf3, VL);
+            acc0 = _vel_vfmads_vvvvl(acc0, w0, xv, VL);
+            acc1 = _vel_vfmads_vvvvl(acc1, w1, xv, VL);
+            acc2 = _vel_vfmads_vvvvl(acc2, w2, xv, VL);
+            acc3 = _vel_vfmads_vvvvl(acc3, w3, xv, VL);
+        }
+
+        acc0 = _vel_vfsums_vvl(acc0, VL); a0 += _vel_lvss_svs(acc0, 0);
+        acc1 = _vel_vfsums_vvl(acc1, VL); a1 += _vel_lvss_svs(acc1, 0);
+        acc2 = _vel_vfsums_vvl(acc2, VL); a2 += _vel_lvss_svs(acc2, 0);
+        acc3 = _vel_vfsums_vvl(acc3, VL); a3 += _vel_lvss_svs(acc3, 0);
+        blk_offset += chunk_nb;
+    }
+    *y0_out = a0; *y1_out = a1; *y2_out = a2; *y3_out = a3;
+}
+
+/* 8-row variant: same idea, 2x more shared-x sharing. */
+void q4k_full_8rows_xperm_extern(const uint8_t * const qs_r[8],
+                                  const uint8_t * const hdr_r[8],
+                                  const float *x_perm,
+                                  float *y_out[8], int nb);
+
+void q4k_full_8rows_xperm_extern(const uint8_t * const qs_r[8],
+                                  const uint8_t * const hdr_r[8],
+                                  const float *x_perm,
+                                  float *y_out[8], int nb) {
+    float a[8] = {0};
+    const int n_lanes_total = nb * 16;
+    int blk_offset = 0;
+    while (blk_offset < nb) {
+        int chunk_nb = nb - blk_offset;
+        if (chunk_nb > MAX_CHUNK_BLOCKS) chunk_nb = MAX_CHUNK_BLOCKS;
+        const int VL = chunk_nb * 16;
+        const int lane_off = blk_offset * 16;
+
+        float dlane[8][MAX_CHUNK_VL];
+        float neg_mlane[8][MAX_CHUNK_VL];
+        for (int r = 0; r < 8; r++) {
+            const uint8_t *hdr_chunk = hdr_r[r] + (size_t) blk_offset * 16;
+            for (int b = 0; b < chunk_nb; b++) {
+                const uint8_t *hdr = hdr_chunk + (size_t) b * 16;
+                uint16_t d_raw, dmin_raw;
+                memcpy(&d_raw,    hdr,     2);
+                memcpy(&dmin_raw, hdr + 2, 2);
+                const float d_super    = h2f(d_raw);
+                const float dmin_super = h2f(dmin_raw);
+                const uint8_t *sc12 = hdr + 4;
+                for (int s = 0; s < 8; s++) {
+                    uint8_t sc, mn;
+                    q4k_sm(s, sc12, &sc, &mn);
+                    const float d  = d_super    * (float) sc;
+                    const float nm = -(dmin_super * (float) mn);
+                    int lane0 = b * 16 + s * 2;
+                    dlane[r][lane0]     = d;
+                    dlane[r][lane0 + 1] = d;
+                    neg_mlane[r][lane0]     = nm;
+                    neg_mlane[r][lane0 + 1] = nm;
+                }
+            }
+        }
+
+        __vr qs_v[8];
+        __vr d_v[8], nm_v[8], acc_v[8];
+        for (int r = 0; r < 8; r++) {
+            qs_v[r] = _vel_vld_vssl(8, (void *)(qs_r[r] + blk_offset * 128), VL);
+            d_v[r]  = _vel_vldu_vssl(4, (void *) dlane[r], VL);
+            nm_v[r] = _vel_vldu_vssl(4, (void *) neg_mlane[r], VL);
+            acc_v[r] = _vel_vbrds_vsl(0.0f, VL);
+        }
+        __vr mask_f = _vel_vbrdl_vsl(0x0FUL, VL);
+
+        for (int k = 0; k < 16; k++) {
+            /* Single shared x load. */
+            __vr xv = _vel_vldu_vssl(4,
+                (void *)(x_perm + k * n_lanes_total + lane_off), VL);
+            /* 8 independent extract + FMA chains. */
+            for (int r = 0; r < 8; r++) {
+                __vr nib = _vel_vand_vvvl(_vel_vsrl_vvsl(qs_v[r], 4 * k, VL),
+                                          mask_f, VL);
+                __vr nib_f = _vel_vcvtsw_vvl(nib, VL);
+                __vr w = _vel_vfmads_vvvvl(nm_v[r], d_v[r], nib_f, VL);
+                acc_v[r] = _vel_vfmads_vvvvl(acc_v[r], w, xv, VL);
+            }
+        }
+
+        for (int r = 0; r < 8; r++) {
+            __vr s = _vel_vfsums_vvl(acc_v[r], VL);
+            a[r] += _vel_lvss_svs(s, 0);
+        }
+        blk_offset += chunk_nb;
+    }
+    for (int r = 0; r < 8; r++) *y_out[r] = a[r];
 }
 
 /* Entry point lives in q4k_full_dispatch.c (compiled with NCC for OMP).
