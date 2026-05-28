@@ -584,6 +584,19 @@ uint64_t ve_q2k_bf16_matvec_hbm(VEDAdeviceptr y_vptr,
 }
 
 /* ============================================================================
+ * PERF WARNING (microbench bench_q4k_vs_bf16.c, 14336x4096 shape):
+ *   Q4_K (this kernel)         : 0.2 GB/s   0.6 GFLOPS
+ *   BF16 sgemv_packed_bf16_unr : 540  GB/s  540 GFLOPS
+ *   F32  ve_f32_matvec         : 272  GB/s  136 GFLOPS
+ * This kernel is ~2700x slower than BF16 because NCC cannot vectorize
+ * the uint8 nibble reads in the inner dequant loop (per CLAUDE.md).
+ * To get competitive performance Q4_K needs an LLVM-VE-RV intrinsics
+ * rewrite that does packed-FP32 dequant + FMA + 16-row unroll, mirroring
+ * what sgemv_packed_bf16_unr.c does for BF16. Current kernel is kept as
+ * a correctness reference (passes test_q4k_matvec.c bit-exact) and an
+ * opt-in via GGML_VE_Q4K=1; production routing keeps Q4_K on CPU.
+ * Tracked as task #58 in the project task list.
+ *
  * Q4_K direct matvec — dequant in registers, Q4_K weights stay in HBM.
  *
  * Key design point: we do NOT cache an expanded BF16 copy of the weights.
