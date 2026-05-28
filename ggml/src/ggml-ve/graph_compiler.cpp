@@ -33,6 +33,7 @@ const char * op_type_name(OpType t) {
         case OpType::ADD:           return "ADD";
         case OpType::MUL_MAT_F32:   return "MUL_MAT_F32";
         case OpType::MUL_MAT_BF16:  return "MUL_MAT_BF16";
+        case OpType::MUL_MAT_Q4K:   return "MUL_MAT_Q4K";
         case OpType::ROPE:          return "ROPE";
         case OpType::SET_ROWS:      return "SET_ROWS";
         case OpType::FLASH_ATTN:    return "FLASH_ATTN";
@@ -340,9 +341,15 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
             op.type = OpType::ADD;
             break;
         case GGML_OP_MUL_MAT:
-            op.type = (op.src_type == GGML_TYPE_BF16)
-                        ? OpType::MUL_MAT_BF16
-                        : OpType::MUL_MAT_F32;
+            if (op.src_type == GGML_TYPE_BF16)      op.type = OpType::MUL_MAT_BF16;
+            else if (op.src_type == GGML_TYPE_Q4_K) op.type = OpType::MUL_MAT_Q4K;
+            else                                     op.type = OpType::MUL_MAT_F32;
+            // Q4_K only supported at N=1 (matvec); N>1 case crashes today
+            // (see mul_mat_q.cpp KNOWN-BUG comment). Compiler must not emit
+            // a Q4_K op with N>1 because there's no inner that handles it.
+            if (op.type == OpType::MUL_MAT_Q4K && node->src[1] && node->src[1]->ne[1] != 1) {
+                return false;
+            }
             break;
         case GGML_OP_ROPE: {
             int32_t mode = 0, n_dims = 0;
@@ -442,6 +449,24 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
         op.colmajor_idx = sp.companion_slot;
     }
 
+    // Q4_K MUL_MAT: register two companion slots (qs + decoded hdr).
+    // The original Q4_K weight slot stays in the table but isn't actually
+    // touched by the kernel (we use qs/hdr instead); execute() fills both
+    // companion slots from hbm_cache::get_or_upload_q4k_canon.
+    if (op.type == OpType::MUL_MAT_Q4K && op.src0_idx >= 0) {
+        Q4KSpec sp;
+        sp.src0_slot = op.src0_idx;
+        sp.M         = op.src0_ne[1];
+        sp.K         = op.src0_ne[0];
+        sp.qs_slot   = (int) tensor_slot_order_.size();
+        tensor_slot_order_.push_back({nullptr, BufferKind::WEIGHT_Q4K_QS});
+        sp.hdr_slot  = (int) tensor_slot_order_.size();
+        tensor_slot_order_.push_back({nullptr, BufferKind::WEIGHT_Q4K_HDR});
+        q4k_specs_.push_back(sp);
+        op.q4k_qs_idx  = sp.qs_slot;
+        op.q4k_hdr_idx = sp.hdr_slot;
+    }
+
     traced_ops_.push_back(op);
     return true;
 }
@@ -456,6 +481,7 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     intermediate_bufs_.clear();
     tensor_slot_order_.clear();
     colmajor_specs_.clear();
+    q4k_specs_.clear();
     trace_valid_ = true;
 
     // Pre-pass: refuse if any weight tensor referenced by this cgraph
@@ -499,6 +525,12 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
             const char * bn = buft ? ggml_backend_buft_name(buft) : nullptr;
             const bool host = !bn || std::strncmp(bn, "VE", 2) != 0 || !std::strstr(bn, "_HBM");
             if (!host) continue;
+            // Q4_K weights are a special case: they typically live on
+            // CPU_Mapped (mmap'd from the GGUF file) but get pulled into HBM
+            // via the q4k canonical-split cache at execute time. Allow them
+            // through the pre-pass; execute() will populate the qs/hdr
+            // companion slots from hbm_cache::get_or_upload_q4k_canon.
+            if (is_weight(t) && t->type == GGML_TYPE_Q4_K) continue;
             if (debug_enabled()) {
                 fprintf(stderr, "[VE-GC] refuse: %s '%s' is on non-HBM buffer (%s) at op #%d\n",
                         is_weight(t) ? "weight" : "tensor",
@@ -762,6 +794,21 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             break;
         }
 
+        case OpType::MUL_MAT_Q4K: {
+            // Q4_K matvec using the canonical-split + pre-decoded-header
+            // inner. qs and hdr come from the Q4KSpec companion slots
+            // (filled at execute time from hbm_cache::get_or_upload_q4k_canon).
+            int64_t M = op.src0_ne[1], K = op.src0_ne[0];
+            std::string qs_p  = "p[" + std::to_string(op.q4k_qs_idx)  + "]";
+            std::string hdr_p = "p[" + std::to_string(op.q4k_hdr_idx) + "]";
+            ss << "    ve_q4k_matvec_rowmajor_ptr_inner((float*)" << dst
+               << ", (const unsigned char*)" << qs_p
+               << ", (const unsigned char*)" << hdr_p
+               << ", (const float*)" << src1
+               << ", " << M << ", " << K << ");\n";
+            break;
+        }
+
         case OpType::ROPE: {
             int n_heads = (op.ne[1] > 1) ? op.ne[1] : 1;
             int head_sz = (int) op.ne[0];
@@ -993,6 +1040,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
     // The "_omp" variants spawn their own region and are used only by the
     // OpType::FLASH_ATTN F32 fallback (kept until we add an _inner there).
     ss << "extern void ve_bf16_matvec_rowmajor_ptr_inner(float* y, const uint16_t* W, const float* x, int M, int K);\n";
+    ss << "extern void ve_q4k_matvec_rowmajor_ptr_inner(float* y, const unsigned char* qs, const unsigned char* hdr, const float* x, int M, int K);\n";
     ss << "extern void ve_f32_matvec_ptr(float* y, const float* W, const float* x, int M, int K);\n";
     ss << "extern void attention_f32_raw_gqa_stride_omp(float* out, const float* q, const void* k, const void* v,"
        << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, float scale,"
@@ -1209,6 +1257,7 @@ CompiledGraph * GraphCompiler::load_compiled(const std::string & so_path, const 
         cg->slot_kinds[i] = tensor_slot_order_[i].second;
     }
     cg->colmajor_specs = colmajor_specs_;
+    cg->q4k_specs      = q4k_specs_;
     return cg;
 }
 
@@ -1318,7 +1367,9 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     size_t slot_pos = 0;
     auto advance_past_colmajor = [&]() {
         while (slot_pos < (size_t) graph->num_slots
-               && graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_COLMAJOR) {
+               && (graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_COLMAJOR
+                   || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_Q4K_QS
+                   || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_Q4K_HDR)) {
             ++slot_pos;
         }
     };
@@ -1380,6 +1431,32 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         }
     }
 
+    // Q4_K companion slots (qs + decoded hdr per Q4_K MUL_MAT op). We need
+    // the cgraph tensor's w->data and w->name to call get_or_upload_q4k_canon.
+    // Walk the cgraph in traced order, find Q4_K MUL_MATs and match to specs.
+    if (!graph->q4k_specs.empty() && bctx) {
+        size_t spec_i = 0;
+        for (int i = 0; i < current_graph->n_nodes && spec_i < graph->q4k_specs.size(); i++) {
+            const ggml_tensor * node = current_graph->nodes[i];
+            if (!node || node->op != GGML_OP_MUL_MAT) continue;
+            const ggml_tensor * w = node->src[0];
+            if (!w || w->type != GGML_TYPE_Q4_K) continue;
+            const Q4KSpec & sp = graph->q4k_specs[spec_i++];
+            VEDAdeviceptr qs_v = 0, hdr_v = 0;
+            const char * name = (w->name && w->name[0]) ? w->name : nullptr;
+            if (!bctx->cache().get_or_upload_q4k_canon(
+                    name, w->data, (uint64_t) sp.M, (uint64_t) sp.K, &qs_v, &hdr_v)) {
+                if (debug_enabled()) {
+                    fprintf(stderr, "[VE-GC] q4k canon upload failed for %s (M=%ld K=%ld)\n",
+                            name ? name : "?", (long) sp.M, (long) sp.K);
+                }
+                return false;
+            }
+            if (sp.qs_slot  >= 0 && sp.qs_slot  < (int) tptrs.size()) tptrs[sp.qs_slot]  = qs_v;
+            if (sp.hdr_slot >= 0 && sp.hdr_slot < (int) tptrs.size()) tptrs[sp.hdr_slot] = hdr_v;
+        }
+    }
+
     // After walking the cgraph + populating colmajor slots, slot_pos should
     // have stepped past every WEIGHT/KV/INTERMEDIATE slot in the table —
     // anything less means try_push ran out of cgraph tensors before filling
@@ -1398,7 +1475,11 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     // mmap weight). Launching with a null pointer is undefined behaviour
     // on the VE — and almost always SIGSEGVs.
     for (size_t i = 0; i < tptrs.size(); ++i) {
-        if (graph->slot_kinds[i] == BufferKind::WEIGHT_COLMAJOR) continue;  // populated above
+        // Companion slots are populated by their own loops above; skip the
+        // null check for them. Real tensor slots must be non-null.
+        if (graph->slot_kinds[i] == BufferKind::WEIGHT_COLMAJOR) continue;
+        if (graph->slot_kinds[i] == BufferKind::WEIGHT_Q4K_QS)   continue;
+        if (graph->slot_kinds[i] == BufferKind::WEIGHT_Q4K_HDR)  continue;
         if (tptrs[i] == 0) {
             if (debug_enabled()) {
                 fprintf(stderr, "[VE-GC] slot %zu kind=%d is NULL — abort\n",

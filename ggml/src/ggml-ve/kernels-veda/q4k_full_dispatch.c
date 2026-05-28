@@ -57,6 +57,65 @@ static size_t  g_x_perm_cap = 0;
 static float * g_sx_full_buf = NULL;
 static size_t  g_sx_full_cap = 0;
 
+/* Pointer-arg variant for use from generated graph-compiler kernels (NCC).
+ * Same OMP-parallel + 8-row tile + xperm-precompute dispatcher logic as
+ * ve_q4k_matvec_full_hbm, but takes already-resolved raw pointers so the
+ * generated C function can just CALL it from inside its own OMP region.
+ * No vedaMemPtr resolution -- caller already has raw HBM pointers from
+ * the slot table populated by GraphCompiler::execute. */
+void ve_q4k_matvec_rowmajor_ptr_inner(float *y, const uint8_t *qs,
+                                       const uint8_t *hdr, const float *x,
+                                       int M, int K) {
+    const int nb = K / 256;
+    const int row_qs_bytes  = nb * 128;
+    const int row_hdr_bytes = nb * 64;
+
+    /* Pre-permute x + Σx per lane (reuses the same growing static bufs). */
+    const size_t need = (size_t) K * sizeof(float);
+    if (need > g_x_perm_cap) {
+        if (g_x_perm_buf) free(g_x_perm_buf);
+        g_x_perm_buf = (float *) aligned_alloc(64, need);
+        g_x_perm_cap = need;
+    }
+    float *x_perm = g_x_perm_buf;
+    q4k_build_x_perm_extern(x, x_perm, K);
+
+    const size_t sx_need = (size_t)(K / 16) * sizeof(float);
+    if (sx_need > g_sx_full_cap) {
+        if (g_sx_full_buf) free(g_sx_full_buf);
+        g_sx_full_buf = (float *) aligned_alloc(64, sx_need);
+        g_sx_full_cap = sx_need;
+    }
+    float *sx_full = g_sx_full_buf;
+    q4k_build_sx_full_extern(x, sx_full, K);
+
+    /* 8-row tile + tail */
+    const int M8 = M & ~7;
+    #pragma omp for
+    for (int m = 0; m < M8; m += 8) {
+        const uint8_t *qs_r[8]  = {
+            qs + (m+0) * row_qs_bytes,  qs + (m+1) * row_qs_bytes,
+            qs + (m+2) * row_qs_bytes,  qs + (m+3) * row_qs_bytes,
+            qs + (m+4) * row_qs_bytes,  qs + (m+5) * row_qs_bytes,
+            qs + (m+6) * row_qs_bytes,  qs + (m+7) * row_qs_bytes };
+        const uint8_t *hdr_r[8] = {
+            hdr + (m+0) * row_hdr_bytes, hdr + (m+1) * row_hdr_bytes,
+            hdr + (m+2) * row_hdr_bytes, hdr + (m+3) * row_hdr_bytes,
+            hdr + (m+4) * row_hdr_bytes, hdr + (m+5) * row_hdr_bytes,
+            hdr + (m+6) * row_hdr_bytes, hdr + (m+7) * row_hdr_bytes };
+        float *y_out[8] = {
+            &y[m+0], &y[m+1], &y[m+2], &y[m+3],
+            &y[m+4], &y[m+5], &y[m+6], &y[m+7] };
+        q4k_full_8rows_decoded_extern(qs_r, hdr_r, x_perm, sx_full, y_out, nb);
+    }
+    #pragma omp for
+    for (int m = M8; m < M; m++) {
+        y[m] = q4k_full_row_dot_xperm_extern(qs  + m * row_qs_bytes,
+                                              hdr + m * row_hdr_bytes,
+                                              x_perm, sx_full, nb);
+    }
+}
+
 uint64_t ve_q4k_matvec_full_hbm(uint64_t y_vptr, uint64_t qs_vptr,
                                  uint64_t hdr_vptr, uint64_t x_vptr,
                                  uint64_t M, uint64_t K) {

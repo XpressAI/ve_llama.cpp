@@ -43,6 +43,7 @@ enum class OpType {
     ADD,
     MUL_MAT_F32,
     MUL_MAT_BF16,
+    MUL_MAT_Q4K,      // Q4_K weights, F32 activations; canonical-split + pre-decoded hdr
     ROPE,             // mode 0 (normal) and 2 (NeoX)
     SET_ROWS,
     FLASH_ATTN,
@@ -54,6 +55,8 @@ enum class OpType {
 enum class BufferKind {
     WEIGHT,           // loaded once, never changes (model weights)
     WEIGHT_COLMAJOR,  // F32 column-major copy of a BF16 weight (cache populated lazily)
+    WEIGHT_Q4K_QS,    // Canonical-packed qs bytes for Q4_K (lazy from hbm cache)
+    WEIGHT_Q4K_HDR,   // Pre-decoded fp32 d_sub+m_sub for Q4_K (lazy from hbm cache)
     KV_CACHE,         // persistent across tokens, mutates each step
     INTERMEDIATE,     // scratch, reused inside the kernel
     INPUT,            // pseudo: input embedding row
@@ -78,6 +81,11 @@ struct TracedOp {
     // the slot holding the F32 col-major companion of src0. -1 = use
     // the original BF16 path through `_inner` matvec.
     int     colmajor_idx = -1;
+    // For MUL_MAT_Q4K ops, the slots holding the canonical-packed qs
+    // bytes and the pre-decoded fp32 headers (populated at execute via
+    // hbm_cache::get_or_upload_q4k_canon). -1 = not a Q4_K op.
+    int     q4k_qs_idx   = -1;
+    int     q4k_hdr_idx  = -1;
     BufferKind dst_kind  = BufferKind::INTERMEDIATE;
     BufferKind src0_kind = BufferKind::INTERMEDIATE;
     BufferKind src1_kind = BufferKind::INTERMEDIATE;
@@ -106,6 +114,17 @@ struct ColmajorSpec {
     int64_t K              = 0;
 };
 
+// Spec for the Q4_K canonical-split companion slots: at execute time
+// we look up (or build) the pre-decoded qs+hdr pair for the Q4_K weight,
+// keyed by tensor name, and stash both HBM pointers in the slot array.
+struct Q4KSpec {
+    int     src0_slot   = -1;   // original weight slot (used as identity key)
+    int     qs_slot     = -1;   // populated with canonical qs pointer
+    int     hdr_slot    = -1;   // populated with pre-decoded hdr pointer
+    int64_t M           = 0;
+    int64_t K           = 0;
+};
+
 struct CompiledGraph {
     VEDAmodule   module    = 0;
     VEDAfunction run_func  = 0;
@@ -126,6 +145,10 @@ struct CompiledGraph {
     // ctx->dev()->colmajor->get_or_create(tptrs[src0_slot], M, K, ...).
     // Empty when no MUL_MAT in the graph opted into the colmajor path.
     std::vector<ColmajorSpec> colmajor_specs;
+
+    // Q4_K companion slots populated at execute time via
+    // hbm_cache::get_or_upload_q4k_canon. Empty if no Q4_K MUL_MAT.
+    std::vector<Q4KSpec>      q4k_specs;
 
     // Reusable HMEM staging buffers for the kernel's `input` (token id)
     // and `output` (logits row) args. Allocated lazily on first execute
@@ -179,6 +202,8 @@ private:
     std::vector<std::pair<const ggml_tensor *, BufferKind>> tensor_slot_order_;
     // Colmajor companion slots created during trace, populated at execute.
     std::vector<ColmajorSpec>           colmajor_specs_;
+    // Q4_K companion slots created during trace, populated at execute.
+    std::vector<Q4KSpec>                q4k_specs_;
 
     bool trace_valid_ = false;
 
