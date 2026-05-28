@@ -329,6 +329,178 @@ float q4k_full_row_dot_xperm_extern(const uint8_t *qs_row, const uint8_t *hdr_ro
     return acc_scalar;
 }
 
+/* 4-ROW tile, pre-decoded header. Processes 4 rows in parallel
+ * sharing one x_perm load per nibble position. Inner-loop x_loads
+ * drop from 16 (×row) to 16 (shared across 4 rows) -- 4× fewer
+ * x-load issues per row. With pre-decoded headers the per-row stack
+ * cost is just dlane[VL]+neg_mlane[VL] = 2 KB/row, so 8 KB/tile --
+ * easily fits in any thread's stack (previously the 16-byte packed
+ * header + scalar setup approach was already 2 KB/row of stack
+ * scratch; this is no worse). */
+void q4k_full_4rows_decoded_extern(const uint8_t * const qs_r[4],
+                                    const uint8_t * const hdr_r[4],
+                                    const float *x_perm,
+                                    const float *sx_full,
+                                    float *y_out[4], int nb);
+
+void q4k_full_4rows_decoded_extern(const uint8_t * const qs_r[4],
+                                    const uint8_t * const hdr_r[4],
+                                    const float *x_perm,
+                                    const float *sx_full,
+                                    float *y_out[4], int nb) {
+    float ay[4] = {0};
+    const int n_lanes_total = nb * 16;
+    int blk_offset = 0;
+    while (blk_offset < nb) {
+        int chunk_nb = nb - blk_offset;
+        if (chunk_nb > MAX_CHUNK_BLOCKS) chunk_nb = MAX_CHUNK_BLOCKS;
+        const int VL = chunk_nb * 16;
+        const int lane_off = blk_offset * 16;
+
+        /* Per-row: build dlane/neg_mlane from pre-decoded fp32 hdr. */
+        float dlane[4][MAX_CHUNK_VL];
+        float neg_mlane[4][MAX_CHUNK_VL];
+        for (int r = 0; r < 4; r++) {
+            const float *hdr_chunk =
+                (const float *)(hdr_r[r] + (size_t) blk_offset * 64);
+            for (int b = 0; b < chunk_nb; b++) {
+                const float *blk_hdr = hdr_chunk + b * 16;
+                for (int s = 0; s < 8; s++) {
+                    const float d  =  blk_hdr[s];
+                    const float nm = -blk_hdr[8 + s];
+                    int lane0 = b * 16 + s * 2;
+                    dlane[r][lane0    ]   = d;
+                    dlane[r][lane0 + 1]   = d;
+                    neg_mlane[r][lane0  ] = nm;
+                    neg_mlane[r][lane0+1] = nm;
+                }
+            }
+        }
+
+        /* Per-row qs load. */
+        __vr qs0_v = _vel_vld_vssl(8, (void *)(qs_r[0] + blk_offset * 128), VL);
+        __vr qs1_v = _vel_vld_vssl(8, (void *)(qs_r[1] + blk_offset * 128), VL);
+        __vr qs2_v = _vel_vld_vssl(8, (void *)(qs_r[2] + blk_offset * 128), VL);
+        __vr qs3_v = _vel_vld_vssl(8, (void *)(qs_r[3] + blk_offset * 128), VL);
+        __vr mask_f = _vel_vbrdl_vsl(0x0FUL, VL);
+
+        /* Per-row sum_nibx accumulator (one shared chain per row -- the
+         * x_perm load is the shared resource). */
+        __vr sum0 = _vel_vbrds_vsl(0.0f, VL);
+        __vr sum1 = _vel_vbrds_vsl(0.0f, VL);
+        __vr sum2 = _vel_vbrds_vsl(0.0f, VL);
+        __vr sum3 = _vel_vbrds_vsl(0.0f, VL);
+
+        for (int k = 0; k < 16; k++) {
+            /* ONE x load shared by 4 rows. */
+            __vr xv = _vel_vldu_vssl(4,
+                (void *)(x_perm + k * n_lanes_total + lane_off), VL);
+
+            __vr nib0 = _vel_vand_vvvl(_vel_vsrl_vvsl(qs0_v, 4 * k, VL), mask_f, VL);
+            __vr nib1 = _vel_vand_vvvl(_vel_vsrl_vvsl(qs1_v, 4 * k, VL), mask_f, VL);
+            __vr nib2 = _vel_vand_vvvl(_vel_vsrl_vvsl(qs2_v, 4 * k, VL), mask_f, VL);
+            __vr nib3 = _vel_vand_vvvl(_vel_vsrl_vvsl(qs3_v, 4 * k, VL), mask_f, VL);
+            __vr nf0  = _vel_vcvtsw_vvl(nib0, VL);
+            __vr nf1  = _vel_vcvtsw_vvl(nib1, VL);
+            __vr nf2  = _vel_vcvtsw_vvl(nib2, VL);
+            __vr nf3  = _vel_vcvtsw_vvl(nib3, VL);
+            sum0 = _vel_vfmads_vvvvl(sum0, nf0, xv, VL);
+            sum1 = _vel_vfmads_vvvvl(sum1, nf1, xv, VL);
+            sum2 = _vel_vfmads_vvvvl(sum2, nf2, xv, VL);
+            sum3 = _vel_vfmads_vvvvl(sum3, nf3, xv, VL);
+        }
+
+        __vr sx_lane_v = _vel_vldu_vssl(4, (void *)(sx_full + lane_off), VL);
+        for (int r = 0; r < 4; r++) {
+            __vr dlane_v   = _vel_vldu_vssl(4, (void *) dlane[r], VL);
+            __vr nmlane_v  = _vel_vldu_vssl(4, (void *) neg_mlane[r], VL);
+            __vr s = (r == 0) ? sum0 : (r == 1) ? sum1 : (r == 2) ? sum2 : sum3;
+            __vr y_lane = _vel_vfmads_vvvvl(
+                _vel_vfmuls_vvvl(nmlane_v, sx_lane_v, VL), dlane_v, s, VL);
+            y_lane = _vel_vfsums_vvl(y_lane, VL);
+            ay[r] += _vel_lvss_svs(y_lane, 0);
+        }
+        blk_offset += chunk_nb;
+    }
+    *y_out[0] = ay[0]; *y_out[1] = ay[1]; *y_out[2] = ay[2]; *y_out[3] = ay[3];
+}
+
+/* 8-ROW tile, pre-decoded header. 8 rows share one x_perm load per
+ * nibble position -- 8× fewer x-loads per row vs single-row. Per-tile
+ * stack: 8 × (dlane + neg_mlane) = 8 × 2 KB = 16 KB. Safely fits in any
+ * thread's stack. */
+void q4k_full_8rows_decoded_extern(const uint8_t * const qs_r[8],
+                                    const uint8_t * const hdr_r[8],
+                                    const float *x_perm,
+                                    const float *sx_full,
+                                    float *y_out[8], int nb);
+
+void q4k_full_8rows_decoded_extern(const uint8_t * const qs_r[8],
+                                    const uint8_t * const hdr_r[8],
+                                    const float *x_perm,
+                                    const float *sx_full,
+                                    float *y_out[8], int nb) {
+    float ay[8] = {0};
+    const int n_lanes_total = nb * 16;
+    int blk_offset = 0;
+    while (blk_offset < nb) {
+        int chunk_nb = nb - blk_offset;
+        if (chunk_nb > MAX_CHUNK_BLOCKS) chunk_nb = MAX_CHUNK_BLOCKS;
+        const int VL = chunk_nb * 16;
+        const int lane_off = blk_offset * 16;
+
+        float dlane[8][MAX_CHUNK_VL];
+        float neg_mlane[8][MAX_CHUNK_VL];
+        for (int r = 0; r < 8; r++) {
+            const float *hdr_chunk =
+                (const float *)(hdr_r[r] + (size_t) blk_offset * 64);
+            for (int b = 0; b < chunk_nb; b++) {
+                const float *blk_hdr = hdr_chunk + b * 16;
+                for (int s = 0; s < 8; s++) {
+                    const float d  =  blk_hdr[s];
+                    const float nm = -blk_hdr[8 + s];
+                    int lane0 = b * 16 + s * 2;
+                    dlane[r][lane0    ]   = d;
+                    dlane[r][lane0 + 1]   = d;
+                    neg_mlane[r][lane0  ] = nm;
+                    neg_mlane[r][lane0+1] = nm;
+                }
+            }
+        }
+
+        __vr qs_v[8];
+        for (int r = 0; r < 8; r++)
+            qs_v[r] = _vel_vld_vssl(8, (void *)(qs_r[r] + blk_offset * 128), VL);
+        __vr mask_f = _vel_vbrdl_vsl(0x0FUL, VL);
+
+        __vr sum[8];
+        for (int r = 0; r < 8; r++) sum[r] = _vel_vbrds_vsl(0.0f, VL);
+
+        for (int k = 0; k < 16; k++) {
+            __vr xv = _vel_vldu_vssl(4,
+                (void *)(x_perm + k * n_lanes_total + lane_off), VL);
+            for (int r = 0; r < 8; r++) {
+                __vr nib = _vel_vand_vvvl(_vel_vsrl_vvsl(qs_v[r], 4 * k, VL),
+                                          mask_f, VL);
+                __vr nf  = _vel_vcvtsw_vvl(nib, VL);
+                sum[r] = _vel_vfmads_vvvvl(sum[r], nf, xv, VL);
+            }
+        }
+
+        __vr sx_lane_v = _vel_vldu_vssl(4, (void *)(sx_full + lane_off), VL);
+        for (int r = 0; r < 8; r++) {
+            __vr dlane_v  = _vel_vldu_vssl(4, (void *) dlane[r], VL);
+            __vr nmlane_v = _vel_vldu_vssl(4, (void *) neg_mlane[r], VL);
+            __vr y_lane = _vel_vfmads_vvvvl(
+                _vel_vfmuls_vvvl(nmlane_v, sx_lane_v, VL), dlane_v, sum[r], VL);
+            y_lane = _vel_vfsums_vvl(y_lane, VL);
+            ay[r] += _vel_lvss_svs(y_lane, 0);
+        }
+        blk_offset += chunk_nb;
+    }
+    for (int r = 0; r < 8; r++) *y_out[r] = ay[r];
+}
+
 /* PACKED-FP32 variant. Processes 2 nibble positions per FMA via VE's
  * packed-fp32 ops (pvfmad). Halves the inner-loop count from 16 to 8.
  *

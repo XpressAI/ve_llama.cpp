@@ -29,6 +29,16 @@ extern void  q4k_build_sx_full_extern(const float *x, float *sx_full, int K);
 extern float q4k_full_row_dot_tile_extern(const uint8_t *qs_row,
                                            const uint8_t *hdr_row,
                                            const float *x, int nb);
+extern void  q4k_full_4rows_decoded_extern(const uint8_t * const qs_r[4],
+                                            const uint8_t * const hdr_r[4],
+                                            const float *x_perm,
+                                            const float *sx_full,
+                                            float *y_out[4], int nb);
+extern void  q4k_full_8rows_decoded_extern(const uint8_t * const qs_r[8],
+                                            const uint8_t * const hdr_r[8],
+                                            const float *x_perm,
+                                            const float *sx_full,
+                                            float *y_out[8], int nb);
 extern void  q4k_full_4rows_xperm_extern(const uint8_t *qs_r0, const uint8_t *qs_r1,
                                            const uint8_t *qs_r2, const uint8_t *qs_r3,
                                            const uint8_t *hdr_r0, const uint8_t *hdr_r1,
@@ -97,8 +107,30 @@ uint64_t ve_q4k_matvec_full_hbm(uint64_t y_vptr, uint64_t qs_vptr,
                                                  x, nb);
         }
     } else {
+        /* 8-row tile dispatch: shares one x_perm load per nibble position
+         * across 8 row FMAs. Each x_perm load is a 256-element vldu --
+         * sharing it cuts x-load count by 8× in the inner loop. */
+        const uint64_t M8 = M & ~(uint64_t) 7;
         #pragma omp parallel for num_threads(nthr)
-        for (uint64_t m = 0; m < M; m++) {
+        for (uint64_t m = 0; m < M8; m += 8) {
+            const uint8_t *qs_r[8] = {
+                qs + (m+0) * row_qs_bytes, qs + (m+1) * row_qs_bytes,
+                qs + (m+2) * row_qs_bytes, qs + (m+3) * row_qs_bytes,
+                qs + (m+4) * row_qs_bytes, qs + (m+5) * row_qs_bytes,
+                qs + (m+6) * row_qs_bytes, qs + (m+7) * row_qs_bytes };
+            const uint8_t *hdr_r[8] = {
+                hdr + (m+0) * row_hdr_bytes, hdr + (m+1) * row_hdr_bytes,
+                hdr + (m+2) * row_hdr_bytes, hdr + (m+3) * row_hdr_bytes,
+                hdr + (m+4) * row_hdr_bytes, hdr + (m+5) * row_hdr_bytes,
+                hdr + (m+6) * row_hdr_bytes, hdr + (m+7) * row_hdr_bytes };
+            float *y_out[8] = {
+                &y[m+0], &y[m+1], &y[m+2], &y[m+3],
+                &y[m+4], &y[m+5], &y[m+6], &y[m+7] };
+            q4k_full_8rows_decoded_extern(qs_r, hdr_r, x_perm, sx_full, y_out, nb);
+        }
+        /* Tail: M%8 leftover rows go through the per-row variant. */
+        #pragma omp parallel for num_threads(nthr)
+        for (uint64_t m = M8; m < M; m++) {
             y[m] = q4k_full_row_dot_xperm_extern(qs  + m * row_qs_bytes,
                                                   hdr + m * row_hdr_bytes,
                                                   x_perm, sx_full, nb);
