@@ -15,6 +15,37 @@
 
 namespace ggml_ve {
 
+// ---- Q4_K header decode helpers (used by get_or_upload_q4k_canon) ----
+//
+// q4k_h2f       : fp16 → fp32 (manual, no compiler builtin dependency)
+// q4k_unpack_sm : extract the 6-bit (scale, min) pair for sub-block idx (0..7)
+//                 from the 12-byte scales array; same packing rule as
+//                 ggml's CPU Q4_K decode.
+static inline float q4k_h2f(uint16_t h) {
+    uint32_t s = (h >> 15) & 1u;
+    uint32_t e = (h >> 10) & 0x1Fu;
+    uint32_t m = h & 0x3FFu;
+    uint32_t u;
+    if (e == 0) {
+        if (m == 0) u = s << 31;
+        else { while (!(m & 0x400u)) { m <<= 1; e--; } m &= 0x3FFu; e++;
+               u = (s << 31) | ((e + 112u) << 23) | (m << 13); }
+    } else if (e == 31) u = (s << 31) | 0x7F800000u | (m << 13);
+    else u = (s << 31) | ((e + 112u) << 23) | (m << 13);
+    float f; std::memcpy(&f, &u, 4); return f;
+}
+
+static inline void q4k_unpack_sm(int idx, const uint8_t * sc12,
+                                  uint8_t * scale, uint8_t * mn) {
+    if (idx < 4) {
+        *scale = sc12[idx]     & 0x3F;
+        *mn    = sc12[idx + 4] & 0x3F;
+    } else {
+        *scale = (sc12[idx + 4] & 0x0F) | ((sc12[idx - 4] >> 6) << 4);
+        *mn    = (sc12[idx + 4] >>   4) | ((sc12[idx]     >> 6) << 4);
+    }
+}
+
 struct hbm_cache_entry {
     VEDAdeviceptr        vptr      = 0;
     size_t               size      = 0;
@@ -70,15 +101,24 @@ public:
         return v;
     }
 
-    // Q4_K canonical-split upload. Given a tensor of standard-layout Q4_K
-    // blocks (144 B / 256 elem, M rows × nb blocks/row), produce two HBM
-    // regions:
-    //   qs_vptr  : M × nb × 128 bytes  -- nibble bytes in canonical order
-    //              (byte k = (element 2k+1) << 4 | element 2k)
-    //   hdr_vptr : M × nb × 16 bytes   -- d, dmin, scales (verbatim copy)
-    // Same total bytes as standard Q4_K (no expansion). Keyed by name+suffix
-    // so each is cacheable across MUL_MAT calls touching the same weight.
-    // Returns true if both uploads succeed; sets out params.
+    // Q4_K canonical-split upload WITH PRE-DECODED HEADERS.
+    //
+    // Pre-decoding moves the per-block scale work (h2f conversion of d/dmin,
+    // 6-bit unpack of 8 sub-block scales/mins, fp32 multiplication for d_sub
+    // and m_sub) from per-MUL_MAT VE-side scalar code to a ONE-TIME CPU pass
+    // at upload. Per VE_PROGINF on Q4_K_FULL at 14336x4096: the prior packed
+    // header forced ~1ms of SPU scalar work per matvec call (h2f + q4k_sm +
+    // dlane/mlane build) -- pre-decoded headers eliminate all of it. The VE
+    // kernel just vector-loads d_sub[8] and m_sub[8] directly.
+    //
+    // Layout:
+    //   qs_vptr  : M × nb × 128 bytes  (canonical nibbles, unchanged)
+    //   hdr_vptr : M × nb × 64 bytes   (8 fp32 d_sub + 8 fp32 m_sub per block)
+    //
+    // 64-byte decoded header vs the original 16-byte packed header: +48 bytes
+    // per block = ~4× header expansion. For Qwen3.6-27B Q4_K_M (110M blocks):
+    // +5.3 GB total cache, taking weights from 16 GB to ~21 GB (still fits
+    // in the 48 GB HBM with KV cache + activations).
     bool get_or_upload_q4k_canon(const char * tensor_name,
                                   const void * src_blocks,
                                   uint64_t M, uint64_t K,
@@ -86,11 +126,11 @@ public:
                                   VEDAdeviceptr * hdr_vptr) {
         const int    nb        = (int) K / 256;
         const size_t qs_total  = (size_t) M * nb * 128;
-        const size_t hdr_total = (size_t) M * nb * 16;
+        const size_t hdr_total = (size_t) M * nb * 64;  // PRE-DECODED 64-byte hdr
 
         // Lookup by name+suffix.
         std::string qs_key  = std::string(tensor_name ? tensor_name : "?") + "/q4k_qs";
-        std::string hdr_key = std::string(tensor_name ? tensor_name : "?") + "/q4k_hdr";
+        std::string hdr_key = std::string(tensor_name ? tensor_name : "?") + "/q4k_dhdr64";
         VEDAdeviceptr qs_v = 0, hdr_v = 0;
         for (auto & e : entries_) {
             if (e.name == qs_key  && e.size == qs_total)  qs_v  = e.vptr;
@@ -115,9 +155,23 @@ public:
             for (int b = 0; b < nb; b++) {
                 const uint8_t * blk = S + (m * nb + b) * 144;
                 uint8_t * qd  = qs_host  + (m * nb + b) * 128;
-                uint8_t * hd  = hdr_host + (m * nb + b) * 16;
-                std::memcpy(hd, blk, 16);
-                // Reconstruct element[256] from standard layout, repack canonical.
+                float   * hd  = (float *)(hdr_host + (m * nb + b) * 64);
+
+                // ---- Decode header into 8 fp32 d_sub + 8 fp32 m_sub ----
+                uint16_t d_raw, dmin_raw;
+                std::memcpy(&d_raw,    blk + 0, 2);
+                std::memcpy(&dmin_raw, blk + 2, 2);
+                const float d_super    = q4k_h2f(d_raw);
+                const float dmin_super = q4k_h2f(dmin_raw);
+                const uint8_t * sc12 = blk + 4;
+                for (int s = 0; s < 8; s++) {
+                    uint8_t sc, mn;
+                    q4k_unpack_sm(s, sc12, &sc, &mn);
+                    hd[s    ] = d_super    * (float) sc;   // d_sub[s]
+                    hd[8 + s] = dmin_super * (float) mn;   // m_sub[s]
+                }
+
+                // ---- Canonical-pack qs (byte k = elem[2k+1]<<4 | elem[2k]) ----
                 uint8_t elem[256];
                 const uint8_t * src_qs = blk + 16;
                 for (int p = 0; p < 4; p++) {

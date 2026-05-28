@@ -58,7 +58,7 @@ uint64_t ve_q4k_matvec_full_hbm(uint64_t y_vptr, uint64_t qs_vptr,
 
     const int nb = (int) K / 256;
     const int row_qs_bytes  = nb * 128;
-    const int row_hdr_bytes = nb * 16;
+    const int row_hdr_bytes = nb * 64;  /* pre-decoded: 8 fp32 d_sub + 8 fp32 m_sub per block */
     int nthr = omp_get_max_threads();
     if (nthr > 8) nthr = 8;
 

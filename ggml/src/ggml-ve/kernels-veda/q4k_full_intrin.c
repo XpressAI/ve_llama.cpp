@@ -256,29 +256,28 @@ float q4k_full_row_dot_xperm_extern(const uint8_t *qs_row, const uint8_t *hdr_ro
         const int VL = chunk_nb * 16;
 
         const uint8_t *qs_chunk  = qs_row  + (size_t) blk_offset * 128;
-        const uint8_t *hdr_chunk = hdr_row + (size_t) blk_offset * 16;
+        /* Pre-decoded header layout: 64 bytes/block = 8 fp32 d_sub + 8 fp32 m_sub.
+         * Decoded at upload by hbm_cache::get_or_upload_q4k_canon, so no per-row
+         * SPU work needed (h2f, q4k_sm, dlane build all GONE). */
+        const float   *hdr_chunk = (const float *)(hdr_row + (size_t) blk_offset * 64);
         const int      lane_off  = blk_offset * 16;
 
+        /* Build dlane[VL]/neg_mlane[VL] from the pre-decoded 8-fp32 vectors.
+         * Each lane i covers 16 elements = half a sub-block. Sub-block index
+         * for lane i is i/2 (within the chunk). The pre-decoded array has
+         * d_sub at slot s and m_sub at slot 8+s per block. */
         float dlane[MAX_CHUNK_VL];
-        float neg_mlane[MAX_CHUNK_VL]; /* pre-negated so we can fuse via vfmads */
+        float neg_mlane[MAX_CHUNK_VL];
         for (int b = 0; b < chunk_nb; b++) {
-            const uint8_t *hdr = hdr_chunk + (size_t) b * 16;
-            uint16_t d_raw, dmin_raw;
-            memcpy(&d_raw,    hdr,     2);
-            memcpy(&dmin_raw, hdr + 2, 2);
-            const float d_super    = h2f(d_raw);
-            const float dmin_super = h2f(dmin_raw);
-            const uint8_t *sc12 = hdr + 4;
+            const float *blk_hdr = hdr_chunk + b * 16;  /* 8 d + 8 m = 16 floats */
             for (int s = 0; s < 8; s++) {
-                uint8_t sc, mn;
-                q4k_sm(s, sc12, &sc, &mn);
-                const float d = d_super    * (float) sc;
-                const float m = dmin_super * (float) mn;
+                const float d = blk_hdr[s];
+                const float nm = -blk_hdr[8 + s];
                 int lane0 = b * 16 + s * 2;
                 dlane[lane0    ] = d;
                 dlane[lane0 + 1] = d;
-                neg_mlane[lane0    ] = -m;
-                neg_mlane[lane0 + 1] = -m;
+                neg_mlane[lane0    ] = nm;
+                neg_mlane[lane0 + 1] = nm;
             }
         }
 
