@@ -108,13 +108,31 @@ uint64_t ve_q4k_matvec_std_hdr_hbm(uint64_t y_vptr, uint64_t W_vptr,
         if (g_xlo_perm == NULL || g_xhi_perm == NULL) return 5;
     }
 
-    q4k_std_build_x_perm_extern(x, g_xlo_perm, g_xhi_perm, (int) K);
+    /* Variant selection. DEFAULT = chunked + packed (VL=256 pvfmad), the
+     * fastest variant measured (27B Q4_K_M: 0.63 tg vs 0.30 single-row).
+     * Env overrides force alternates, all for A/B testing / debugging:
+     *   GGML_VE_Q4K_STD_PLAIN=1   -> single-row VL=32 (old default)
+     *   GGML_VE_Q4K_STD_TILE=1    -> 8-row tile (register-pressure bound)
+     *   GGML_VE_Q4K_STD_NOPACK=1  -> chunked, unpacked (scratch pack)
+     *   GGML_VE_Q4K_STD_GATHER=1  -> chunked, unpacked, vgtlzx gather
+     * (GGML_VE_Q4K_STD_CHUNK / _PACKED are accepted as explicit opt-ins
+     *  but are now the default, so they're no-ops unless an override
+     *  below disables them.) */
+    const int force_plain  = (getenv("GGML_VE_Q4K_STD_PLAIN")  != NULL);
+    const int force_tile   = (getenv("GGML_VE_Q4K_STD_TILE")   != NULL);
+    const int force_nopack = (getenv("GGML_VE_Q4K_STD_NOPACK") != NULL);
+    const int force_gather = (getenv("GGML_VE_Q4K_STD_GATHER") != NULL);
 
-    /* GGML_VE_Q4K_STD_TILE=1 to try the 8-row tile (slower at the moment
-     * due to register pressure -- left in for future tuning). */
-    const int use_tile = (getenv("GGML_VE_Q4K_STD_TILE") != NULL);
-    /* GGML_VE_Q4K_STD_CHUNK=1 to use cross-block chunking (VL up to 256). */
-    const int use_chunk = (getenv("GGML_VE_Q4K_STD_CHUNK") != NULL);
+    const int use_tile  = force_tile;
+    const int use_chunk = !force_plain && !force_tile;
+    /* Packed is the default within chunked unless an unpacked override
+     * (NOPACK or GATHER) is requested. */
+    const int use_packed = use_chunk && !force_nopack && !force_gather;
+
+    /* Only build the perm layout the chosen path needs. */
+    if (!use_packed) {
+        q4k_std_build_x_perm_extern(x, g_xlo_perm, g_xhi_perm, (int) K);
+    }
 
     if (use_chunk) {
         /* Grow per-thread qs scratch. nb*128 bytes per thread. */
@@ -132,8 +150,6 @@ uint64_t ve_q4k_matvec_std_hdr_hbm(uint64_t y_vptr, uint64_t W_vptr,
         }
 
         const size_t hdr_row_floats = (size_t) nb * 16;  /* 16 fp32 per block */
-        const int use_gather = (getenv("GGML_VE_Q4K_STD_GATHER") != NULL);
-        const int use_packed = (getenv("GGML_VE_Q4K_STD_PACKED") != NULL);
 
         if (use_packed) {
             /* Build packed x_perm (low|high<<32 per element). Same total
@@ -160,7 +176,7 @@ uint64_t ve_q4k_matvec_std_hdr_hbm(uint64_t y_vptr, uint64_t W_vptr,
                 y[m] = q4k_std_row_dot_chunked_packed_hdr_extern(blk_row, hdr_row,
                     g_xpk_perm, nb);
             }
-        } else if (use_gather) {
+        } else if (force_gather) {
             #pragma omp parallel for num_threads(nthr)
             for (uint64_t m = 0; m < M; m++) {
                 const uint8_t *blk_row = W + m * row_bytes;
