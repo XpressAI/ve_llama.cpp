@@ -425,6 +425,91 @@ void q4k_full_4rows_decoded_extern(const uint8_t * const qs_r[4],
     *y_out[0] = ay[0]; *y_out[1] = ay[1]; *y_out[2] = ay[2]; *y_out[3] = ay[3];
 }
 
+/* TILE-BATCHED matmul: dequant one row tile (8 rows × K elements)
+ * to F32 in an LLC-resident stack buffer, then do N matvecs against
+ * that cached tile. Amortizes the dequant cost across N x-columns,
+ * which is the win prompt-eval (N=5..512) wants over sequential
+ * matvecs.
+ *
+ * Per tile of 8 rows × K elements:
+ *   - F32 dequant buffer: 8 * K * 4 bytes (32 KB at K=4096, fits in
+ *     2 MB per-core LLC easily)
+ *   - For each x column n in 0..N-1: y[r+8, n] = W_tile @ x[:, n]
+ *
+ * Caller (dispatcher) iterates row tiles + tail; this function
+ * processes ONE 8-row tile across all N columns. */
+void q4k_full_8rows_xN_extern(const uint8_t * const qs_r[8],
+                               const uint8_t * const hdr_r[8],
+                               const float *x,         /* K × N, column-major x[k + n*K] */
+                               float *y[8],            /* per-row dst stride M between cols */
+                               float *W_tile_buf,      /* caller-provided 8*K f32 scratch */
+                               int N, int M_stride, int nb);
+
+void q4k_full_8rows_xN_extern(const uint8_t * const qs_r[8],
+                               const uint8_t * const hdr_r[8],
+                               const float *x,
+                               float *y[8],
+                               float *W_tile_buf,
+                               int N, int M_stride, int nb) {
+    const int K_total = nb * 256;
+    float (*W_tile)[K_total] = (float (*)[K_total]) W_tile_buf;
+
+    /* Per row dequant: walk blocks, decode scales (already pre-decoded
+     * in hdr) and produce F32 elements in canonical row order. */
+    for (int r = 0; r < 8; r++) {
+        for (int b = 0; b < nb; b++) {
+            const float *blk_hdr = (const float *)(hdr_r[r] + (size_t) b * 64);
+            const uint8_t *qs    = qs_r[r] + (size_t) b * 128;
+            float *out           = W_tile[r] + b * 256;
+
+            /* Per-lane dlane/neg_mlane from pre-decoded hdr. */
+            float dlane[16], neg_mlane[16];
+            for (int s = 0; s < 8; s++) {
+                dlane[s*2]       = blk_hdr[s];
+                dlane[s*2 + 1]   = blk_hdr[s];
+                neg_mlane[s*2]     = -blk_hdr[8 + s];
+                neg_mlane[s*2 + 1] = -blk_hdr[8 + s];
+            }
+
+            __vr qs_v        = _vel_vld_vssl(8, (void *)qs, 16);
+            __vr mask_f      = _vel_vbrdl_vsl(0x0FUL, 16);
+            __vr dlane_v     = _vel_vldu_vssl(4, (void *) dlane, 16);
+            __vr neg_mlane_v = _vel_vldu_vssl(4, (void *) neg_mlane, 16);
+
+            for (int k = 0; k < 16; k++) {
+                __vr nib   = _vel_vand_vvvl(_vel_vsrl_vvsl(qs_v, 4 * k, 16),
+                                            mask_f, 16);
+                __vr nib_f = _vel_vcvtsw_vvl(nib, 16);
+                __vr w     = _vel_vfmads_vvvvl(neg_mlane_v, dlane_v, nib_f, 16);
+                _vel_vstu_vssl(w, 64, (void *)(out + k), 16);
+            }
+        }
+    }
+
+    /* Per (n, row): F32 dot of W_tile[r] × x[:, n]. */
+    for (int n = 0; n < N; n++) {
+        const float *xn = x + (size_t) n * K_total;
+        for (int r = 0; r < 8; r++) {
+            __vr acc = _vel_vbrds_vsl(0.0f, 256);
+            int kk = 0;
+            while (kk + 256 <= K_total) {
+                __vr wv = _vel_vldu_vssl(4, (void *)(W_tile[r] + kk), 256);
+                __vr xv = _vel_vldu_vssl(4, (void *)(xn          + kk), 256);
+                acc = _vel_vfmads_vvvvl(acc, wv, xv, 256);
+                kk += 256;
+            }
+            if (kk < K_total) {
+                int rem = K_total - kk;
+                __vr wv = _vel_vldu_vssl(4, (void *)(W_tile[r] + kk), rem);
+                __vr xv = _vel_vldu_vssl(4, (void *)(xn          + kk), rem);
+                acc = _vel_vfmads_vvvvl(acc, wv, xv, rem);
+            }
+            acc = _vel_vfsums_vvl(acc, 256);
+            y[r][n * M_stride] = _vel_lvss_svs(acc, 0);
+        }
+    }
+}
+
 /* 8-ROW tile, pre-decoded header. 8 rows share one x_perm load per
  * nibble position -- 8× fewer x-loads per row vs single-row. Per-tile
  * stack: 8 × (dlane + neg_mlane) = 8 × 2 KB = 16 KB. Safely fits in any

@@ -680,14 +680,29 @@ uint64_t ve_q4k_matvec_f32_hbm(VEDAdeviceptr y_vptr,
                 const float * x_lo = xb + j;
                 const float * x_hi = xb + j + 32;
 
+                /* Step 1: unpack nibbles to int32 arrays. NCC can vectorise
+                 * uint32 loads + bit ops, but NOT uint8 (CLAUDE.md). */
+                const uint32_t * qs32 = (const uint32_t *) qs_pair;  /* 8 words */
+                int32_t q_lo[32], q_hi[32];
+#pragma _NEC ivdep
+                for (int i = 0; i < 8; i++) {
+                    uint32_t w = qs32[i];
+                    q_lo[i*4 + 0] = (int32_t)((w >>  0) & 0xF);
+                    q_lo[i*4 + 1] = (int32_t)((w >>  8) & 0xF);
+                    q_lo[i*4 + 2] = (int32_t)((w >> 16) & 0xF);
+                    q_lo[i*4 + 3] = (int32_t)((w >> 24) & 0xF);
+                    q_hi[i*4 + 0] = (int32_t)((w >>  4) & 0xF);
+                    q_hi[i*4 + 1] = (int32_t)((w >> 12) & 0xF);
+                    q_hi[i*4 + 2] = (int32_t)((w >> 20) & 0xF);
+                    q_hi[i*4 + 3] = (int32_t)((w >> 28) & 0xF);
+                }
+                /* Step 2: vectorisable F32 dot (int32→float convert + FMA). */
                 float a_lo = 0.0f;
                 float a_hi = 0.0f;
 #pragma _NEC ivdep
                 for (int l = 0; l < 32; l++) {
-                    int q_l = qs_pair[l] & 0x0F;
-                    int q_h = qs_pair[l] >> 4;
-                    a_lo += (d_lo * (float) q_l - m_lo) * x_lo[l];
-                    a_hi += (d_hi * (float) q_h - m_hi) * x_hi[l];
+                    a_lo += (d_lo * (float) q_lo[l] - m_lo) * x_lo[l];
+                    a_hi += (d_hi * (float) q_hi[l] - m_hi) * x_hi[l];
                 }
                 acc += a_lo + a_hi;
                 is += 2;

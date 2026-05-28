@@ -255,12 +255,20 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
                 name, src_for_cache, (uint64_t) M, (uint64_t) K, &qs_v, &hdr_v)) {
             return false;
         }
-        /* N>1 (batched matmul): loop the matvec, advancing y by M and x by K
-         * each iteration. dst[m,n] is stored at y_hbm + (n*M + m)*4 (ggml's
-         * standard row-major in our convention: ne[0]=M is inner). Each
-         * column's matvec is independent so we queue them all without sync
-         * (VEDA stream serialises, but the kernels themselves run on 8 cores
-         * each via OMP). For N=1 this is just one call -- unchanged. */
+        /* N>1 path: loop the matvec column-by-column. y[m,n] is stored at
+         * y_hbm + (n*M + m)*4 (ggml's column-major). Each column matvec is
+         * independent so we queue them all without sync (VEDA stream
+         * serialises). For N=1 this is just one call.
+         *
+         * KNOWN LIMITATION: enabling GGML_VE_Q4K_N_GT_1 on models that
+         * already saturate HBM (e.g. Qwen3.6-27B) WILL crash with OOM.
+         * When N>1 is accepted, the scheduler places Q4_K weights on
+         * VE_HBM directly (so consumers can read them at HBM bandwidth);
+         * our canonical-split cache then DOUBLES the storage (raw + canon)
+         * because we still need to canon-pack for the optimised kernel.
+         * Fix path: write a direct-dispatch kernel that operates on the
+         * standard Q4_K layout (task #58) so the canon cache can be
+         * deleted entirely. */
         ok = true;
         for (int64_t n = 0; n < N && ok; n++) {
             VEDAargs args = nullptr;
@@ -279,7 +287,7 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
                             "vedaLaunchKernelEx(q4k_matvec_full_hbm)");
             /* Sync each iteration so VEDA's static x_perm staging buffer in
              * the kernel doesn't get clobbered by the next column. */
-            if (ok) vedaCtxSynchronize();
+            if (ok && N > 1) vedaCtxSynchronize();
         }
     } else if (w->type == GGML_TYPE_Q2_K) {
         VEDAfunction fn = ctx->fn(K_Q2K_BF16_MATVEC_HBM);
