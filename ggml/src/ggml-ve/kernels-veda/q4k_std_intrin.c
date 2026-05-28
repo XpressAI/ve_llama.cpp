@@ -319,32 +319,34 @@ float q4k_std_row_dot_chunked_extern(const uint8_t *blk_row,
         _vel_vst_vssl(v, 8, qs_scratch + (size_t) b * 128, 16);
     }
 
-    /* Decode ALL headers into per-row d_sub/m_sub arrays.
-     * 8 d + 8 m per block × nb blocks. Up to nb<=32 in practice. */
-    float d_sub_all[32 * 8];  /* MAX_NB_PER_ROW * 8 sub */
-    float m_sub_all[32 * 8];
-    for (int b = 0; b < nb; b++) {
-        const uint8_t *blk = blk_row + (size_t) b * 144;
-        uint16_t d_raw, dmin_raw;
-        memcpy(&d_raw,    blk + 0, 2);
-        memcpy(&dmin_raw, blk + 2, 2);
-        const float d_super    = h2f(d_raw);
-        const float dmin_super = h2f(dmin_raw);
-        const uint8_t *sc12 = blk + 4;
-        for (int s = 0; s < 8; s++) {
-            uint8_t sc, mn;
-            q4k_sm(s, sc12, &sc, &mn);
-            d_sub_all[b * 8 + s] = d_super    * (float) sc;
-            m_sub_all[b * 8 + s] = dmin_super * (float) mn;
-        }
-    }
-
     float acc = 0.0f;
 
-    /* Chunk loop. */
+    /* Chunk loop: decode headers for the CHUNK and process it. Per-chunk
+     * d/m arrays sized for Q4K_STD_CHUNK blocks max — bounded regardless
+     * of nb, so it handles real-model shapes like Qwen FFN-down K=17408
+     * (nb=68) without overflow. */
     for (int chunk_start = 0; chunk_start < nb; chunk_start += Q4K_STD_CHUNK) {
         int cn = (nb - chunk_start) < Q4K_STD_CHUNK ? (nb - chunk_start) : Q4K_STD_CHUNK;
         const int VL = cn * 32;
+
+        /* Decode chunk's headers (cn blocks * 8 sub-blocks). */
+        float d_sub_chunk[Q4K_STD_CHUNK * 8];
+        float m_sub_chunk[Q4K_STD_CHUNK * 8];
+        for (int cb = 0; cb < cn; cb++) {
+            const uint8_t *blk = blk_row + (size_t)(chunk_start + cb) * 144;
+            uint16_t d_raw, dmin_raw;
+            memcpy(&d_raw,    blk + 0, 2);
+            memcpy(&dmin_raw, blk + 2, 2);
+            const float d_super    = h2f(d_raw);
+            const float dmin_super = h2f(dmin_raw);
+            const uint8_t *sc12 = blk + 4;
+            for (int s = 0; s < 8; s++) {
+                uint8_t sc, mn;
+                q4k_sm(s, sc12, &sc, &mn);
+                d_sub_chunk[cb * 8 + s] = d_super    * (float) sc;
+                m_sub_chunk[cb * 8 + s] = dmin_super * (float) mn;
+            }
+        }
 
         /* Load qs chunk: cn*32 u32 lanes from packed scratch (stride=4). */
         __vr qs_chunk = _vel_vldlzx_vssl(4,
@@ -353,12 +355,11 @@ float q4k_std_row_dot_chunked_extern(const uint8_t *blk_row,
 
         /* Build dlane/mlane for low + high at VL.
          * Lane i in 0..VL-1: block_in_chunk = i/32, quarter q = (i%32)/8.
-         *   dlane_lo[i] = d_sub_all[(chunk_start + i/32)*8 + 2*q]
-         *   etc. */
+         *   dlane_lo[i] = d_sub_chunk[(i/32)*8 + 2*q]   etc. */
         float dlane_lo[256], mlane_lo[256], dlane_hi[256], mlane_hi[256];
         for (int cb = 0; cb < cn; cb++) {
-            const float *d_blk = d_sub_all + (size_t)(chunk_start + cb) * 8;
-            const float *m_blk = m_sub_all + (size_t)(chunk_start + cb) * 8;
+            const float *d_blk = d_sub_chunk + (size_t) cb * 8;
+            const float *m_blk = m_sub_chunk + (size_t) cb * 8;
             for (int q = 0; q < 4; q++) {
                 const float d_l = d_blk[2 * q],     m_l = m_blk[2 * q];
                 const float d_h = d_blk[2 * q + 1], m_h = m_blk[2 * q + 1];
