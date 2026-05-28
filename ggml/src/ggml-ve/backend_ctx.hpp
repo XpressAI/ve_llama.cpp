@@ -192,10 +192,18 @@ public:
             pool_.release(o.hmem);
         }
         // CPU-dst ops (from resolve_out): direct DtoH from temp HBM
-        // into the original host destination. No HMEM intermediate.
-        for (auto & d : deferred_dtoh_) {
-            vedaMemcpyDtoH(d.host_dst, d.temp_hbm, d.size);
-            vedaMemFreeAsync(d.temp_hbm, 0);
+        // into the original host destination. Issue all as async, then
+        // sync once at the end -- much faster than N synchronous DtoHs
+        // when many small intermediates pile up (typical of safe-mode
+        // post-flush).
+        if (!deferred_dtoh_.empty()) {
+            for (auto & d : deferred_dtoh_) {
+                vedaMemcpyDtoHAsync(d.host_dst, d.temp_hbm, d.size, 0);
+            }
+            vedaCtxSynchronize();  // single sync for all queued DtoHs
+            for (auto & d : deferred_dtoh_) {
+                vedaMemFreeAsync(d.temp_hbm, 0);
+            }
         }
         for (auto & h : pending_inputs_) {
             pool_.release(h, nullptr, 0, /*clear_cache=*/true);

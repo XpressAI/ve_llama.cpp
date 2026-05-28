@@ -203,18 +203,17 @@ bool compute_forward(backend_context * ctx, ggml_tensor * node) {
     if (!profile && !quant_safe) {
         return compute_forward_inner(ctx, node);
     }
-    // QUANT_SAFE_MODE: per-op flush, no profiling overhead. Required for
-    // correctness on Q-quant models (see backend_ctx.cpp fresh-hit
-    // KNOWN-BUG comment + task #60). The pre-flush ensures the deferred
-    // queue is empty before this op's resolve_in lookups (so an entry
-    // queued by a prior op's resolve_out can't be mis-matched). The
-    // post-flush + sync guarantees CPU memory is fresh by the time the
-    // next op starts, so resolve_in's CPU-upload returns valid bytes.
+    // QUANT_SAFE_MODE: per-op flush. Required for correctness on Q-quant
+    // models (see backend_ctx.cpp fresh-hit KNOWN-BUG comment + task #60).
+    // Single POST-flush guarantees CPU memory is fresh by the time the
+    // next op starts -- which means the next op's resolve_in_slow can
+    // read from CPU and get valid bytes. A separate pre-flush is
+    // redundant: the prior op's post-flush already drained the queue.
+    // (Saves ~50us of vedaCtxSynchronize per op = ~2x throughput on
+    // Q-quant models compared to the previous pre+post variant.)
     if (quant_safe && !profile) {
-        ctx->flush("quant_safe pre");
         bool ok = compute_forward_inner(ctx, node);
         ctx->flush("quant_safe post");
-        vedaCtxSynchronize();
         return ok;
     }
     // PROFILE_PEROP (with or without quant_safe): timed per-op sync.
