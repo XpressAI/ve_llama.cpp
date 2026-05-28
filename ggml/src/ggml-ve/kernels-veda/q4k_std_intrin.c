@@ -307,11 +307,46 @@ float q4k_std_row_dot_chunked_extern(const uint8_t *blk_row,
 
 #define Q4K_STD_CHUNK 8                       /* 8 blocks per chunk => VL=256 */
 
+/* Same kernel with OPTIONAL pre-decoded header source.
+ *   hdr_decoded != NULL : skip per-block scalar decode, read 16 fp32 per
+ *                          block from hdr_decoded (8 d_sub + 8 m_sub).
+ *                          hdr_decoded layout: row r, block b at
+ *                          hdr_decoded + (r*nb + b) * 64 -- BUT this
+ *                          inner func takes the ROW POINTER so caller
+ *                          passes hdr_decoded + r*nb*64. Then per block:
+ *                          16 floats at offset b*64.
+ *   hdr_decoded == NULL : decode on the fly (same as the
+ *                          q4k_std_row_dot_chunked_extern shim below). */
+float q4k_std_row_dot_chunked_hdr_extern(const uint8_t *blk_row,
+                                          const float *hdr_decoded_row,
+                                          const float *x_low_perm,
+                                          const float *x_high_perm,
+                                          uint8_t *qs_scratch,
+                                          int nb);
+
+float q4k_std_row_dot_chunked_hdr_extern(const uint8_t *blk_row,
+                                          const float *hdr_decoded_row,
+                                          const float *x_low_perm,
+                                          const float *x_high_perm,
+                                          uint8_t *qs_scratch,
+                                          int nb);
+
 float q4k_std_row_dot_chunked_extern(const uint8_t *blk_row,
                                       const float *x_low_perm,
                                       const float *x_high_perm,
                                       uint8_t *qs_scratch,
                                       int nb) {
+    return q4k_std_row_dot_chunked_hdr_extern(blk_row, /*hdr_decoded=*/NULL,
+                                              x_low_perm, x_high_perm,
+                                              qs_scratch, nb);
+}
+
+float q4k_std_row_dot_chunked_hdr_extern(const uint8_t *blk_row,
+                                          const float *hdr_decoded_row,
+                                          const float *x_low_perm,
+                                          const float *x_high_perm,
+                                          uint8_t *qs_scratch,
+                                          int nb) {
     /* Pack qs into scratch via 16-lane u64 vector copy (1 vld + 1 vst per
      * block, ~2 cycles). Total: nb such copies. */
     for (int b = 0; b < nb; b++) {
@@ -329,22 +364,35 @@ float q4k_std_row_dot_chunked_extern(const uint8_t *blk_row,
         int cn = (nb - chunk_start) < Q4K_STD_CHUNK ? (nb - chunk_start) : Q4K_STD_CHUNK;
         const int VL = cn * 32;
 
-        /* Decode chunk's headers (cn blocks * 8 sub-blocks). */
+        /* Chunk's 8 d_sub + 8 m_sub per block: either load pre-decoded from
+         * cache or fall back to per-block scalar decode. */
         float d_sub_chunk[Q4K_STD_CHUNK * 8];
         float m_sub_chunk[Q4K_STD_CHUNK * 8];
-        for (int cb = 0; cb < cn; cb++) {
-            const uint8_t *blk = blk_row + (size_t)(chunk_start + cb) * 144;
-            uint16_t d_raw, dmin_raw;
-            memcpy(&d_raw,    blk + 0, 2);
-            memcpy(&dmin_raw, blk + 2, 2);
-            const float d_super    = h2f(d_raw);
-            const float dmin_super = h2f(dmin_raw);
-            const uint8_t *sc12 = blk + 4;
-            for (int s = 0; s < 8; s++) {
-                uint8_t sc, mn;
-                q4k_sm(s, sc12, &sc, &mn);
-                d_sub_chunk[cb * 8 + s] = d_super    * (float) sc;
-                m_sub_chunk[cb * 8 + s] = dmin_super * (float) mn;
+        if (hdr_decoded_row != NULL) {
+            /* hdr layout: per block 16 fp32 = [d0..d7, m0..m7]. */
+            const float *hdr_chunk = hdr_decoded_row + (size_t) chunk_start * 16;
+            for (int cb = 0; cb < cn; cb++) {
+                const float *blk_hdr = hdr_chunk + (size_t) cb * 16;
+                for (int s = 0; s < 8; s++) {
+                    d_sub_chunk[cb * 8 + s] = blk_hdr[s    ];
+                    m_sub_chunk[cb * 8 + s] = blk_hdr[8 + s];
+                }
+            }
+        } else {
+            for (int cb = 0; cb < cn; cb++) {
+                const uint8_t *blk = blk_row + (size_t)(chunk_start + cb) * 144;
+                uint16_t d_raw, dmin_raw;
+                memcpy(&d_raw,    blk + 0, 2);
+                memcpy(&dmin_raw, blk + 2, 2);
+                const float d_super    = h2f(d_raw);
+                const float dmin_super = h2f(dmin_raw);
+                const uint8_t *sc12 = blk + 4;
+                for (int s = 0; s < 8; s++) {
+                    uint8_t sc, mn;
+                    q4k_sm(s, sc12, &sc, &mn);
+                    d_sub_chunk[cb * 8 + s] = d_super    * (float) sc;
+                    m_sub_chunk[cb * 8 + s] = dmin_super * (float) mn;
+                }
             }
         }
 

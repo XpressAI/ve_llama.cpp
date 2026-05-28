@@ -206,6 +206,60 @@ public:
         return true;
     }
 
+    // ---- Decoded-header ONLY upload (for direct-dispatch Q4_K kernel) ----
+    //
+    // Same per-block decoded header layout as get_or_upload_q4k_canon (8 fp32
+    // d_sub + 8 fp32 m_sub = 64 B/blk) but with NO canon-qs side table. The
+    // direct kernel reads qs from raw HBM weights and only needs the decoded
+    // scales here. Costs +5.3 GB on 27B Q4_K_M (vs +21 GB for full canon).
+    bool get_or_upload_q4k_hdr_decoded(const char * tensor_name,
+                                        const void * src_blocks,
+                                        uint64_t M, uint64_t K,
+                                        VEDAdeviceptr * hdr_vptr) {
+        const int    nb        = (int) K / 256;
+        const size_t hdr_total = (size_t) M * nb * 64;  // 8 d_sub + 8 m_sub fp32
+
+        std::string hdr_key = std::string(tensor_name ? tensor_name : "?") + "/q4k_dhdr64_std";
+        for (auto & e : entries_) {
+            if (e.name == hdr_key && e.size == hdr_total) {
+                ++hits_;
+                *hdr_vptr = e.vptr;
+                return true;
+            }
+        }
+
+        uint8_t * hdr_host = (uint8_t *) std::aligned_alloc(64, hdr_total);
+        if (!hdr_host) return false;
+
+        const uint8_t * S = (const uint8_t *) src_blocks;
+        for (uint64_t m = 0; m < M; m++) {
+            for (int b = 0; b < nb; b++) {
+                const uint8_t * blk = S + (m * nb + b) * 144;
+                float         * hd  = (float *)(hdr_host + (m * nb + b) * 64);
+                uint16_t d_raw, dmin_raw;
+                std::memcpy(&d_raw,    blk + 0, 2);
+                std::memcpy(&dmin_raw, blk + 2, 2);
+                const float d_super    = q4k_h2f(d_raw);
+                const float dmin_super = q4k_h2f(dmin_raw);
+                const uint8_t * sc12 = blk + 4;
+                for (int s = 0; s < 8; s++) {
+                    uint8_t sc, mn;
+                    q4k_unpack_sm(s, sc12, &sc, &mn);
+                    hd[s    ] = d_super    * (float) sc;
+                    hd[8 + s] = dmin_super * (float) mn;
+                }
+            }
+        }
+
+        VEDAdeviceptr hdr_v = upload(hdr_host, hdr_total);
+        if (hdr_v) record(hdr_v, hdr_total, src_blocks, hdr_key.c_str(),
+                          GGML_VE_HBM_Q4K_CANON_HDR);
+        std::free(hdr_host);
+        if (!hdr_v) return false;
+        *hdr_vptr = hdr_v;
+        return true;
+    }
+
     void clear() {
         for (auto & e : entries_) {
             if (e.vptr) vedaMemFreeAsync(e.vptr, 0);

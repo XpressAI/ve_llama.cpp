@@ -14,6 +14,7 @@
 
 #include "ggml.h"
 
+#include <atomic>
 #include <memory>
 
 namespace ggml_ve {
@@ -220,10 +221,86 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
          * but it's the only way 27B Q4_K_M fits on a single 48 GB VE when
          * we also need raw weights on VE_HBM. */
         if (std::getenv("GGML_VE_Q4K_DIRECT") != nullptr) {
-            VEDAfunction fn_std = ctx->fn(K_Q4K_MATVEC_STD_HBM);
-            if (fn_std == 0) return false;
             const VEDAdeviceptr w_raw_hbm = ctx->resolve_in(w);
             if (w_raw_hbm == 0) return false;
+
+            /* Try to use pre-decoded header cache (saves per-block scalar
+             * h2f + q4k_sm in the kernel). Costs +5.3 GB HBM for 27B but
+             * fits comfortably. Pickable: GGML_VE_Q4K_DIRECT_HDR=1 (opt-in
+             * for now since the cache build requires bouncing weights
+             * through host on first lookup). */
+            /* Sticky flag: if the hdr cache fails once (likely HBM exhausted),
+             * disable it for the rest of this process. Avoids reentering
+             * VEDA in a degraded state. */
+            static std::atomic<bool> hdr_cache_disabled{false};
+
+            VEDAdeviceptr hdr_v = 0;
+            if (std::getenv("GGML_VE_Q4K_DIRECT_HDR") != nullptr && !hdr_cache_disabled.load()) {
+                /* HBM headroom guard. Sample initial-free ONCE at startup;
+                 * track our own cumulative cache via cache().stats(). When
+                 * (initial_free - cumulative) drops below a 4 GB cushion,
+                 * stop caching. Calling vedaMemGetInfo per-matvec stalled
+                 * the VEDA queue and tanked 1B perf 5x, so we use a single
+                 * static snapshot. */
+                static std::atomic<size_t> initial_free{0};
+                size_t snap = initial_free.load();
+                if (snap == 0) {
+                    size_t free = 0, total = 0;
+                    vedaMemGetInfo(&free, &total);
+                    initial_free.store(free);
+                    snap = free;
+                    if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+                        fprintf(stderr, "[Q4K-HDR] initial vedaMemGetInfo: free=%zu MB total=%zu MB\n",
+                                free / (1024 * 1024), total / (1024 * 1024));
+                    }
+                }
+                size_t allocated = 0;
+                ctx->cache().stats(&allocated, nullptr, nullptr);
+                const char * keep_free_env = std::getenv("GGML_VE_Q4K_HDR_KEEP_FREE_MB");
+                const size_t keep_free_bytes = keep_free_env
+                    ? (size_t) std::strtoull(keep_free_env, nullptr, 10) * 1024ull * 1024ull
+                    : 20ull * 1024ull * 1024ull * 1024ull;  /* 20 GB headroom.
+                          * Snap captures vedaMemGetInfo at first matvec.
+                          * 27B-class observes snap ~= 22 GB (model + KV
+                          * pre-allocated), but activations grow during
+                          * the graph and eat cushion. With this default,
+                          * 27B skips caching entirely (snap-cushion < 0
+                          * for any single hdr alloc). Override with
+                          * GGML_VE_Q4K_HDR_KEEP_FREE_MB for tuning. */
+                const size_t hdr_size = (size_t) M * (K / 256) * 64;
+                const size_t projected_used = allocated + hdr_size;
+                if (snap > projected_used + keep_free_bytes) {
+                    const void * src_for_cache = w->data;
+                    std::unique_ptr<uint8_t[]> bounce;
+                    const int64_t weight_bytes = (int64_t) M * (K / 256) * 144;
+                    if (w->buffer && !ggml_backend_buffer_is_host(w->buffer)) {
+                        bounce.reset(new uint8_t[weight_bytes]);
+                        if (vedaMemcpyDtoH(bounce.get(),
+                                           (VEDAdeviceptr)(uintptr_t) w->data,
+                                           weight_bytes) != VEDA_SUCCESS) {
+                            return false;
+                        }
+                        src_for_cache = bounce.get();
+                    }
+                    if (!ctx->cache().get_or_upload_q4k_hdr_decoded(
+                            name, src_for_cache, (uint64_t) M, (uint64_t) K, &hdr_v)) {
+                        hdr_v = 0;
+                        hdr_cache_disabled.store(true);
+                        if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+                            fprintf(stderr, "[Q4K-HDR-DISABLE] cache build failed on %s; "
+                                    "disabling hdr cache for the rest of this run\n",
+                                    name ? name : "?");
+                        }
+                    }
+                }
+            }
+
+            const kernel_id kid = (hdr_v != 0)
+                ? K_Q4K_MATVEC_STD_HDR_HBM
+                : K_Q4K_MATVEC_STD_HBM;
+            VEDAfunction fn_std = ctx->fn(kid);
+            if (fn_std == 0) return false;
+
             ok = true;
             for (int64_t n = 0; n < N && ok; n++) {
                 VEDAargs args = nullptr;
@@ -232,11 +309,20 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
                 }
                 VEDAdeviceptr y_col = (VEDAdeviceptr)((uintptr_t) y_hbm + n * M * sizeof(float));
                 VEDAdeviceptr x_col = (VEDAdeviceptr)((uintptr_t) x_hbm + n * K * sizeof(float));
-                vedaArgsSetVPtr(args, 0, y_col);
-                vedaArgsSetVPtr(args, 1, w_raw_hbm);
-                vedaArgsSetVPtr(args, 2, x_col);
-                vedaArgsSetU64 (args, 3, (uint64_t) M);
-                vedaArgsSetU64 (args, 4, (uint64_t) K);
+                if (hdr_v != 0) {
+                    vedaArgsSetVPtr(args, 0, y_col);
+                    vedaArgsSetVPtr(args, 1, w_raw_hbm);
+                    vedaArgsSetVPtr(args, 2, hdr_v);
+                    vedaArgsSetVPtr(args, 3, x_col);
+                    vedaArgsSetU64 (args, 4, (uint64_t) M);
+                    vedaArgsSetU64 (args, 5, (uint64_t) K);
+                } else {
+                    vedaArgsSetVPtr(args, 0, y_col);
+                    vedaArgsSetVPtr(args, 1, w_raw_hbm);
+                    vedaArgsSetVPtr(args, 2, x_col);
+                    vedaArgsSetU64 (args, 3, (uint64_t) M);
+                    vedaArgsSetU64 (args, 4, (uint64_t) K);
+                }
                 ok = ggml_ve_ok(vedaLaunchKernelEx(fn_std, 0, args, 1, nullptr),
                                 "vedaLaunchKernelEx(q4k_matvec_std_hbm)");
             }

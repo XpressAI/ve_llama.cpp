@@ -74,6 +74,7 @@ const kernel_meta & meta(kernel_id id) {
         /* K_Q4K_MATVEC_FULL_HBM                      */ { "ve_q4k_matvec_full_hbm",                   KMOD_SGEMV  },
         /* K_Q4K_MATMUL_FULL_HBM                      */ { "ve_q4k_matmul_full_hbm",                   KMOD_SGEMV  },
         /* K_Q4K_MATVEC_STD_HBM                       */ { "ve_q4k_matvec_std_hbm",                    KMOD_SGEMV  },
+        /* K_Q4K_MATVEC_STD_HDR_HBM                   */ { "ve_q4k_matvec_std_hdr_hbm",                KMOD_SGEMV  },
         /* K_DEQUANT_Q2K_BF16                         */ { "ve_dequant_q2k_bf16",                      KMOD_SGEMV  },
         /* K_DEQUANT_Q8_0_BF16                        */ { "ve_dequant_q8_0_bf16",                     KMOD_SGEMV  },
         /* K_DEQUANT_MXFP4_BF16_HMEM                  */ { "ve_dequant_mxfp4_bf16_hmem",               KMOD_SGEMV  },

@@ -24,6 +24,12 @@ extern float q4k_std_row_dot_chunked_extern(const uint8_t *blk_row,
                                               const float *x_high_perm,
                                               uint8_t *qs_scratch,
                                               int nb);
+extern float q4k_std_row_dot_chunked_hdr_extern(const uint8_t *blk_row,
+                                                  const float *hdr_decoded_row,
+                                                  const float *x_low_perm,
+                                                  const float *x_high_perm,
+                                                  uint8_t *qs_scratch,
+                                                  int nb);
 extern void  q4k_std_build_x_perm_extern(const float *x,
                                           float *x_low_perm,
                                           float *x_high_perm, int K);
@@ -38,12 +44,35 @@ static uint8_t * g_qs_pool = NULL;
 static size_t    g_qs_per_thread = 0;
 static int       g_qs_nthr_cap = 0;
 
+/* Optional pre-decoded headers (per-tensor cache). If non-zero, kernel
+ * loads 16 fp32 / block from this HBM buffer instead of doing scalar
+ * h2f + q4k_sm per block. Layout: M * nb * 64 bytes, contiguous, row r
+ * block b at offset (r*nb + b) * 64. */
+uint64_t ve_q4k_matvec_std_hdr_hbm(uint64_t y_vptr, uint64_t W_vptr,
+                                    uint64_t hdr_vptr, uint64_t x_vptr,
+                                    uint64_t M, uint64_t K);
+
+uint64_t ve_q4k_matvec_std_hdr_hbm(uint64_t y_vptr, uint64_t W_vptr,
+                                    uint64_t hdr_vptr, uint64_t x_vptr,
+                                    uint64_t M, uint64_t K);
+
 uint64_t ve_q4k_matvec_std_hbm(uint64_t y_vptr, uint64_t W_vptr,
                                 uint64_t x_vptr,
                                 uint64_t M, uint64_t K) {
+    return ve_q4k_matvec_std_hdr_hbm(y_vptr, W_vptr, /*hdr=*/0, x_vptr, M, K);
+}
+
+uint64_t ve_q4k_matvec_std_hdr_hbm(uint64_t y_vptr, uint64_t W_vptr,
+                                    uint64_t hdr_vptr, uint64_t x_vptr,
+                                    uint64_t M, uint64_t K) {
     void *p;
     if (vedaMemPtr(&p, y_vptr) != 0) return 1; float         *y = (float *)p;
     if (vedaMemPtr(&p, W_vptr) != 0) return 2; const uint8_t *W = (const uint8_t *)p;
+    const float *hdr_all = NULL;
+    if (hdr_vptr != 0) {
+        if (vedaMemPtr(&p, hdr_vptr) != 0) return 7;
+        hdr_all = (const float *)p;
+    }
     if (vedaMemPtr(&p, x_vptr) != 0) return 3; const float   *x = (const float *)p;
 
     const int nb = (int) K / 256;
@@ -89,6 +118,7 @@ uint64_t ve_q4k_matvec_std_hbm(uint64_t y_vptr, uint64_t W_vptr,
             if (g_qs_pool == NULL) return 6;
         }
 
+        const size_t hdr_row_floats = (size_t) nb * 16;  /* 16 fp32 per block */
         #pragma omp parallel num_threads(nthr)
         {
             int tid = omp_get_thread_num();
@@ -96,7 +126,10 @@ uint64_t ve_q4k_matvec_std_hbm(uint64_t y_vptr, uint64_t W_vptr,
             #pragma omp for
             for (uint64_t m = 0; m < M; m++) {
                 const uint8_t *blk_row = W + m * row_bytes;
-                y[m] = q4k_std_row_dot_chunked_extern(blk_row,
+                const float *hdr_row = hdr_all
+                    ? hdr_all + m * hdr_row_floats
+                    : NULL;
+                y[m] = q4k_std_row_dot_chunked_hdr_extern(blk_row, hdr_row,
                     g_xlo_perm, g_xhi_perm, qs_scratch, nb);
             }
         }
