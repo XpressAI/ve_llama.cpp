@@ -1,15 +1,7 @@
 /* NCC-side dispatcher for q4k_std_intrin.c (direct-dispatch Q4_K matvec).
  *
- * No canon-split cache. No header pre-decode. Just: lay out the standard
- * block_q4_K bytes (144 B/block) on VE0_HBM, give us a (qs+hdr+x+y)
- * pointer set, and we dot every row.
- *
- * Compared to the canon-cache path:
- *   - HBM footprint: 1× raw weights only (no 192/144 expansion)
- *   - First-call overhead: 0 (no canon transform; no host bounce)
- *   - Per-call cost: slightly higher (header decode + 6-bit unpack inside
- *     the kernel) but the row-dot inner loop has comparable VL/Op.Ratio
- */
+ * Builds x_low_perm and x_high_perm ONCE per matvec, then dispatches
+ * OMP-parallel rows that each call the VL=32 inner kernel. */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -17,14 +9,24 @@
 
 extern int vedaMemPtr(void **ptr, uint64_t vptr);
 
-extern float q4k_std_row_dot_extern(const uint8_t *blk_row,
-                                     const float *x, int nb);
+extern float q4k_std_row_dot_xperm_extern(const uint8_t *blk_row,
+                                            const float *x_low_perm,
+                                            const float *x_high_perm,
+                                            int nb);
+extern void  q4k_std_8rows_xperm_extern(const uint8_t * const blk_rows[8],
+                                          const float *x_low_perm,
+                                          const float *x_high_perm,
+                                          float *y_out[8], int nb);
+extern void  q4k_std_build_x_perm_extern(const float *x,
+                                          float *x_low_perm,
+                                          float *x_high_perm, int K);
 
-/* Direct-dispatch matvec on standard block_q4_K layout.
- *   y[M]   : F32 output
- *   W[M*K] : standard block_q4_K (M * nb * 144 bytes, nb = K/256)
- *   x[K]   : F32 input
- * All pointers are HBM (VEDAdeviceptr -> raw VE pointer via vedaMemPtr). */
+/* Reusable permuted-x buffers; grow monotonically. Single VEDA kernel
+ * context per matvec call so static state is safe. */
+static float * g_xlo_perm = NULL;
+static float * g_xhi_perm = NULL;
+static size_t  g_xperm_cap = 0;  /* in bytes */
+
 uint64_t ve_q4k_matvec_std_hbm(uint64_t y_vptr, uint64_t W_vptr,
                                 uint64_t x_vptr,
                                 uint64_t M, uint64_t K) {
@@ -41,10 +43,47 @@ uint64_t ve_q4k_matvec_std_hbm(uint64_t y_vptr, uint64_t W_vptr,
     if (nthr < 1) nthr = 1;
     if (nthr > 8) nthr = 8;
 
-    #pragma omp parallel for num_threads(nthr)
-    for (uint64_t m = 0; m < M; m++) {
-        const uint8_t *blk_row = W + m * row_bytes;
-        y[m] = q4k_std_row_dot_extern(blk_row, x, nb);
+    /* Grow permuted-x buffers if needed. Each holds K floats. */
+    const size_t need_bytes = (size_t) K * sizeof(float);
+    if (need_bytes > g_xperm_cap) {
+        if (g_xlo_perm) free(g_xlo_perm);
+        if (g_xhi_perm) free(g_xhi_perm);
+        g_xlo_perm = (float *) aligned_alloc(64, need_bytes);
+        g_xhi_perm = (float *) aligned_alloc(64, need_bytes);
+        g_xperm_cap = need_bytes;
+        if (g_xlo_perm == NULL || g_xhi_perm == NULL) return 5;
+    }
+
+    q4k_std_build_x_perm_extern(x, g_xlo_perm, g_xhi_perm, (int) K);
+
+    /* GGML_VE_Q4K_STD_TILE=1 to try the 8-row tile (slower at the moment
+     * due to register pressure -- left in for future tuning). */
+    const int use_tile = (getenv("GGML_VE_Q4K_STD_TILE") != NULL);
+    if (use_tile) {
+        const uint64_t M8 = M & ~(uint64_t) 7;
+        #pragma omp parallel for num_threads(nthr)
+        for (uint64_t m = 0; m < M8; m += 8) {
+            const uint8_t *blk_rows[8] = {
+                W + (m + 0) * row_bytes, W + (m + 1) * row_bytes,
+                W + (m + 2) * row_bytes, W + (m + 3) * row_bytes,
+                W + (m + 4) * row_bytes, W + (m + 5) * row_bytes,
+                W + (m + 6) * row_bytes, W + (m + 7) * row_bytes };
+            float *y_out[8] = {
+                &y[m + 0], &y[m + 1], &y[m + 2], &y[m + 3],
+                &y[m + 4], &y[m + 5], &y[m + 6], &y[m + 7] };
+            q4k_std_8rows_xperm_extern(blk_rows, g_xlo_perm, g_xhi_perm, y_out, nb);
+        }
+        #pragma omp parallel for num_threads(nthr)
+        for (uint64_t m = M8; m < M; m++) {
+            const uint8_t *blk_row = W + m * row_bytes;
+            y[m] = q4k_std_row_dot_xperm_extern(blk_row, g_xlo_perm, g_xhi_perm, nb);
+        }
+    } else {
+        #pragma omp parallel for num_threads(nthr)
+        for (uint64_t m = 0; m < M; m++) {
+            const uint8_t *blk_row = W + m * row_bytes;
+            y[m] = q4k_std_row_dot_xperm_extern(blk_row, g_xlo_perm, g_xhi_perm, nb);
+        }
     }
     return 0;
 }
