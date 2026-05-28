@@ -14,6 +14,8 @@
 
 #include "ggml.h"
 
+#include <memory>
+
 namespace ggml_ve {
 namespace ops {
 
@@ -219,8 +221,38 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
             fprintf(stderr, "[Q4K-DEBUG] name=%s M=%ld K=%ld N=%ld\n",
                     name ? name : "?", (long)M, (long)K, (long)N);
         }
+        // The host-side canonical-pack reads from src_blocks via memcpy. If
+        // the weight buffer is device-resident (VE_HBM), w->data is an HBM
+        // pointer and host memcpy SEGVs. Download to a host bounce buffer
+        // first.
+        //
+        // This happens with GGML_VE_Q4K_N_GT_1: once our backend accepts
+        // Q4_K MUL_MATs in batched form, the scheduler decides Q4_K weights
+        // are best placed on VE_HBM (the buffer they're consumed on). The
+        // cache then needs to read them BACK to host to do the canonical
+        // pack + pre-decode. One-time cost per weight at first lookup.
+        const void * src_for_cache = w->data;
+        std::unique_ptr<uint8_t[]> bounce;
+        const int64_t weight_bytes = (int64_t) M * (K / 256) * 144;
+        if (w->buffer && !ggml_backend_buffer_is_host(w->buffer)) {
+            bounce.reset(new uint8_t[weight_bytes]);
+            if (vedaMemcpyDtoH(bounce.get(),
+                               (VEDAdeviceptr)(uintptr_t) w->data,
+                               weight_bytes) != VEDA_SUCCESS) {
+                if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+                    fprintf(stderr, "[Q4K-FAIL] DtoH bounce for %s failed\n",
+                            name ? name : "?");
+                }
+                return false;
+            }
+            src_for_cache = bounce.get();
+            if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+                fprintf(stderr, "[Q4K-DEVICE-BOUNCE] %s: %ld bytes downloaded for canon pack\n",
+                        name ? name : "?", (long) weight_bytes);
+            }
+        }
         if (!ctx->cache().get_or_upload_q4k_canon(
-                name, w->data, (uint64_t) M, (uint64_t) K, &qs_v, &hdr_v)) {
+                name, src_for_cache, (uint64_t) M, (uint64_t) K, &qs_v, &hdr_v)) {
             return false;
         }
         /* N>1 (batched matmul): loop the matvec, advancing y by M and x by K
