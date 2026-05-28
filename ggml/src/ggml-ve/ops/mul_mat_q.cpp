@@ -131,7 +131,16 @@ bool mul_mat_q_supports(const ggml_tensor * op) {
         return false;
     };
 
-    if (N != 1) return reject("N!=1");
+    /* N>1 currently CRASHES the kernel chain (likely cache reentry or
+     * VEDA arg lifetime issue across queued launches). Reverting to
+     * N=1 only until investigated. The dispatch code that loops N times
+     * is left in place for when the underlying issue is fixed.
+     * Opt-in for testing: GGML_VE_Q4K_N_GT_1=1 to try N>1 path. */
+    if (w->type == GGML_TYPE_Q4_K && std::getenv("GGML_VE_Q4K_N_GT_1") != nullptr) {
+        if (N < 1) return reject("N<1");
+    } else {
+        if (N != 1) return reject("N!=1");
+    }
     if (op->ne[0] != M || op->ne[1] != N) return reject("op_ne mismatch");
     if (w->ne[0]  != x->ne[0]) return reject("K mismatch");
     if (op->ne[2] != 1 || op->ne[3] != 1) return reject("op_ne23");
@@ -205,33 +214,41 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
         if (fn == 0) return false;
         VEDAdeviceptr qs_v = 0, hdr_v = 0;
         const char * name = (w->name && w->name[0]) ? w->name : nullptr;
+        const int64_t N = dst->ne[1];
         if (std::getenv("GGML_VE_Q4K_DEBUG")) {
-            fprintf(stderr, "[Q4K-DEBUG] name=%s M=%ld K=%ld y_hbm=%lx x_hbm=%lx ...",
-                    name ? name : "?", (long)M, (long)K,
-                    (long)y_hbm, (long)x_hbm);
-            fflush(stderr);
+            fprintf(stderr, "[Q4K-DEBUG] name=%s M=%ld K=%ld N=%ld\n",
+                    name ? name : "?", (long)M, (long)K, (long)N);
         }
         if (!ctx->cache().get_or_upload_q4k_canon(
                 name, w->data, (uint64_t) M, (uint64_t) K, &qs_v, &hdr_v)) {
-            if (std::getenv("GGML_VE_Q4K_DEBUG")) fprintf(stderr, " UPLOAD FAIL\n");
             return false;
         }
-        if (std::getenv("GGML_VE_Q4K_DEBUG")) {
-            fprintf(stderr, " qs_v=%lx hdr_v=%lx ", (long)qs_v, (long)hdr_v);
-            fflush(stderr);
+        /* N>1 (batched matmul): loop the matvec, advancing y by M and x by K
+         * each iteration. dst[m,n] is stored at y_hbm + (n*M + m)*4 (ggml's
+         * standard row-major in our convention: ne[0]=M is inner). Each
+         * column's matvec is independent so we queue them all without sync
+         * (VEDA stream serialises, but the kernels themselves run on 8 cores
+         * each via OMP). For N=1 this is just one call -- unchanged. */
+        ok = true;
+        for (int64_t n = 0; n < N && ok; n++) {
+            VEDAargs args = nullptr;
+            if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(q4k_full)")) {
+                ok = false; break;
+            }
+            VEDAdeviceptr y_col = (VEDAdeviceptr)((uintptr_t) y_hbm + n * M * sizeof(float));
+            VEDAdeviceptr x_col = (VEDAdeviceptr)((uintptr_t) x_hbm + n * K * sizeof(float));
+            vedaArgsSetVPtr(args, 0, y_col);
+            vedaArgsSetVPtr(args, 1, qs_v);
+            vedaArgsSetVPtr(args, 2, hdr_v);
+            vedaArgsSetVPtr(args, 3, x_col);
+            vedaArgsSetU64 (args, 4, (uint64_t) M);
+            vedaArgsSetU64 (args, 5, (uint64_t) K);
+            ok = ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, 1, nullptr),
+                            "vedaLaunchKernelEx(q4k_matvec_full_hbm)");
+            /* Sync each iteration so VEDA's static x_perm staging buffer in
+             * the kernel doesn't get clobbered by the next column. */
+            if (ok) vedaCtxSynchronize();
         }
-        VEDAargs args = nullptr;
-        if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(q4k_full)")) return false;
-        vedaArgsSetVPtr(args, 0, y_hbm);
-        vedaArgsSetVPtr(args, 1, qs_v);
-        vedaArgsSetVPtr(args, 2, hdr_v);
-        vedaArgsSetVPtr(args, 3, x_hbm);
-        vedaArgsSetU64 (args, 4, (uint64_t) M);
-        vedaArgsSetU64 (args, 5, (uint64_t) K);
-        ok = ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, 1, nullptr),
-                        "vedaLaunchKernelEx(q4k_matvec_full_hbm)");
-        if (ok && std::getenv("GGML_VE_Q4K_SYNC")) vedaCtxSynchronize();
-        if (std::getenv("GGML_VE_Q4K_DEBUG")) fprintf(stderr, " OK\n");
     } else if (w->type == GGML_TYPE_Q2_K) {
         VEDAfunction fn = ctx->fn(K_Q2K_BF16_MATVEC_HBM);
         if (fn == 0) return false;
