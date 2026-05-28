@@ -99,6 +99,30 @@ void q4k_std_build_x_perm_extern(const float *x, float *x_low_perm,
     }
 }
 
+/* PACKED variant of the x permute: per bp, nb*32 u64 where each u64 packs
+ * (x_low, x_high) as low|high<<32. Used by the pvfmad kernel below. */
+void q4k_std_build_x_perm_packed_extern(const float *x, uint64_t *x_pk_perm, int K);
+
+void q4k_std_build_x_perm_packed_extern(const float *x, uint64_t *x_pk_perm, int K) {
+    const int nb = K / 256;
+    for (int bp = 0; bp < 4; bp++) {
+        uint64_t *xpk_bp = x_pk_perm + (size_t) bp * nb * 32;
+        for (int b = 0; b < nb; b++) {
+            const float *xb = x + (size_t) b * 256;
+            for (int i = 0; i < 32; i++) {
+                const int qq = i / 8;
+                const int ii = i % 8;
+                const float x_lo = xb[64 * qq      + 4 * ii + bp];
+                const float x_hi = xb[64 * qq + 32 + 4 * ii + bp];
+                uint32_t lo_bits, hi_bits;
+                memcpy(&lo_bits, &x_lo, 4);
+                memcpy(&hi_bits, &x_hi, 4);
+                xpk_bp[b * 32 + i] = ((uint64_t) hi_bits << 32) | lo_bits;
+            }
+        }
+    }
+}
+
 /* Inner per-row dot using pre-permuted x. blk_row points at row m's
  * first block. x_low_perm and x_high_perm are nb*128 floats each. */
 float q4k_std_row_dot_xperm_extern(const uint8_t *blk_row,
@@ -596,6 +620,146 @@ float q4k_std_row_dot_chunked_gather_hdr_extern(const uint8_t *blk_row,
 
         __vr red = _vel_vfsums_vvl(acc_v, VL);
         acc += _vel_lvss_svs(red, 0);
+    }
+
+    return acc;
+}
+
+/* ---- Packed pvfmad variant ---- *
+ *
+ * Packs low+high nibble FMAs into _vel_pvfmad_vvvvl (packed FP32 -- 2
+ * elements per 64-bit lane). Per chunk:
+ *   - 4 byte-positions × 1 packed FMA chain = 4 packed FMAs (vs 8 in
+ *     the non-packed chunked kernel: 4 bp × 2 halves).
+ *   - dlane_pk[i] = pack(d_low, d_high), mlane_pk[i] = pack(-m_lo, -m_hi)
+ *   - x_pk[i] = pack(x_low, x_high) -- preloaded once per matvec
+ *   - nib_pk[i] = pack(low_nib_i, high_nib_i)
+ *   - w_pk = pvfmad(neg_m_pk, d_pk, nib_f_pk)   # = d*nib - m  (packed)
+ *   - acc_pk = pvfmad(acc_pk, w_pk, x_pk)
+ *
+ * Reduction: extract low and high halves of each lane, sum to scalar.
+ *
+ * Inputs:
+ *   x_pk_perm: packed x permute (low|high<<32 per bp×nb×32 layout)
+ */
+float q4k_std_row_dot_chunked_packed_hdr_extern(const uint8_t *blk_row,
+                                                  const float *hdr_decoded_row,
+                                                  const uint64_t *x_pk_perm,
+                                                  int nb);
+
+float q4k_std_row_dot_chunked_packed_hdr_extern(const uint8_t *blk_row,
+                                                  const float *hdr_decoded_row,
+                                                  const uint64_t *x_pk_perm,
+                                                  int nb) {
+    if (!g_qs_gather_init) q4k_std_init_gather_offsets();
+
+    /* Preload the offset vector at MAX VL (only used by gather path). */
+    __vr off_v = _vel_vld_vssl(8, (void *) g_qs_gather_offsets, Q4K_STD_GATHER_VL);
+
+    float acc = 0.0f;
+
+    for (int chunk_start = 0; chunk_start < nb; chunk_start += Q4K_STD_CHUNK) {
+        int cn = (nb - chunk_start) < Q4K_STD_CHUNK ? (nb - chunk_start) : Q4K_STD_CHUNK;
+        const int VL = cn * 32;
+
+        /* qs gather (same as gather variant). */
+        const uint64_t chunk_base = (uint64_t)(uintptr_t)(blk_row + (size_t) chunk_start * 144);
+        __vr addrs    = _vel_vsfa_vvssl(off_v, 0, chunk_base, VL);
+        __vr qs_chunk = _vel_vgtlzx_vvssl(addrs, 0, 0, VL);
+
+        /* Header source: cached pre-decoded, else live decode. */
+        float d_sub_chunk[Q4K_STD_CHUNK * 8];
+        float m_sub_chunk[Q4K_STD_CHUNK * 8];
+        if (hdr_decoded_row != NULL) {
+            const float *hdr_chunk = hdr_decoded_row + (size_t) chunk_start * 16;
+            for (int cb = 0; cb < cn; cb++) {
+                const float *blk_hdr = hdr_chunk + (size_t) cb * 16;
+                for (int s = 0; s < 8; s++) {
+                    d_sub_chunk[cb * 8 + s] = blk_hdr[s    ];
+                    m_sub_chunk[cb * 8 + s] = blk_hdr[8 + s];
+                }
+            }
+        } else {
+            for (int cb = 0; cb < cn; cb++) {
+                const uint8_t *blk = blk_row + (size_t)(chunk_start + cb) * 144;
+                uint16_t d_raw, dmin_raw;
+                memcpy(&d_raw,    blk + 0, 2);
+                memcpy(&dmin_raw, blk + 2, 2);
+                const float d_super    = h2f(d_raw);
+                const float dmin_super = h2f(dmin_raw);
+                const uint8_t *sc12 = blk + 4;
+                for (int s = 0; s < 8; s++) {
+                    uint8_t sc, mn;
+                    q4k_sm(s, sc12, &sc, &mn);
+                    d_sub_chunk[cb * 8 + s] = d_super    * (float) sc;
+                    m_sub_chunk[cb * 8 + s] = dmin_super * (float) mn;
+                }
+            }
+        }
+
+        /* Build packed dlane/mlane (negated m for pvfmad).
+         *   dlane_pk[lane] = pack(d_low, d_high) = hi<<32 | lo bits
+         *   mlane_pk[lane] = pack(-m_low, -m_high) */
+        uint64_t dlane_pk[256], mlane_pk[256];
+        for (int cb = 0; cb < cn; cb++) {
+            const float *d_blk = d_sub_chunk + (size_t) cb * 8;
+            const float *m_blk = m_sub_chunk + (size_t) cb * 8;
+            for (int q = 0; q < 4; q++) {
+                const float d_l =  d_blk[2 * q],     d_h =  d_blk[2 * q + 1];
+                const float m_l = -m_blk[2 * q],     m_h = -m_blk[2 * q + 1];
+                uint32_t dl_b, dh_b, ml_b, mh_b;
+                memcpy(&dl_b, &d_l, 4); memcpy(&dh_b, &d_h, 4);
+                memcpy(&ml_b, &m_l, 4); memcpy(&mh_b, &m_h, 4);
+                const uint64_t d_pk = ((uint64_t) dh_b << 32) | dl_b;
+                const uint64_t m_pk = ((uint64_t) mh_b << 32) | ml_b;
+                for (int j = 0; j < 8; j++) {
+                    const int lane = cb * 32 + q * 8 + j;
+                    dlane_pk[lane] = d_pk;
+                    mlane_pk[lane] = m_pk;
+                }
+            }
+        }
+        __vr d_pk_v = _vel_vld_vssl(8, (void *) dlane_pk, VL);
+        __vr m_pk_v = _vel_vld_vssl(8, (void *) mlane_pk, VL);
+
+        __vr acc_pk = _vel_vbrdl_vsl(0UL, VL);
+        __vr lo_mask = _vel_vbrdl_vsl(0x000000000000000FUL, VL);
+
+        for (int bp = 0; bp < 4; bp++) {
+            /* nib_pk lane i = low_nib_i | (high_nib_i << 32).
+             *   low_nib_i  = (qs >> 8bp)      & 0x0F
+             *   high_nib_i = (qs >> (8bp+4))  & 0x0F  -> shift left 32 */
+            __vr shifted_lo = _vel_vsrl_vvsl(qs_chunk, 8 * bp,     VL);
+            __vr shifted_hi = _vel_vsrl_vvsl(qs_chunk, 8 * bp + 4, VL);
+            __vr low_nib    = _vel_vand_vvvl(shifted_lo, lo_mask,  VL);
+            __vr high_nib   = _vel_vand_vvvl(shifted_hi, lo_mask,  VL);
+            __vr high_upper = _vel_vsll_vvsl(high_nib, 32,         VL);
+            __vr nib_pk     = _vel_vor_vvvl (low_nib,  high_upper, VL);
+
+            /* Packed int32 -> packed fp32. */
+            __vr nib_f_pk = _vel_pvcvtsw_vvl(nib_pk, VL);
+
+            /* w_pk = -m + d*nib  (packed FMA). */
+            __vr w_pk = _vel_pvfmad_vvvvl(m_pk_v, d_pk_v, nib_f_pk, VL);
+
+            /* Load packed x. */
+            __vr x_pk = _vel_vld_vssl(8,
+                (void *)(x_pk_perm + (size_t) bp * nb * 32 + (size_t) chunk_start * 32), VL);
+
+            /* acc_pk += w_pk * x_pk  (packed FMA). */
+            acc_pk = _vel_pvfmad_vvvvl(acc_pk, w_pk, x_pk, VL);
+        }
+
+        /* Reduce packed accumulator. Pattern mirrors canon's packed
+         * matvec at q4k_full_intrin.c:698-705. */
+        __vr lo32_mask = _vel_vbrdl_vsl(0x00000000FFFFFFFFUL, VL);
+        __vr acc_lo32 = _vel_vand_vvvl(acc_pk, lo32_mask, VL);
+        __vr acc_hi32 = _vel_vsrl_vvsl(acc_pk, 32, VL);
+        acc_lo32 = _vel_vsll_vvsl(acc_lo32, 32, VL);
+        __vr acc_hi32_up = _vel_vsll_vvsl(acc_hi32, 32, VL);
+        __vr acc_sum = _vel_vfadds_vvvl(acc_lo32, acc_hi32_up, VL);
+        acc_sum = _vel_vfsums_vvl(acc_sum, VL);
+        acc += _vel_lvss_svs(acc_sum, 0);
     }
 
     return acc;

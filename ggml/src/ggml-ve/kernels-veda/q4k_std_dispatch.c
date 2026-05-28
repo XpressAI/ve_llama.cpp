@@ -35,14 +35,22 @@ extern float q4k_std_row_dot_chunked_gather_hdr_extern(const uint8_t *blk_row,
                                                          const float *x_low_perm,
                                                          const float *x_high_perm,
                                                          int nb);
+extern float q4k_std_row_dot_chunked_packed_hdr_extern(const uint8_t *blk_row,
+                                                         const float *hdr_decoded_row,
+                                                         const uint64_t *x_pk_perm,
+                                                         int nb);
 extern void  q4k_std_build_x_perm_extern(const float *x,
                                           float *x_low_perm,
                                           float *x_high_perm, int K);
+extern void  q4k_std_build_x_perm_packed_extern(const float *x,
+                                                  uint64_t *x_pk_perm, int K);
 
 /* Reusable per-matvec buffers; grow monotonically. */
-static float * g_xlo_perm = NULL;
-static float * g_xhi_perm = NULL;
-static size_t  g_xperm_cap = 0;
+static float    * g_xlo_perm = NULL;
+static float    * g_xhi_perm = NULL;
+static size_t     g_xperm_cap = 0;
+static uint64_t * g_xpk_perm = NULL;     /* packed x_perm for pvfmad path */
+static size_t     g_xpk_cap   = 0;
 
 /* Per-thread qs scratch pool. Sized for nb*128 bytes * nthr_cap. */
 static uint8_t * g_qs_pool = NULL;
@@ -125,7 +133,34 @@ uint64_t ve_q4k_matvec_std_hdr_hbm(uint64_t y_vptr, uint64_t W_vptr,
 
         const size_t hdr_row_floats = (size_t) nb * 16;  /* 16 fp32 per block */
         const int use_gather = (getenv("GGML_VE_Q4K_STD_GATHER") != NULL);
-        if (use_gather) {
+        const int use_packed = (getenv("GGML_VE_Q4K_STD_PACKED") != NULL);
+
+        if (use_packed) {
+            /* Build packed x_perm (low|high<<32 per element). Same total
+             * floats as the unpacked variant; just packed layout. */
+            const size_t pk_need = (size_t) K * sizeof(float);  /* same byte count
+                                                                 * as 2 float arrays
+                                                                 * combined (2*K*4 = K*8) */
+            const size_t pk_need_bytes = (size_t) nb * 4 * 32 * sizeof(uint64_t);
+            (void) pk_need;
+            if (pk_need_bytes > g_xpk_cap) {
+                if (g_xpk_perm) free(g_xpk_perm);
+                g_xpk_perm = (uint64_t *) aligned_alloc(64, pk_need_bytes);
+                g_xpk_cap = pk_need_bytes;
+                if (g_xpk_perm == NULL) return 8;
+            }
+            q4k_std_build_x_perm_packed_extern(x, g_xpk_perm, (int) K);
+
+            #pragma omp parallel for num_threads(nthr)
+            for (uint64_t m = 0; m < M; m++) {
+                const uint8_t *blk_row = W + m * row_bytes;
+                const float *hdr_row = hdr_all
+                    ? hdr_all + m * hdr_row_floats
+                    : NULL;
+                y[m] = q4k_std_row_dot_chunked_packed_hdr_extern(blk_row, hdr_row,
+                    g_xpk_perm, nb);
+            }
+        } else if (use_gather) {
             #pragma omp parallel for num_threads(nthr)
             for (uint64_t m = 0; m < M; m++) {
                 const uint8_t *blk_row = W + m * row_bytes;
