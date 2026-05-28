@@ -84,6 +84,8 @@ enum ggml_ve_hbm_format {
     GGML_VE_HBM_FP32_COLMAJOR = 2,
     GGML_VE_HBM_BF16_COLMAJOR = 3,
     GGML_VE_HBM_Q8_0          = 4,
+    GGML_VE_HBM_Q4K_CANON_QS  = 5,  // qs bytes in canonical-nibble order
+    GGML_VE_HBM_Q4K_CANON_HDR = 6,  // headers (d, dmin, scales) separately
 };
 
 #endif // GGML_VE_COMMON_HPP

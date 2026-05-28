@@ -35,6 +35,12 @@ extern void  q4k_full_8rows_xperm_extern(const uint8_t * const qs_r[8],
                                           const float *x_perm,
                                           float *y_out[8], int nb);
 
+/* Reusable x_perm buffer to avoid per-call aligned_alloc. Grows monotonically
+ * to the largest K seen. NCC's VEDA kernel context is single-threaded across
+ * calls so no synchronisation is needed. */
+static float * g_x_perm_buf = NULL;
+static size_t  g_x_perm_cap = 0;
+
 uint64_t ve_q4k_matvec_full_hbm(uint64_t y_vptr, uint64_t qs_vptr,
                                  uint64_t hdr_vptr, uint64_t x_vptr,
                                  uint64_t M, uint64_t K) {
@@ -50,8 +56,14 @@ uint64_t ve_q4k_matvec_full_hbm(uint64_t y_vptr, uint64_t qs_vptr,
     int nthr = omp_get_max_threads();
     if (nthr > 8) nthr = 8;
 
-    /* Pre-permute x once per matvec for sequential loads. */
-    float *x_perm = (float *) aligned_alloc(64, K * sizeof(float));
+    /* Pre-permute x once per matvec for sequential loads. Reuse buffer. */
+    const size_t need = (size_t) K * sizeof(float);
+    if (need > g_x_perm_cap) {
+        if (g_x_perm_buf) free(g_x_perm_buf);
+        g_x_perm_buf = (float *) aligned_alloc(64, need);
+        g_x_perm_cap = need;
+    }
+    float *x_perm = g_x_perm_buf;
     if (x_perm == 0) return 5;
     q4k_build_x_perm_extern(x, x_perm, (int) K);
 
@@ -79,6 +91,6 @@ uint64_t ve_q4k_matvec_full_hbm(uint64_t y_vptr, uint64_t qs_vptr,
                                               hdr + m * row_hdr_bytes,
                                               x_perm, nb);
     }
-    free(x_perm);
+    /* don't free x_perm -- reused across calls */
     return 0;
 }

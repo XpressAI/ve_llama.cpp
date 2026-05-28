@@ -70,6 +70,88 @@ public:
         return v;
     }
 
+    // Q4_K canonical-split upload. Given a tensor of standard-layout Q4_K
+    // blocks (144 B / 256 elem, M rows × nb blocks/row), produce two HBM
+    // regions:
+    //   qs_vptr  : M × nb × 128 bytes  -- nibble bytes in canonical order
+    //              (byte k = (element 2k+1) << 4 | element 2k)
+    //   hdr_vptr : M × nb × 16 bytes   -- d, dmin, scales (verbatim copy)
+    // Same total bytes as standard Q4_K (no expansion). Keyed by name+suffix
+    // so each is cacheable across MUL_MAT calls touching the same weight.
+    // Returns true if both uploads succeed; sets out params.
+    bool get_or_upload_q4k_canon(const char * tensor_name,
+                                  const void * src_blocks,
+                                  uint64_t M, uint64_t K,
+                                  VEDAdeviceptr * qs_vptr,
+                                  VEDAdeviceptr * hdr_vptr) {
+        const int    nb        = (int) K / 256;
+        const size_t qs_total  = (size_t) M * nb * 128;
+        const size_t hdr_total = (size_t) M * nb * 16;
+
+        // Lookup by name+suffix.
+        std::string qs_key  = std::string(tensor_name ? tensor_name : "?") + "/q4k_qs";
+        std::string hdr_key = std::string(tensor_name ? tensor_name : "?") + "/q4k_hdr";
+        VEDAdeviceptr qs_v = 0, hdr_v = 0;
+        for (auto & e : entries_) {
+            if (e.name == qs_key  && e.size == qs_total)  qs_v  = e.vptr;
+            if (e.name == hdr_key && e.size == hdr_total) hdr_v = e.vptr;
+        }
+        if (qs_v && hdr_v) {
+            hits_ += 2;
+            *qs_vptr = qs_v; *hdr_vptr = hdr_v;
+            return true;
+        }
+
+        // Need to build the split arrays. Allocate host-side staging.
+        uint8_t * qs_host  = (uint8_t *) std::aligned_alloc(64, qs_total);
+        uint8_t * hdr_host = (uint8_t *) std::aligned_alloc(64, hdr_total);
+        if (!qs_host || !hdr_host) {
+            if (qs_host)  std::free(qs_host);
+            if (hdr_host) std::free(hdr_host);
+            return false;
+        }
+        const uint8_t * S = (const uint8_t *) src_blocks;
+        for (uint64_t m = 0; m < M; m++) {
+            for (int b = 0; b < nb; b++) {
+                const uint8_t * blk = S + (m * nb + b) * 144;
+                uint8_t * qd  = qs_host  + (m * nb + b) * 128;
+                uint8_t * hd  = hdr_host + (m * nb + b) * 16;
+                std::memcpy(hd, blk, 16);
+                // Reconstruct element[256] from standard layout, repack canonical.
+                uint8_t elem[256];
+                const uint8_t * src_qs = blk + 16;
+                for (int p = 0; p < 4; p++) {
+                    for (int l = 0; l < 32; l++) {
+                        elem[64*p + l]      = src_qs[32*p + l] & 0x0F;
+                        elem[64*p + 32 + l] = src_qs[32*p + l] >> 4;
+                    }
+                }
+                for (int k = 0; k < 128; k++) {
+                    qd[k] = (uint8_t) ((elem[2*k + 1] << 4) | elem[2*k]);
+                }
+            }
+        }
+
+        if (qs_v == 0) {
+            qs_v = upload(qs_host, qs_total);
+            // Record host_data as src_blocks (the original Q4_K weights)
+            // so that pointer-based lookups still work; name is primary key.
+            if (qs_v) record(qs_v, qs_total, src_blocks, qs_key.c_str(),
+                             GGML_VE_HBM_Q4K_CANON_QS);
+        }
+        if (hdr_v == 0) {
+            hdr_v = upload(hdr_host, hdr_total);
+            if (hdr_v) record(hdr_v, hdr_total, src_blocks, hdr_key.c_str(),
+                              GGML_VE_HBM_Q4K_CANON_HDR);
+        }
+        // Temp buffers are no longer needed -- upload() did the HtoD copy.
+        std::free(qs_host);
+        std::free(hdr_host);
+        if (!qs_v || !hdr_v) return false;
+        *qs_vptr = qs_v; *hdr_vptr = hdr_v;
+        return true;
+    }
+
     void clear() {
         for (auto & e : entries_) {
             if (e.vptr) vedaMemFreeAsync(e.vptr, 0);

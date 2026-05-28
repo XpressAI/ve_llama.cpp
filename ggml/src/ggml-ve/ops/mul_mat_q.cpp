@@ -21,17 +21,14 @@ namespace {
 
 bool is_supported_quant_type(ggml_type t) {
     // Q8_0: all-HBM fused kernel.
-    // Q4_K: direct matvec exists (ve_q4k_matvec_f32_hbm) and passes all
-    //       standalone correctness shapes bit-exact. BUT enabling it on
-    //       real Q-quant models triggers a separate VE↔CPU intermediate
-    //       transfer bug that produces garbage regardless of whether the
-    //       Q4_K kernel runs (verified: a dummy kernel body that just
-    //       writes y[i] = constant produces the same broken output as
-    //       my real kernel; even disabling the kernel entirely and
-    //       routing all Q4_K to CPU produces the same garbage).
-    //       Until that boundary bug is found, leave Q4_K opt-in.
-    if (std::getenv("GGML_VE_Q4K") == nullptr) return t == GGML_TYPE_Q8_0;
-    return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K;
+    // Q4_K: canonical-nibble + qs/hdr-split HBM kernel. Microbench: 94x
+    //       speedup over the old NCC scalar kernel, ~10x off BF16 speed.
+    //       Requires GGML_VE_QUANT_SAFE_MODE=1 for correct output on
+    //       real models (see resolve_in_slow KNOWN-BUG in backend_ctx.cpp,
+    //       and commit 7ddc2fa26). Opt-out via GGML_VE_NO_Q4K=1.
+    if (t == GGML_TYPE_Q8_0) return true;
+    if (t == GGML_TYPE_Q4_K) return std::getenv("GGML_VE_NO_Q4K") == nullptr;
+    return false;
 }
 
 // Block size for a given quant — used to validate K is aligned.
@@ -175,10 +172,25 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
         if (fn == 0) return false;
         ok = launch_matvec_q8_0_full_hbm(fn, y_hbm, w_hbm, x_hbm, M, K);
     } else if (w->type == GGML_TYPE_Q4_K) {
-        VEDAfunction fn = ctx->fn(K_Q4K_MATVEC_F32_HBM);
+        // Canonical-split kernel: takes y, qs_split, hdr_split, x, M, K.
+        VEDAfunction fn = ctx->fn(K_Q4K_MATVEC_FULL_HBM);
         if (fn == 0) return false;
-        // Same all-HBM launch signature as Q8_0 (y, W, x, M, K).
-        ok = launch_matvec_q8_0_full_hbm(fn, y_hbm, w_hbm, x_hbm, M, K);
+        VEDAdeviceptr qs_v = 0, hdr_v = 0;
+        const char * name = (w->name && w->name[0]) ? w->name : nullptr;
+        if (!ctx->cache().get_or_upload_q4k_canon(
+                name, w->data, (uint64_t) M, (uint64_t) K, &qs_v, &hdr_v)) {
+            return false;
+        }
+        VEDAargs args = nullptr;
+        if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(q4k_full)")) return false;
+        vedaArgsSetVPtr(args, 0, y_hbm);
+        vedaArgsSetVPtr(args, 1, qs_v);
+        vedaArgsSetVPtr(args, 2, hdr_v);
+        vedaArgsSetVPtr(args, 3, x_hbm);
+        vedaArgsSetU64 (args, 4, (uint64_t) M);
+        vedaArgsSetU64 (args, 5, (uint64_t) K);
+        ok = ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, 1, nullptr),
+                        "vedaLaunchKernelEx(q4k_matvec_full_hbm)");
     } else if (w->type == GGML_TYPE_Q2_K) {
         VEDAfunction fn = ctx->fn(K_Q2K_BF16_MATVEC_HBM);
         if (fn == 0) return false;
