@@ -30,6 +30,11 @@ extern float q4k_std_row_dot_chunked_hdr_extern(const uint8_t *blk_row,
                                                   const float *x_high_perm,
                                                   uint8_t *qs_scratch,
                                                   int nb);
+extern float q4k_std_row_dot_chunked_gather_hdr_extern(const uint8_t *blk_row,
+                                                         const float *hdr_decoded_row,
+                                                         const float *x_low_perm,
+                                                         const float *x_high_perm,
+                                                         int nb);
 extern void  q4k_std_build_x_perm_extern(const float *x,
                                           float *x_low_perm,
                                           float *x_high_perm, int K);
@@ -119,18 +124,31 @@ uint64_t ve_q4k_matvec_std_hdr_hbm(uint64_t y_vptr, uint64_t W_vptr,
         }
 
         const size_t hdr_row_floats = (size_t) nb * 16;  /* 16 fp32 per block */
-        #pragma omp parallel num_threads(nthr)
-        {
-            int tid = omp_get_thread_num();
-            uint8_t *qs_scratch = g_qs_pool + (size_t) tid * g_qs_per_thread;
-            #pragma omp for
+        const int use_gather = (getenv("GGML_VE_Q4K_STD_GATHER") != NULL);
+        if (use_gather) {
+            #pragma omp parallel for num_threads(nthr)
             for (uint64_t m = 0; m < M; m++) {
                 const uint8_t *blk_row = W + m * row_bytes;
                 const float *hdr_row = hdr_all
                     ? hdr_all + m * hdr_row_floats
                     : NULL;
-                y[m] = q4k_std_row_dot_chunked_hdr_extern(blk_row, hdr_row,
-                    g_xlo_perm, g_xhi_perm, qs_scratch, nb);
+                y[m] = q4k_std_row_dot_chunked_gather_hdr_extern(blk_row, hdr_row,
+                    g_xlo_perm, g_xhi_perm, nb);
+            }
+        } else {
+            #pragma omp parallel num_threads(nthr)
+            {
+                int tid = omp_get_thread_num();
+                uint8_t *qs_scratch = g_qs_pool + (size_t) tid * g_qs_per_thread;
+                #pragma omp for
+                for (uint64_t m = 0; m < M; m++) {
+                    const uint8_t *blk_row = W + m * row_bytes;
+                    const float *hdr_row = hdr_all
+                        ? hdr_all + m * hdr_row_floats
+                        : NULL;
+                    y[m] = q4k_std_row_dot_chunked_hdr_extern(blk_row, hdr_row,
+                        g_xlo_perm, g_xhi_perm, qs_scratch, nb);
+                }
             }
         }
     } else if (use_tile) {

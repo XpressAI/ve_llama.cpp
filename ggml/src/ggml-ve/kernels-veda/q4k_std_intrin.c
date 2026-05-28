@@ -331,6 +331,26 @@ float q4k_std_row_dot_chunked_hdr_extern(const uint8_t *blk_row,
                                           uint8_t *qs_scratch,
                                           int nb);
 
+/* GATHER variant: skips the scratch pack and uses vgtlzx + vsfa to load
+ * cn*32 u32 lanes directly from raw HBM. Address pattern per chunk:
+ *   addr[i] = chunk_base + (i/32)*144 + 16 + (i%32)*4
+ * with chunk_base = blk_row + chunk_start * 144.
+ *
+ * The offset vector (i/32)*144 + 16 + (i%32)*4 doesn't depend on
+ * chunk_start, so it's precomputed once into g_qs_gather_offsets (a
+ * static MAX_VL=256 u64 array) and loaded per-chunk. */
+float q4k_std_row_dot_chunked_gather_hdr_extern(const uint8_t *blk_row,
+                                                  const float *hdr_decoded_row,
+                                                  const float *x_low_perm,
+                                                  const float *x_high_perm,
+                                                  int nb);
+
+float q4k_std_row_dot_chunked_gather_hdr_extern(const uint8_t *blk_row,
+                                                  const float *hdr_decoded_row,
+                                                  const float *x_low_perm,
+                                                  const float *x_high_perm,
+                                                  int nb);
+
 float q4k_std_row_dot_chunked_extern(const uint8_t *blk_row,
                                       const float *x_low_perm,
                                       const float *x_high_perm,
@@ -437,6 +457,129 @@ float q4k_std_row_dot_chunked_hdr_extern(const uint8_t *blk_row,
 
             /* x_*_perm bp-major: per bp, nb*32 floats; this chunk wants
              * cn*32 floats starting at chunk_start*32. */
+            __vr xl = _vel_vldu_vssl(4,
+                (void *)(x_low_perm  + (size_t) bp * nb * 32 + (size_t) chunk_start * 32), VL);
+            __vr xh = _vel_vldu_vssl(4,
+                (void *)(x_high_perm + (size_t) bp * nb * 32 + (size_t) chunk_start * 32), VL);
+
+            __vr w_lo = _vel_vfmuls_vvvl(dlv, nlf, VL);
+            w_lo      = _vel_vfsubs_vvvl(w_lo, mlv, VL);
+            acc_v     = _vel_vfmads_vvvvl(acc_v, w_lo, xl, VL);
+
+            __vr w_hi = _vel_vfmuls_vvvl(dhv, nhf, VL);
+            w_hi      = _vel_vfsubs_vvvl(w_hi, mhv, VL);
+            acc_v     = _vel_vfmads_vvvvl(acc_v, w_hi, xh, VL);
+        }
+
+        __vr red = _vel_vfsums_vvl(acc_v, VL);
+        acc += _vel_lvss_svs(red, 0);
+    }
+
+    return acc;
+}
+
+/* ---- Gather variant ---- */
+
+/* Static offset vector. Initialised lazily on first call. Pattern:
+ *   off[i] = (i/32)*144 + 16 + (i%32)*4   for i in 0..MAX-1
+ * MAX = Q4K_STD_CHUNK*32 = 256 (matches MVL). */
+#define Q4K_STD_GATHER_VL (Q4K_STD_CHUNK * 32)
+static uint64_t g_qs_gather_offsets[Q4K_STD_GATHER_VL] __attribute__((aligned(64)));
+static int      g_qs_gather_init = 0;
+
+static void q4k_std_init_gather_offsets(void) {
+    for (int i = 0; i < Q4K_STD_GATHER_VL; i++) {
+        const int cb = i / 32;
+        const int ii = i % 32;
+        g_qs_gather_offsets[i] = (uint64_t)(cb * 144 + 16 + ii * 4);
+    }
+    g_qs_gather_init = 1;
+}
+
+float q4k_std_row_dot_chunked_gather_hdr_extern(const uint8_t *blk_row,
+                                                  const float *hdr_decoded_row,
+                                                  const float *x_low_perm,
+                                                  const float *x_high_perm,
+                                                  int nb) {
+    if (!g_qs_gather_init) q4k_std_init_gather_offsets();
+
+    /* Preload the offset vector at MAX VL. */
+    __vr off_v = _vel_vld_vssl(8, (void *)g_qs_gather_offsets, Q4K_STD_GATHER_VL);
+
+    float acc = 0.0f;
+
+    for (int chunk_start = 0; chunk_start < nb; chunk_start += Q4K_STD_CHUNK) {
+        int cn = (nb - chunk_start) < Q4K_STD_CHUNK ? (nb - chunk_start) : Q4K_STD_CHUNK;
+        const int VL = cn * 32;
+
+        /* Build chunk-relative absolute addresses: chunk_base + offsets. */
+        const uint64_t chunk_base = (uint64_t)(uintptr_t)(blk_row + (size_t) chunk_start * 144);
+        __vr addrs = _vel_vsfa_vvssl(off_v, /*shift=*/0, chunk_base, VL);
+
+        /* Gather load: each lane reads u32 at addrs[lane]. */
+        __vr qs_chunk = _vel_vgtlzx_vvssl(addrs, /*sw=*/0, /*sz=*/0, VL);
+        __vr mask     = _vel_vbrdl_vsl(0x0FUL, VL);
+
+        /* Headers: same logic as the scratch-pack variant. */
+        float d_sub_chunk[Q4K_STD_CHUNK * 8];
+        float m_sub_chunk[Q4K_STD_CHUNK * 8];
+        if (hdr_decoded_row != NULL) {
+            const float *hdr_chunk = hdr_decoded_row + (size_t) chunk_start * 16;
+            for (int cb = 0; cb < cn; cb++) {
+                const float *blk_hdr = hdr_chunk + (size_t) cb * 16;
+                for (int s = 0; s < 8; s++) {
+                    d_sub_chunk[cb * 8 + s] = blk_hdr[s    ];
+                    m_sub_chunk[cb * 8 + s] = blk_hdr[8 + s];
+                }
+            }
+        } else {
+            for (int cb = 0; cb < cn; cb++) {
+                const uint8_t *blk = blk_row + (size_t)(chunk_start + cb) * 144;
+                uint16_t d_raw, dmin_raw;
+                memcpy(&d_raw,    blk + 0, 2);
+                memcpy(&dmin_raw, blk + 2, 2);
+                const float d_super    = h2f(d_raw);
+                const float dmin_super = h2f(dmin_raw);
+                const uint8_t *sc12 = blk + 4;
+                for (int s = 0; s < 8; s++) {
+                    uint8_t sc, mn;
+                    q4k_sm(s, sc12, &sc, &mn);
+                    d_sub_chunk[cb * 8 + s] = d_super    * (float) sc;
+                    m_sub_chunk[cb * 8 + s] = dmin_super * (float) mn;
+                }
+            }
+        }
+
+        float dlane_lo[256], mlane_lo[256], dlane_hi[256], mlane_hi[256];
+        for (int cb = 0; cb < cn; cb++) {
+            const float *d_blk = d_sub_chunk + (size_t) cb * 8;
+            const float *m_blk = m_sub_chunk + (size_t) cb * 8;
+            for (int q = 0; q < 4; q++) {
+                const float d_l = d_blk[2 * q],     m_l = m_blk[2 * q];
+                const float d_h = d_blk[2 * q + 1], m_h = m_blk[2 * q + 1];
+                for (int j = 0; j < 8; j++) {
+                    const int lane = cb * 32 + q * 8 + j;
+                    dlane_lo[lane] = d_l;
+                    mlane_lo[lane] = m_l;
+                    dlane_hi[lane] = d_h;
+                    mlane_hi[lane] = m_h;
+                }
+            }
+        }
+        __vr dlv = _vel_vldu_vssl(4, (void *) dlane_lo, VL);
+        __vr mlv = _vel_vldu_vssl(4, (void *) mlane_lo, VL);
+        __vr dhv = _vel_vldu_vssl(4, (void *) dlane_hi, VL);
+        __vr mhv = _vel_vldu_vssl(4, (void *) mlane_hi, VL);
+
+        __vr acc_v = _vel_vbrds_vsl(0.0f, VL);
+
+        for (int bp = 0; bp < 4; bp++) {
+            __vr shifted = _vel_vsrl_vvsl(qs_chunk, 8 * bp, VL);
+            __vr nib_lo  = _vel_vand_vvvl(shifted, mask, VL);
+            __vr nib_hi  = _vel_vand_vvvl(_vel_vsrl_vvsl(shifted, 4, VL), mask, VL);
+            __vr nlf     = _vel_vcvtsw_vvl(nib_lo, VL);
+            __vr nhf     = _vel_vcvtsw_vvl(nib_hi, VL);
+
             __vr xl = _vel_vldu_vssl(4,
                 (void *)(x_low_perm  + (size_t) bp * nb * 32 + (size_t) chunk_start * 32), VL);
             __vr xh = _vel_vldu_vssl(4,
