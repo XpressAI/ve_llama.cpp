@@ -452,6 +452,93 @@ float q4k_full_row_dot_packed_extern(const uint8_t *qs_row, const uint8_t *hdr_r
     return acc_scalar;
 }
 
+/* TILE variant: per row, vectorised dequant Q4_K → F32 into a stack
+ * buffer (16 KB for K=4096 — fits in L1 per core), then compute the dot
+ * with x using a vectorised F32 inner loop ON CACHED DATA.
+ *
+ * The hypothesis: BF16 matvec on cache-resident weights runs at multiples
+ * of HBM bandwidth (LLC is ~3 TB/s aggregate vs HBM 1.2 TB/s). The
+ * dequant cost is fixed but the cached matvec is much faster than direct
+ * Q4_K-from-HBM. Net: per-row total time may drop below direct
+ * Q4_K_FULL's 2.4 ms even with the extra dequant write.
+ *
+ * Output buffer layout: standard row-major (element index = canonical
+ * order from dequant), so a subsequent ve_f32_matvec inner could be
+ * called -- but we just inline the dot here for simplicity.
+ *
+ * Stack usage: K * 4 bytes. For K=17408 (Qwen FFN), that's 70 KB --
+ * exceeds default L1 (32 KB) but well within LLC (2 MB per core). */
+float q4k_full_row_dot_tile_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
+                                    const float *x, int nb);
+
+float q4k_full_row_dot_tile_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
+                                    const float *x, int nb) {
+    /* Stack alloc one row's worth of F32 dequant. Max nb=68 (K=17408 = Qwen FFN). */
+    float row_f32[68 * 256];
+    if (nb > 68) return 0.0f;  /* unsupported, shouldn't happen */
+
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = qs_row + (size_t) b * 128;     /* canonical qs */
+        const uint8_t *hdr = hdr_row + (size_t) b * 16;
+        uint16_t d_raw, dmin_raw;
+        memcpy(&d_raw,    hdr,     2);
+        memcpy(&dmin_raw, hdr + 2, 2);
+        const float d_super    = h2f(d_raw);
+        const float dmin_super = h2f(dmin_raw);
+        const uint8_t *sc12 = hdr + 4;
+
+        /* Per-lane scale + min (lane=16 elements; 2 lanes per sub-block). */
+        float dlane[16], neg_mlane[16];
+        for (int s = 0; s < 8; s++) {
+            uint8_t sc, mn;
+            q4k_sm(s, sc12, &sc, &mn);
+            const float d  = d_super    * (float) sc;
+            const float nm = -(dmin_super * (float) mn);
+            dlane[s*2]     = d;  dlane[s*2 + 1] = d;
+            neg_mlane[s*2] = nm; neg_mlane[s*2 + 1] = nm;
+        }
+
+        /* Load this block's canonical qs (128 bytes = 16 lanes of 8 bytes). */
+        __vr qs_v       = _vel_vld_vssl(8, (void *) blk, 16);
+        __vr mask_f     = _vel_vbrdl_vsl(0x0FUL, 16);
+        __vr dlane_v    = _vel_vldu_vssl(4, (void *) dlane, 16);
+        __vr neg_mlane_v = _vel_vldu_vssl(4, (void *) neg_mlane, 16);
+
+        /* Per nibble position k: extract, convert, scale, store strided.
+         * Strided store: lane i contributes element [16i + k] of the row.
+         * For block b, output offset = b * 256 + 16i + k → store at
+         * stride 64 bytes (16 floats = stride between consecutive lanes
+         * in same nibble position) starting at offset 4*(b*256 + k). */
+        float *blk_out = row_f32 + (size_t) b * 256;
+        for (int k = 0; k < 16; k++) {
+            __vr nib   = _vel_vand_vvvl(_vel_vsrl_vvsl(qs_v, 4 * k, 16), mask_f, 16);
+            __vr nib_f = _vel_vcvtsw_vvl(nib, 16);
+            __vr fp32_out = _vel_vfmads_vvvvl(neg_mlane_v, dlane_v, nib_f, 16);
+            /* vstu: store upper 32 bits (the fp32) at stride 64 bytes. */
+            _vel_vstu_vssl(fp32_out, 64, (void *)(blk_out + k), 16);
+        }
+    }
+
+    /* F32 dot product on the cache-resident row buffer. */
+    const int K_total = nb * 256;
+    __vr acc = _vel_vbrds_vsl(0.0f, 256);
+    int kk = 0;
+    while (kk + 256 <= K_total) {
+        __vr w  = _vel_vldu_vssl(4, (void *)(row_f32 + kk), 256);
+        __vr xv = _vel_vldu_vssl(4, (void *)(x       + kk), 256);
+        acc = _vel_vfmads_vvvvl(acc, w, xv, 256);
+        kk += 256;
+    }
+    if (kk < K_total) {
+        int rem = K_total - kk;
+        __vr w  = _vel_vldu_vssl(4, (void *)(row_f32 + kk), rem);
+        __vr xv = _vel_vldu_vssl(4, (void *)(x       + kk), rem);
+        acc = _vel_vfmads_vvvvl(acc, w, xv, rem);
+    }
+    acc = _vel_vfsums_vvl(acc, 256);
+    return _vel_lvss_svs(acc, 0);
+}
+
 /* 4-row unrolled variant. Processes 4 rows in parallel, sharing one x_perm
  * load across all 4 rows for each nibble position. The dlane/mlane builds
  * are still per-row but the inner FMA chains share x loads, which halves

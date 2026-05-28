@@ -26,6 +26,9 @@ extern float q4k_full_row_dot_xperm_extern(const uint8_t *qs_row,
                                             const float *sx_full, int nb);
 extern void  q4k_build_x_perm_extern(const float *x, float *x_perm, int K);
 extern void  q4k_build_sx_full_extern(const float *x, float *sx_full, int K);
+extern float q4k_full_row_dot_tile_extern(const uint8_t *qs_row,
+                                           const uint8_t *hdr_row,
+                                           const float *x, int nb);
 extern void  q4k_full_4rows_xperm_extern(const uint8_t *qs_r0, const uint8_t *qs_r1,
                                            const uint8_t *qs_r2, const uint8_t *qs_r3,
                                            const uint8_t *hdr_r0, const uint8_t *hdr_r1,
@@ -83,11 +86,23 @@ uint64_t ve_q4k_matvec_full_hbm(uint64_t y_vptr, uint64_t qs_vptr,
     /* Single-row only for now. The 8-row variant allocates 8x ~2KB of
      * stack arrays per call which may overflow VE thread stacks on
      * deep models (64-layer Qwen3.6-27B crashed in node 57). */
-    #pragma omp parallel for num_threads(nthr)
-    for (uint64_t m = 0; m < M; m++) {
-        y[m] = q4k_full_row_dot_xperm_extern(qs  + m * row_qs_bytes,
-                                              hdr + m * row_hdr_bytes,
-                                              x_perm, sx_full, nb);
+    /* GGML_VE_Q4K_TILE=1 selects the tile-based dequant-to-F32-cache
+     * variant (per-row F32 buffer stays in L1/LLC, then F32 dot). */
+    const int use_tile = (getenv("GGML_VE_Q4K_TILE") != NULL);
+    if (use_tile) {
+        #pragma omp parallel for num_threads(nthr)
+        for (uint64_t m = 0; m < M; m++) {
+            y[m] = q4k_full_row_dot_tile_extern(qs + m * row_qs_bytes,
+                                                 hdr + m * row_hdr_bytes,
+                                                 x, nb);
+        }
+    } else {
+        #pragma omp parallel for num_threads(nthr)
+        for (uint64_t m = 0; m < M; m++) {
+            y[m] = q4k_full_row_dot_xperm_extern(qs  + m * row_qs_bytes,
+                                                  hdr + m * row_hdr_bytes,
+                                                  x_perm, sx_full, nb);
+        }
     }
     /* don't free x_perm -- reused across calls */
     return 0;
