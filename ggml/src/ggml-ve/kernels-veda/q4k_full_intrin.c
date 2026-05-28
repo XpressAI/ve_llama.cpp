@@ -121,17 +121,35 @@ float q4k_full_row_dot_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
 
 /* Permuted-x variant: x_perm[k * n_lanes + i] = x[16*i + k] where
  * n_lanes = nb * 16. Caller builds once per matvec to make x loads
- * sequential inside the inner extract loop. */
+ * sequential inside the inner extract loop. sx_full[i] = Σ_k x[16i+k]
+ * precomputed so the inner can apply the -m*Σx correction once per
+ * chunk instead of per nibble extract. */
 float q4k_full_row_dot_xperm_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
-                                     const float *x_perm, int nb);
+                                     const float *x_perm, const float *sx_full,
+                                     int nb);
 
-/* Build x_perm. Called once per matvec by the dispatcher. */
+/* Build x_perm AND sx_full (Σ x per lane) in a single pass.
+ * sx_full[lane] = Σ_{k=0..15} x[16*lane + k]
+ * Used by the optimised single-FMA inner kernel to apply the -m * Σx
+ * correction outside the per-element loop. */
 void q4k_build_x_perm_extern(const float *x, float *x_perm, int K) {
     const int n_lanes = K / 16;
     for (int k = 0; k < 16; k++) {
         for (int i = 0; i < n_lanes; i++) {
             x_perm[k * n_lanes + i] = x[16 * i + k];
         }
+    }
+}
+
+void q4k_build_sx_full_extern(const float *x, float *sx_full, int K) {
+    const int n_lanes = K / 16;
+    for (int i = 0; i < n_lanes; i++) {
+        float s = 0.0f;
+        #pragma _NEC ivdep
+        for (int k = 0; k < 16; k++) {
+            s += x[16 * i + k];
+        }
+        sx_full[i] = s;
     }
 }
 
@@ -227,7 +245,8 @@ float q4k_full_row_dot_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
  * Loads are now SEQUENTIAL (stride=4). Also fuses vfmuls + vfsubs into a
  * single vfmads by pre-negating m: w = d*nib - m  →  vfmads(neg_m, d, nib). */
 float q4k_full_row_dot_xperm_extern(const uint8_t *qs_row, const uint8_t *hdr_row,
-                                     const float *x_perm, int nb) {
+                                     const float *x_perm, const float *sx_full,
+                                     int nb) {
     float acc_scalar = 0.0f;
     const int n_lanes_total = nb * 16;
     int blk_offset = 0;
@@ -263,36 +282,49 @@ float q4k_full_row_dot_xperm_extern(const uint8_t *qs_row, const uint8_t *hdr_ro
             }
         }
 
-        __vr qs_v       = _vel_vld_vssl(8, (void *)qs_chunk, VL);
-        __vr mask_f     = _vel_vbrdl_vsl(0x0FUL, VL);
-        __vr dlane_v    = _vel_vldu_vssl(4, (void *) dlane, VL);
-        __vr neg_mlane_v = _vel_vldu_vssl(4, (void *) neg_mlane, VL);
+        __vr qs_v   = _vel_vld_vssl(8, (void *)qs_chunk, VL);
+        __vr mask_f = _vel_vbrdl_vsl(0x0FUL, VL);
 
-        /* 4 parallel accumulators to break the FMA dependency chain.
-         * Without this, each acc_v = vfmads(acc_v, w, x) waits for the
-         * previous FMA's 5-cycle latency. With 4 independent chains, the
-         * pipeline stays full. */
-        __vr acc0 = _vel_vbrds_vsl(0.0f, VL);
-        __vr acc1 = _vel_vbrds_vsl(0.0f, VL);
-        __vr acc2 = _vel_vbrds_vsl(0.0f, VL);
-        __vr acc3 = _vel_vbrds_vsl(0.0f, VL);
-        __vr * accs[4] = {&acc0, &acc1, &acc2, &acc3};
+        /* Decompose: y = Σ (d*nib - m)*x = d * Σ(nib*x) - m * Σx.
+         * Σx per lane is precomputed below ONCE per call (cheap; doesn't
+         * depend on row). The inner loop then needs only ONE FMA per
+         * nibble extract (sum_nibx += nib * x) instead of two (w = d*nib
+         * - m; acc += w * x). The d/m multiply happens once per chunk
+         * outside the loop.
+         *
+         * 4-way ILP on sum_nibx accumulators (8-way and 16-way tested,
+         * no gain -- inner is now too short to benefit from more chains). */
+        __vr s0 = _vel_vbrds_vsl(0.0f, VL);
+        __vr s1 = _vel_vbrds_vsl(0.0f, VL);
+        __vr s2 = _vel_vbrds_vsl(0.0f, VL);
+        __vr s3 = _vel_vbrds_vsl(0.0f, VL);
+        __vr * acs[4] = {&s0, &s1, &s2, &s3};
 
         for (int k = 0; k < 16; k++) {
-            __vr nib = _vel_vand_vvvl(_vel_vsrl_vvsl(qs_v, 4 * k, VL),
-                                      mask_f, VL);
+            __vr nib   = _vel_vand_vvvl(_vel_vsrl_vvsl(qs_v, 4 * k, VL),
+                                        mask_f, VL);
             __vr nib_f = _vel_vcvtsw_vvl(nib, VL);
             __vr xv = _vel_vldu_vssl(4,
                 (void *)(x_perm + k * n_lanes_total + lane_off), VL);
-            __vr w = _vel_vfmads_vvvvl(neg_mlane_v, dlane_v, nib_f, VL);
-            *accs[k & 3] = _vel_vfmads_vvvvl(*accs[k & 3], w, xv, VL);
+            *acs[k & 3] = _vel_vfmads_vvvvl(*acs[k & 3], nib_f, xv, VL);
         }
-        /* Sum accumulators, then reduce. */
-        acc0 = _vel_vfadds_vvvl(acc0, acc1, VL);
-        acc2 = _vel_vfadds_vvvl(acc2, acc3, VL);
-        acc0 = _vel_vfadds_vvvl(acc0, acc2, VL);
-        acc0 = _vel_vfsums_vvl(acc0, VL);
-        acc_scalar += _vel_lvss_svs(acc0, 0);
+        s0 = _vel_vfadds_vvvl(s0, s1, VL);
+        s2 = _vel_vfadds_vvvl(s2, s3, VL);
+        s0 = _vel_vfadds_vvvl(s0, s2, VL);
+
+        /* sx_full was precomputed by dispatcher (build_sx_full_extern):
+         * sx_full[i] = Σ_k x[16i + k]. Per chunk we need lanes
+         * [lane_off..lane_off+VL-1] which is just a sequential slice. */
+        __vr dlane_v   = _vel_vldu_vssl(4, (void *) dlane, VL);
+        __vr nmlane_v  = _vel_vldu_vssl(4, (void *) neg_mlane, VL);
+        __vr sx_lane_v = _vel_vldu_vssl(4, (void *)(sx_full + lane_off), VL);
+
+        /* y_lane = dlane * sum_nibx + (-mlane) * sum_x_lane */
+        __vr y_lane = _vel_vfmads_vvvvl(
+            _vel_vfmuls_vvvl(nmlane_v, sx_lane_v, VL),
+            dlane_v, s0, VL);
+        y_lane = _vel_vfsums_vvl(y_lane, VL);
+        acc_scalar += _vel_lvss_svs(y_lane, 0);
         blk_offset += chunk_nb;
     }
     return acc_scalar;
