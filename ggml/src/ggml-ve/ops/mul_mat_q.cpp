@@ -22,6 +22,57 @@ namespace ops {
 
 namespace {
 
+/* ---- Q4_K routing: canon (default) vs direct-std (big models) ----
+ *
+ * canon path  : pre-reordered nibbles + 64 B/blk decoded headers cached in
+ *               HBM. Fastest per-matvec, but DOUBLES the Q4_K HBM footprint
+ *               (raw + canon). Great for models that fit; OOMs ~27B-class.
+ * direct path : reads the standard 144 B/blk layout in place, packed pvfmad
+ *               VL=256 kernel. ~2x SLOWER per-matvec than canon on small
+ *               models, but no HBM doubling -> the only thing that fits big
+ *               models, and 2.2x faster than canon-N=1 there.
+ *
+ * Decision is made ONCE (memoized) by sampling free HBM after weights are
+ * resident: a big model leaves little free, so route it to direct; a small
+ * model leaves lots free, so route it to canon. Cut at total/2 by default
+ * (27B leaves ~22 GB free of 48; 1B leaves ~43 GB -- wide margin).
+ *
+ * Escape hatches:
+ *   GGML_VE_Q4K_FORCE_DIRECT=1 / GGML_VE_Q4K_DIRECT=1  -> always direct
+ *   GGML_VE_Q4K_FORCE_CANON=1                          -> always canon
+ *   GGML_VE_Q4K_DIRECT_FREE_MB=<n>                     -> custom threshold
+ *
+ * Returns true => use direct-std path (and accept N>1). */
+bool q4k_route_is_direct() {
+    static std::atomic<int> route{-1};  // -1 undecided, 0 canon, 1 direct
+    int d = route.load(std::memory_order_relaxed);
+    if (d >= 0) return d == 1;
+
+    if (std::getenv("GGML_VE_Q4K_FORCE_CANON")) { route.store(0); return false; }
+    if (std::getenv("GGML_VE_Q4K_FORCE_DIRECT") ||
+        std::getenv("GGML_VE_Q4K_DIRECT")) { route.store(1); return true; }
+
+    size_t mem_free = 0, mem_total = 0;
+    if (vedaMemGetInfo(&mem_free, &mem_total) != VEDA_SUCCESS || mem_total == 0) {
+        // No live context yet (e.g. called from schedule before any compute).
+        // Don't memoize -- stay on the safe canon default and let a later
+        // call (with a live context) make the real decision.
+        return false;
+    }
+    const char * th = std::getenv("GGML_VE_Q4K_DIRECT_FREE_MB");
+    const size_t thresh = th
+        ? (size_t) std::strtoull(th, nullptr, 10) * 1024ull * 1024ull
+        : mem_total / 2;
+    const int dec = (mem_free < thresh) ? 1 : 0;
+    route.store(dec);
+    if (std::getenv("GGML_VE_Q4K_DEBUG")) {
+        fprintf(stderr, "[Q4K-ROUTE] free=%zu MB total=%zu MB thresh=%zu MB -> %s\n",
+                mem_free / (1024 * 1024), mem_total / (1024 * 1024),
+                thresh / (1024 * 1024), dec ? "DIRECT" : "canon");
+    }
+    return dec == 1;
+}
+
 bool is_supported_quant_type(ggml_type t) {
     // Q8_0: all-HBM fused kernel.
     // Q4_K: canonical-nibble + qs/hdr-split HBM kernel. Microbench: 94x
@@ -134,12 +185,14 @@ bool mul_mat_q_supports(const ggml_tensor * op) {
         return false;
     };
 
-    /* N>1 currently CRASHES the kernel chain (likely cache reentry or
-     * VEDA arg lifetime issue across queued launches). Reverting to
-     * N=1 only until investigated. The dispatch code that loops N times
-     * is left in place for when the underlying issue is fixed.
-     * Opt-in for testing: GGML_VE_Q4K_N_GT_1=1 to try N>1 path. */
-    if (w->type == GGML_TYPE_Q4_K && std::getenv("GGML_VE_Q4K_N_GT_1") != nullptr) {
+    /* N>1 acceptance for Q4_K is tied to routing: the direct-std path
+     * handles N>1 (loops matvec per column) without the canon HBM
+     * doubling that OOMs big models. When routed to canon we keep N=1
+     * only (prompt-eval N>1 falls to CPU -- correct, and canon's 2x HBM
+     * blowup at N>1 is exactly what we avoid). GGML_VE_Q4K_N_GT_1=1
+     * forces N>1 acceptance regardless (legacy testing hook). */
+    if (w->type == GGML_TYPE_Q4_K &&
+        (q4k_route_is_direct() || std::getenv("GGML_VE_Q4K_N_GT_1") != nullptr)) {
         if (N < 1) return reject("N<1");
     } else {
         if (N != 1) return reject("N!=1");
@@ -215,12 +268,11 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
         const char * name = (w->name && w->name[0]) ? w->name : nullptr;
         const int64_t N = dst->ne[1];
 
-        /* GGML_VE_Q4K_DIRECT=1: direct-dispatch on the standard 144-B/blk
-         * layout. NO canon cache, NO 192/144 storage blow-up, NO host
-         * bounce. Slower per-call than the canon path (low VL=8 vs 256)
-         * but it's the only way 27B Q4_K_M fits on a single 48 GB VE when
-         * we also need raw weights on VE_HBM. */
-        if (std::getenv("GGML_VE_Q4K_DIRECT") != nullptr) {
+        /* Direct-dispatch on the standard 144-B/blk layout (chunked+packed
+         * VL=256). NO canon cache, NO 192/144 storage blow-up. Routed here
+         * automatically for big models (q4k_route_is_direct() samples free
+         * HBM); small models fall through to canon below. */
+        if (q4k_route_is_direct()) {
             const VEDAdeviceptr w_raw_hbm = ctx->resolve_in(w);
             if (w_raw_hbm == 0) return false;
 
