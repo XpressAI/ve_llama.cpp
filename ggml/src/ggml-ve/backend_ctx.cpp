@@ -46,13 +46,28 @@ VEDAdeviceptr backend_context::resolve_in_slow(const ggml_tensor * t) {
     // Within a single VE graph split, if an earlier VE op wrote to this
     // same CPU-backed tensor and queued the DtoH copy, the fresh data
     // lives in temp_hbm. The CPU bytes are stale until flush() runs.
-    // Search REVERSE because resolve_out enforces uniqueness on host_dst
-    // (it drops stale entries when a new write hits the same address),
-    // so the latest matching entry is the only one. Return its temp_hbm
-    // directly -- no extra HtoD, no chance of reading stale host bytes.
-    for (auto it = deferred_dtoh_.rbegin(); it != deferred_dtoh_.rend(); ++it) {
-        if (it->host_dst == t->data && it->size == size) {
-            return it->temp_hbm;
+    //
+    // KNOWN-BUG: this returns the WRONG entry on Q-quant models where
+    // CPU MUL_MATs and VE ops alternate frequently. The deferred queue
+    // ends up holding stale entries whose host_dst matches a freshly
+    // CPU-written tensor (because the cgraph allocator reuses the same
+    // CPU memory address for tensors at different points in the graph,
+    // and resolve_out's same-address purge only fires when the new
+    // writer is also VE — a CPU writer between two VE ops leaves the
+    // stale entry intact). GGML_VE_QUANT_SAFE_MODE=1 (or
+    // GGML_VE_NO_FRESH_HIT=1) skips the lookup; combined with always-on
+    // per-op sync (also flipped by QUANT_SAFE_MODE) this gives correct
+    // output on Q-quant models at ~9% perf cost on BF16 and 58× speedup
+    // + correctness on Q4_K_M (vs the broken default). The minimal
+    // correct fix is open in task #60.
+    static const bool no_fresh_hit =
+        std::getenv("GGML_VE_NO_FRESH_HIT") != nullptr ||
+        std::getenv("GGML_VE_QUANT_SAFE_MODE") != nullptr;
+    if (!no_fresh_hit) {
+        for (auto it = deferred_dtoh_.rbegin(); it != deferred_dtoh_.rend(); ++it) {
+            if (it->host_dst == t->data && it->size == size) {
+                return it->temp_hbm;
+            }
         }
     }
     // Transient activation: temp HBM, freed after sync. With canary

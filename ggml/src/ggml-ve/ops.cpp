@@ -198,10 +198,26 @@ static bool compute_forward_inner(backend_context * ctx, ggml_tensor * node);
 
 bool compute_forward(backend_context * ctx, ggml_tensor * node) {
     static const bool profile = (std::getenv("GGML_VE_PROFILE_PEROP") != nullptr);
-    if (!profile) {
+    static const bool quant_safe = (std::getenv("GGML_VE_QUANT_SAFE_MODE") != nullptr);
+    // Plain fast path — no per-op work.
+    if (!profile && !quant_safe) {
         return compute_forward_inner(ctx, node);
     }
-    // Register atexit print once.
+    // QUANT_SAFE_MODE: per-op flush, no profiling overhead. Required for
+    // correctness on Q-quant models (see backend_ctx.cpp fresh-hit
+    // KNOWN-BUG comment + task #60). The pre-flush ensures the deferred
+    // queue is empty before this op's resolve_in lookups (so an entry
+    // queued by a prior op's resolve_out can't be mis-matched). The
+    // post-flush + sync guarantees CPU memory is fresh by the time the
+    // next op starts, so resolve_in's CPU-upload returns valid bytes.
+    if (quant_safe && !profile) {
+        ctx->flush("quant_safe pre");
+        bool ok = compute_forward_inner(ctx, node);
+        ctx->flush("quant_safe post");
+        vedaCtxSynchronize();
+        return ok;
+    }
+    // PROFILE_PEROP (with or without quant_safe): timed per-op sync.
     if (!g_perop_registered.exchange(true)) {
         std::atexit(perop_print);
     }
