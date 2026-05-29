@@ -110,7 +110,13 @@ struct TracedOp {
                  float ext_factor, beta_fast, beta_slow; int n_ctx_orig; } rope;
         struct { float scale, max_bias, softcap;
                  int   kv_type; int64_t n_kv_heads;
-                 size_t nb_k1, nb_k2, nb_v1, nb_v2; }                 flash_attn;
+                 size_t nb_k1, nb_k2, nb_v1, nb_v2;
+                 // Q byte strides (src0 nb): per-token (nb1) and per-head (nb2).
+                 // For prompt eval Q is permuted [D,N,H] so the head stride is
+                 // N*D*4, not D*4 — the decode _inner assumed contiguous heads.
+                 size_t q_nb1, q_nb2;
+                 // dst byte strides: per-head (nb1) and per-token (nb2).
+                 size_t o_nb1, o_nb2; }                               flash_attn;
     } p;
 };
 
@@ -184,7 +190,14 @@ struct CompiledGraph {
     // a syscall pair (codex finding #4). Freed when the CompiledGraph
     // is destroyed.
     VEDAhmemptr  in_hmem  = 0;
+    size_t       in_cap   = 0;   // bytes allocated for in_hmem (n_tok token ids)
     VEDAhmemptr  out_hmem = 0;
+
+    // Per-token positions (i32, n_tok entries) staged from the ROPE inp_pos /
+    // SET_ROWS index leaf each execute(). Drives ROPE angles, SET_ROWS KV-cell
+    // rows and (for N>1) per-query causal seq_len. One entry for decode.
+    VEDAhmemptr  pos_hmem = 0;
+    size_t       pos_cap  = 0;   // bytes allocated for pos_hmem
 
     // Per-slot HBM scratch for CPU-resident operands. The ggml scheduler
     // parks a handful of small boundary tensors (cross-split hidden states,
@@ -230,6 +243,10 @@ public:
     int num_traced_ops() const { return (int) traced_ops_.size(); }
 
 private:
+    // n_tokens of the traced cgraph (1 = decode, >1 = prompt eval). Used to
+    // divide baked element counts down to per-token constants so the codegen
+    // can scale by the runtime n_tok arg (size-independent across N).
+    int64_t                             n_tok_baked_ = 1;
     std::vector<TracedOp>               traced_ops_;
     std::unordered_map<const ggml_tensor *, int> tensor_buf_idx_;
     std::unordered_map<const ggml_tensor *, BufferKind> tensor_buf_kind_;

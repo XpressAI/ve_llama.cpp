@@ -263,66 +263,30 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
     // graphs work as long as at most one is WEIGHT-backed — same
     // constraint the legacy backend operates under.
 
-    // Reject multi-token (prompt-eval) shapes — the codegen bakes a
-    // per-token element count into the .so and would run off the end
-    // on the subsequent decode call. Shape semantics differ by op:
-    //   - Hidden-state ops carry n_tokens in ne[2].
-    //   - FLASH_ATTN_EXT Q is permuted to [D, N, H, B] — n_tokens is ne[1],
-    //     ne[2] holds heads. K/V grow seq-wise but that's allowed.
-    //   - SET_ROWS dst is the KV-cache view; ne[1..2] are layout, not tokens.
-    //   - ne[3] > 1 is always a real batch dim.
-    auto is_multi_token = [&](const ggml_tensor * t,
-                              ggml_op for_op,
-                              bool is_dst,
-                              int src_slot) {
-        if (!t) return false;
-        if (t->ne[3] > 1) return true;
-        if (for_op == GGML_OP_FLASH_ATTN_EXT) {
-            // FA Q (src[0]) and dst exist in two shape conventions depending
-            // on how the FA result is permuted: [D, N, H, B] (n_tokens in
-            // ne[1], heads in ne[2]) OR [D, H, N, B] (heads in ne[1],
-            // n_tokens in ne[2]). At decode either way N=1, so accept as
-            // long as the *product* of ne[1] and ne[2] is small.
-            //   K/V (src[1..2]) grow seq-wise on ne[1] — KV cache, allowed.
-            if (is_dst || src_slot == 0) {
-                // Accept any FA Q / dst where total "token slots" across
-                // ne[1]*ne[2] equals heads*1 (decode) — i.e. one of the two
-                // dims is exactly 1. Multi-token prompt eval has both > 1.
-                return (t->ne[1] > 1) && (t->ne[2] > 1);
-            }
-            return false;
-        }
-        if (for_op == GGML_OP_SET_ROWS && is_dst) {
-            // dst is the KV-cache view; its ne[1..2] are layout, not tokens.
-            return false;
-        }
-        return t->ne[2] > 1;
-    };
-    for (int s = 0; s < GGML_MAX_SRC; ++s) {
-        const ggml_tensor * src = node->src[s];
-        if (!src) continue;
-        if (is_multi_token(src, node->op, /*is_dst=*/false, s)) {
-            if (debug_enabled()) {
-                fprintf(stderr, "[VE-GC] refuse: '%s' src[%d] is multi-token [%ld,%ld,%ld,%ld]\n",
-                        node->name ? node->name : "?", s,
-                        src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
-            }
-            return false;
-        }
-    }
-    if (is_multi_token(node, node->op, /*is_dst=*/true, -1)) {
+    // Multi-token prompt eval (N>1) is compiled into one fused kernel: every op
+    // divides its baked element/row counts by n_tok_baked_ and re-scales by the
+    // runtime n_tok arg — MUL_MAT loops n_tok columns, FLASH_ATTN loops n_tok
+    // query tokens through the strided _inner with seq_len=positions[t]+1 as the
+    // causal mask, ROPE/SET_ROWS index positions[t], element-wise scale by
+    // n_tok. The graph's last-token slice (GET_ROWS inp_out_ids) makes the tail
+    // (final norm, lm_head) n_out-shaped, so per-op `scales_n` keeps those on
+    // their own count. Verified token-for-token vs the interpreter.
+    // A real batch dim (ne[3] > 1) is still refused (needs another loop level).
+    // GGML_VE_GC_NO_NGT1=1 forces decode-only routing (interpreter prompt eval)
+    // as a debugging escape hatch.
+    if (node->ne[3] > 1) {
         if (debug_enabled()) {
-            fprintf(stderr, "[VE-GC] refuse: '%s' dst is multi-token [%ld,%ld,%ld,%ld]\n",
-                    node->name ? node->name : "?",
-                    node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+            fprintf(stderr, "[VE-GC] refuse: '%s' dst has batch ne[3]=%ld\n",
+                    node->name ? node->name : "?", node->ne[3]);
         }
         return false;
     }
-    if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] > 1) {
-        if (debug_enabled()) {
-            fprintf(stderr, "[VE-GC] refuse: '%s' is batched MUL_MAT N=%ld (prompt eval)\n",
-                    node->name ? node->name : "?", node->src[1]->ne[1]);
-        }
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const ggml_tensor * src = node->src[s];
+        if (src && src->ne[3] > 1) return false;
+    }
+    if (std::getenv("GGML_VE_GC_NO_NGT1") != nullptr &&
+        node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] > 1) {
         return false;
     }
 
@@ -399,8 +363,22 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
             op.p.flash_attn.nb_k2      = K->nb[2];
             op.p.flash_attn.nb_v1      = V->nb[1];
             op.p.flash_attn.nb_v2      = V->nb[2];
+            // Q (src0) per-token and per-head byte strides, and dst per-head /
+            // per-token byte strides. These let one strided kernel serve both
+            // decode (contiguous: q_nb2 == D*4) and prompt eval (q_nb2 == N*D*4).
+            op.p.flash_attn.q_nb1      = node->src[0]->nb[1];
+            op.p.flash_attn.q_nb2      = node->src[0]->nb[2];
+            op.p.flash_attn.o_nb1      = node->nb[1];
+            op.p.flash_attn.o_nb2      = node->nb[2];
             if (op.p.flash_attn.kv_type != (int) GGML_TYPE_BF16 &&
                 op.p.flash_attn.kv_type != (int) GGML_TYPE_F32) {
+                return false;
+            }
+            // No strided F32-KV _inner yet: refuse F32-KV prompt eval (N>1) so
+            // it stays on the interpreter. BF16 KV (our default) has the
+            // strided variant and handles N>1.
+            if (op.p.flash_attn.kv_type == (int) GGML_TYPE_F32 &&
+                node->src[0]->ne[1] > 1) {
                 return false;
             }
             break;
@@ -514,6 +492,16 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     q4k_specs_.clear();
     vebp_specs_.clear();
     trace_valid_ = true;
+
+    // n_tokens of this cgraph: 1 = decode, N = prompt eval. Any MUL_MAT's dst
+    // is [out_dim, N], so its ne[1] is the token count. Used to divide baked
+    // element counts to per-token constants (the codegen then scales by the
+    // runtime n_tok arg, so one .so serves any prompt length).
+    n_tok_baked_ = 1;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n && n->op == GGML_OP_MUL_MAT && n->ne[1] > 1) { n_tok_baked_ = n->ne[1]; break; }
+    }
 
     // Pre-pass: refuse if any weight tensor referenced by this cgraph
     // isn't already on a VE_HBM buffer. The compiled kernel takes the
@@ -716,8 +704,30 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
     int64_t n = per_token_n(op);
     if (n == 0) n = op.ne[0];
 
+    // N>1 prompt-eval support: the traced shapes bake in n_tok_baked_ tokens.
+    // We divide every baked element/row count down to a PER-TOKEN constant and
+    // re-scale by the runtime `n_tok` arg, so one compiled graph serves any
+    // token count and decode (n_tok==1) is byte-equivalent to the old codegen.
+    const int64_t NB = (n_tok_baked_ > 0) ? n_tok_baked_ : 1;
+    int64_t full = op.ne[0] * op.ne[1] * op.ne[2] * op.ne[3];
+    if (full == 0) full = op.ne[0];
+    // Does this op scale with the graph token count? The prompt graph has a
+    // last-token slice (GET_ROWS inp_out_ids) after which the tail (final norm,
+    // lm_head) is n_out(=1)-shaped, NOT N. An op scales with N iff a token dim
+    // equals NB; the n_out tail keeps its own (baked) count. SET_ROWS / ROPE /
+    // FA always loop n_tok directly (handled in their cases).
+    const bool scales_n = (NB > 1) && (op.ne[1] == NB || op.ne[2] == NB);
+    const int64_t pt = scales_n ? (full / NB) : full;  // per-token elem count
+    // Loop count for the token dim: runtime n_tok when the op scales with N,
+    // else the op's literal column count (1 for the lm_head tail).
+    const std::string col_n = scales_n ? std::string("n_tok")
+                                       : std::to_string(op.ne[1] > 0 ? op.ne[1] : 1);
+    // Element range for element-wise ops: pt*n_tok when scaling, else full.
+    const std::string elem_n = scales_n ? (std::to_string(pt) + "LL * n_tok")
+                                        : (std::to_string(full) + "LL");
+
     ss << "    // op " << idx << ": " << op_type_name(op.type)
-       << "  '" << op.name << "'  n=" << n << "\n";
+       << "  '" << op.name << "'  n=" << n << " pt=" << pt << " NB=" << NB << "\n";
 
     switch (op.type) {
         case OpType::GET_ROWS: {
@@ -727,44 +737,87 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             // next op sees the result.
             ss << "    #pragma omp single\n";
             ss << "    {\n";
+            ss << "        int  edim = " << op.ne[0] << ";\n";
             if (op.src0_kind != BufferKind::WEIGHT) {
-                ss << "        memcpy(" << dst << ", " << src0 << ", "
-                   << (op.ne[0] * sizeof(float)) << ");\n";
+                // Output-row selection: GET_ROWS(hidden_state, inp_out_ids).
+                // llama computes logits for n_out tokens only; for prompt eval
+                // n_out is usually 1 (the LAST token) or N (all tokens). The
+                // selected rows are the trailing n_out of the n_tok inputs, so
+                // copy from row (n_tok - n_out). Decode: n_out==1, n_tok==1 →
+                // row 0. (Arbitrary inp_out_ids would need the index array;
+                // those configs are not used by llama-completion.)
+                int64_t n_out = op.ne[1] > 0 ? op.ne[1] : 1;
+                ss << "        long n_out = " << n_out << "LL;\n";
+                ss << "        memcpy(" << dst << ", (const char*)" << src0
+                   << " + (n_tok - n_out) * " << (op.ne[0] * sizeof(float)) << "LL, "
+                   << "n_out * " << (op.ne[0] * sizeof(float)) << "LL);\n";
                 ss << "    }\n";
                 break;
             }
-            ss << "        int32_t tok = ((int32_t*)input)[0];\n";
-            ss << "        int  edim = " << op.ne[0] << ";\n";
+            // Embedding lookup for each of the n_tok input ids (input[t]).
+            ss << "        for (int64_t t = 0; t < n_tok; t++) {\n";
+            ss << "            int32_t tok = ((int32_t*)input)[t];\n";
             if (op.src_type == GGML_TYPE_BF16) {
-                ss << "        const uint32_t* row32 = (const uint32_t*)"
+                ss << "            const uint32_t* row32 = (const uint32_t*)"
                    << src0 << " + ((int64_t)tok * edim) / 2;\n";
-                ss << "        uint32_t* dst32 = (uint32_t*)" << dst << ";\n";
-                ss << "        int half = edim / 2;\n";
-                ss << "        #pragma _NEC ivdep\n";
-                ss << "        for (int i = 0; i < half; i++) {\n";
-                ss << "            uint32_t p = row32[i];\n";
-                ss << "            dst32[2*i  ] = (p & 0xFFFFu) << 16;\n";
-                ss << "            dst32[2*i+1] = p & 0xFFFF0000u;\n";
-                ss << "        }\n";
+                ss << "            uint32_t* dst32 = (uint32_t*)" << dst << " + t * edim;\n";
+                ss << "            int half = edim / 2;\n";
+                ss << "            #pragma _NEC ivdep\n";
+                ss << "            for (int i = 0; i < half; i++) {\n";
+                ss << "                uint32_t p = row32[i];\n";
+                ss << "                dst32[2*i  ] = (p & 0xFFFFu) << 16;\n";
+                ss << "                dst32[2*i+1] = p & 0xFFFF0000u;\n";
+                ss << "            }\n";
             } else {
-                ss << "        memcpy(" << dst << ", (float*)" << src0
+                ss << "            memcpy((float*)" << dst << " + t * edim, (float*)" << src0
                    << " + (int64_t)tok * edim, edim * sizeof(float));\n";
             }
+            ss << "        }\n";
             ss << "    }\n";
             break;
         }
 
         case OpType::RMS_NORM: {
             int64_t cols  = op.ne[0];
-            int64_t rows  = (op.ne[1] > 1) ? op.ne[1] : 1;
-            bool per_head = (cols <= 256 && rows > 1);
+            // rows-per-token (baked): total rows / n_tok_baked_. For Q/K-norm
+            // this is n_heads; for the residual norms it is 1.
+            int64_t rpt   = (cols > 0) ? (full / NB) / cols : 1;
+            if (rpt < 1) rpt = 1;
+            int64_t lit_rows = (cols > 0) ? (full / cols) : 1;   // op's own row count
+            if (lit_rows < 1) lit_rows = 1;
+            // Row count: rpt*n_tok when the op scales with N, else the op's own
+            // baked row count (the n_out=1 final-norm tail).
+            const std::string rows_expr = scales_n
+                ? (std::to_string(rpt) + "LL * n_tok")
+                : (std::to_string(lit_rows) + "LL");
+            // Small-cols (per-head Q/K-norm, and any multi-row case): each row
+            // is an independent scalar reduction shared across the team. For
+            // big-cols single-row decode / the n_out=1 tail we keep the hand-
+            // rolled team reduction below.
+            bool per_head = (cols <= 256);
             if (per_head) {
-                // Per-row independent; share rows across the team via omp for.
                 ss << "    {\n";
-                ss << "        int rows = " << rows << ", cols = " << cols << ";\n";
+                ss << "        long rows = " << rows_expr << "; int cols = " << cols << ";\n";
                 ss << "        float eps = " << flit(op.p.rms_norm.eps) << ";\n";
                 ss << "        #pragma omp for\n";
-                ss << "        for (int r = 0; r < rows; r++) {\n";
+                ss << "        for (long r = 0; r < rows; r++) {\n";
+                ss << "            const float* x = (const float*)" << src0 << " + r * cols;\n";
+                ss << "            float* y = (float*)" << dst << " + r * cols;\n";
+                ss << "            float sumsq = 0.f;\n";
+                ss << "            for (int j = 0; j < cols; j++) sumsq += x[j] * x[j];\n";
+                ss << "            float inv = 1.f / sqrtf(sumsq / cols + eps);\n";
+                ss << "            for (int j = 0; j < cols; j++) y[j] = inv * x[j];\n";
+                ss << "        }\n";
+                ss << "    }\n";
+            } else if (scales_n) {
+                // Big-cols, prompt eval (scales with N): rows = rpt * n_tok rows,
+                // each a scalar reduction over cols, distributed across the team.
+                // (At prompt eval there are plenty of rows to keep 8 threads busy.)
+                ss << "    {\n";
+                ss << "        long rows = " << rows_expr << "; int cols = " << cols << ";\n";
+                ss << "        float eps = " << flit(op.p.rms_norm.eps) << ";\n";
+                ss << "        #pragma omp for\n";
+                ss << "        for (long r = 0; r < rows; r++) {\n";
                 ss << "            const float* x = (const float*)" << src0 << " + r * cols;\n";
                 ss << "            float* y = (float*)" << dst << " + r * cols;\n";
                 ss << "            float sumsq = 0.f;\n";
@@ -805,33 +858,30 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
         }
 
         case OpType::MUL: {
-            int64_t src1_n = op.src1_ne[0];
-            if (op.src1_ne[1] > 1 && op.src1_ne[2] > 1) src1_n = op.src1_ne[0] * op.src1_ne[1];
-            if (src1_n > 0 && src1_n < n && n % src1_n == 0) {
-                int64_t repeats = n / src1_n;
-                ss << "    #pragma omp for\n";
-                ss << "    for (int64_t r = 0; r < " << repeats << "; r++) {\n";
-                ss << "        for (int64_t i = 0; i < " << src1_n << "; i++) {\n";
-                ss << "            ((float*)" << dst << ")[r*" << src1_n << "+i] = "
-                   << "((float*)" << src0 << ")[r*" << src1_n << "+i] * "
-                   << "((float*)" << src1 << ")[i];\n";
-                ss << "        }\n";
-                ss << "    }\n";
-            } else {
-                ss << "    #pragma omp for\n";
-                ss << "    for (int i = 0; i < " << n << "; i++) {\n";
-                ss << "        ((float*)" << dst << ")[i] = "
-                   << "((float*)" << src0 << ")[i] * ((float*)" << src1 << ")[i];\n";
-                ss << "    }\n";
-            }
+            // src1 is a per-token-broadcast operand (a norm weight [hidden] or
+            // [head_dim], not token-bearing) OR an element-wise same-shape
+            // tensor. Period = src1's full element count; dst[e] uses
+            // src1[e % period], which is identity when shapes match and a
+            // broadcast otherwise. Loop the full per-token range * n_tok.
+            int64_t src1_period = op.src1_ne[0] * op.src1_ne[1] * op.src1_ne[2] * op.src1_ne[3];
+            if (src1_period == 0) src1_period = op.src1_ne[0];
+            if (src1_period <= 0) src1_period = 1;
+            ss << "    #pragma omp for\n";
+            ss << "    for (int64_t e = 0; e < " << elem_n << "; e++) {\n";
+            ss << "        ((float*)" << dst << ")[e] = "
+               << "((float*)" << src0 << ")[e] * "
+               << "((float*)" << src1 << ")[e % " << src1_period << "LL];\n";
+            ss << "    }\n";
             break;
         }
 
         case OpType::ADD:
+            // src0 and src1 are the same shape (residual + branch). Element-wise
+            // over the full per-token range (pt*n_tok when scaling, else full).
             ss << "    #pragma omp for\n";
-            ss << "    for (int i = 0; i < " << n << "; i++) {\n";
-            ss << "        ((float*)" << dst << ")[i] = "
-               << "((float*)" << src0 << ")[i] + ((float*)" << src1 << ")[i];\n";
+            ss << "    for (int64_t e = 0; e < " << elem_n << "; e++) {\n";
+            ss << "        ((float*)" << dst << ")[e] = "
+               << "((float*)" << src0 << ")[e] + ((float*)" << src1 << ")[e];\n";
             ss << "    }\n";
             break;
 
@@ -841,8 +891,9 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             int64_t M = op.src0_ne[1], K = op.src0_ne[0];
             ss << "    #pragma omp single\n";
             ss << "    {\n";
-            ss << "        ve_f32_matvec_ptr((float*)" << dst << ", (const float*)"
-               << src0 << ", (const float*)" << src1
+            ss << "        for (int64_t col = 0; col < " << col_n << "; col++)\n";
+            ss << "            ve_f32_matvec_ptr((float*)" << dst << " + col*" << M
+               << ", (const float*)" << src0 << ", (const float*)" << src1 << " + col*" << K
                << ", " << M << ", " << K << ");\n";
             ss << "    }\n";
             break;
@@ -862,28 +913,42 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "    {\n";
                 ss << "        int M = " << M << ", K = " << K << ";\n";
                 ss << "        const float* W = (const float*)" << cm << ";\n";
-                ss << "        const float* xv = (const float*)" << src1 << ";\n";
-                ss << "        float* yv = (float*)" << dst << ";\n";
-                ss << "        int nt = omp_get_num_threads();\n";
-                ss << "        int chunk = (M + nt - 1) / nt;\n";
-                ss << "        #pragma omp for\n";
-                ss << "        for (int g = 0; g < nt; g++) {\n";
-                ss << "            int imin = g * chunk;\n";
-                ss << "            int imax = imin + chunk;\n";
-                ss << "            if (imax > M) imax = M;\n";
-                ss << "            if (imin < imax) {\n";
-                ss << "                cblas_sgemv(CblasColMajor, CblasNoTrans,\n";
-                ss << "                            imax - imin, K, 1.0f,\n";
-                ss << "                            W + imin, M, xv, 1, 0.0f,\n";
-                ss << "                            yv + imin, 1);\n";
+                ss << "        float* yv0 = (float*)" << dst << ";\n";
+                ss << "        const float* xv0 = (const float*)" << src1 << ";\n";
+                ss << "        int64_t ncol = " << col_n << ";\n";
+                // For ncol>1 do one column-major GEMM (W[M,K] @ X[K,ncol]); for
+                // ncol==1 (decode, or the n_out=1 lm_head tail) the row-
+                // partitioned SGEMV keeps the 8-thread team busy (cblas_sgemv
+                // is single-threaded).
+                ss << "        if (ncol > 1) {\n";
+                ss << "            #pragma omp single\n";
+                ss << "            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,\n";
+                ss << "                        M, (int)ncol, K, 1.0f, W, M, xv0, K, 0.0f, yv0, M);\n";
+                ss << "        } else {\n";
+                ss << "            int nt = omp_get_num_threads();\n";
+                ss << "            int chunk = (M + nt - 1) / nt;\n";
+                ss << "            #pragma omp for\n";
+                ss << "            for (int g = 0; g < nt; g++) {\n";
+                ss << "                int imin = g * chunk;\n";
+                ss << "                int imax = imin + chunk;\n";
+                ss << "                if (imax > M) imax = M;\n";
+                ss << "                if (imin < imax) {\n";
+                ss << "                    cblas_sgemv(CblasColMajor, CblasNoTrans,\n";
+                ss << "                                imax - imin, K, 1.0f,\n";
+                ss << "                                W + imin, M, xv0, 1, 0.0f,\n";
+                ss << "                                yv0 + imin, 1);\n";
+                ss << "                }\n";
                 ss << "            }\n";
                 ss << "        }\n";
                 ss << "    }\n";
             } else {
                 // _inner variant uses `#pragma omp for` internally — the
-                // implicit barrier at end-of-for synchronises the team.
-                ss << "    ve_bf16_matvec_rowmajor_ptr_inner((float*)" << dst
-                   << ", (const uint16_t*)" << src0 << ", (const float*)" << src1
+                // implicit barrier at end-of-for synchronises the team. Loop
+                // n_tok activation columns (n_tok==1 -> decode); each column is
+                // y[:,col] = W @ x[:,col].
+                ss << "    for (int64_t col = 0; col < " << col_n << "; col++)\n";
+                ss << "        ve_bf16_matvec_rowmajor_ptr_inner((float*)" << dst << " + col*" << M
+                   << ", (const uint16_t*)" << src0 << ", (const float*)" << src1 << " + col*" << K
                    << ", " << M << ", " << K << ");\n";
             }
             break;
@@ -896,10 +961,11 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             int64_t M = op.src0_ne[1], K = op.src0_ne[0];
             std::string qs_p  = "p[" + std::to_string(op.q4k_qs_idx)  + "]";
             std::string hdr_p = "p[" + std::to_string(op.q4k_hdr_idx) + "]";
-            ss << "    ve_q4k_matvec_rowmajor_ptr_inner((float*)" << dst
+            ss << "    for (int64_t col = 0; col < " << col_n << "; col++)\n";
+            ss << "        ve_q4k_matvec_rowmajor_ptr_inner((float*)" << dst << " + col*" << M
                << ", (const unsigned char*)" << qs_p
                << ", (const unsigned char*)" << hdr_p
-               << ", (const float*)" << src1
+               << ", (const float*)" << src1 << " + col*" << K
                << ", " << M << ", " << K << ");\n";
             break;
         }
@@ -912,11 +978,12 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             std::string ws_p  = "p[" + std::to_string(op.vebp_ws_idx)  + "]";
             std::string wn_p  = "p[" + std::to_string(op.vebp_wn_idx)  + "]";
             std::string wsc_p = "p[" + std::to_string(op.vebp_wsc_idx) + "]";
-            ss << "    ve_vebp_matvec_ptr_inner((float*)" << dst
+            ss << "    for (int64_t col = 0; col < " << col_n << "; col++)\n";
+            ss << "        ve_vebp_matvec_ptr_inner((float*)" << dst << " + col*" << M
                << ", (const unsigned long*)" << ws_p
                << ", (const unsigned long*)" << wn_p
                << ", (const float*)" << wsc_p
-               << ", (const float*)" << src1
+               << ", (const float*)" << src1 << " + col*" << K
                << ", " << M << ", " << K << ");\n";
             break;
         }
@@ -930,7 +997,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             // stable across the positional weight-resolution we do at execute
             // time, and src1's slot might point at a model weight.
             ss << "    {\n";
-            ss << "        int32_t pos_i = (int32_t) pos;\n";
+            ss << "        (void) pos;\n";  // per-token positions[] used below
             (void) src1;
             ss << "        int head_size = " << head_sz << ";\n";
             ss << "        int n_heads = " << n_heads << ";\n";
@@ -959,7 +1026,8 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "        float ms_yarn = (ext_factor != 0.f) ? mscale * (1.f + 0.1f * logf(1.f/freq_scale)) : mscale;\n";
                 ss << "        float denom = corr_hi - corr_lo; if (denom < 0.001f) denom = 0.001f;\n";
                 ss << "        #pragma omp for\n";
-                ss << "        for (int h = 0; h < n_heads; h++) {\n";
+                ss << "        for (long th = 0; th < (long)n_heads * n_tok; th++) {\n";
+                ss << "            int32_t pos_i = positions[th / n_heads];\n";
                 ss << "            float theta_extrap = (float)pos_i;\n";
                 ss << "            for (int i = 0; i < half; i++) {\n";
                 ss << "                float theta = freq_scale * theta_extrap;\n";
@@ -973,8 +1041,8 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "                }\n";
                 ss << "                float c = cosf(theta) * ms;\n";
                 ss << "                float s = sinf(theta) * ms;\n";
-                ss << "                int a = h * head_size + i;\n";
-                ss << "                int b = a + half;\n";
+                ss << "                long a = th * (long)head_size + i;\n";
+                ss << "                long b = a + half;\n";
                 ss << "                float v0 = in[a], v1 = in[b];\n";
                 ss << "                out[a] = v0 * c - v1 * s;\n";
                 ss << "                out[b] = v0 * s + v1 * c;\n";
@@ -983,13 +1051,14 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "        }\n";
             } else {
                 ss << "        #pragma omp for\n";
-                ss << "        for (int h = 0; h < n_heads; h++) {\n";
+                ss << "        for (long th = 0; th < (long)n_heads * n_tok; th++) {\n";
+                ss << "            int32_t pos_i = positions[th / n_heads];\n";
                 ss << "            for (int i = 0; i < head_size; i += 2) {\n";
                 ss << "                float freq = 1.f / powf(freq_base, (float)i / (float)head_size);\n";
                 ss << "                float val  = (float)pos_i * freq * freq_scale;\n";
                 ss << "                float c = cosf(val) * mscale;\n";
                 ss << "                float s = sinf(val) * mscale;\n";
-                ss << "                int idx = h * head_size + i;\n";
+                ss << "                long idx = th * (long)head_size + i;\n";
                 ss << "                float v0 = in[idx], v1 = in[idx + 1];\n";
                 ss << "                out[idx    ] = v0 * c - v1 * s;\n";
                 ss << "                out[idx + 1] = v0 * s + v1 * c;\n";
@@ -1019,23 +1088,28 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             if (op.dst_type == GGML_TYPE_F32) {
                 ss << "    #pragma omp single\n";
                 ss << "    {\n";
-                ss << "        int64_t idx0 = (int64_t) pos;\n";
-                ss << "        const float* src = (const float*)" << src0 << ";\n";
-                ss << "        char* base = (char*)" << dst << ";\n";
-                ss << "        memcpy(base + idx0 * " << dst_row_bytes << ", src, "
+                ss << "        for (int64_t t = 0; t < n_tok; t++) {\n";
+                ss << "            int64_t idx0 = positions[t];\n";
+                ss << "            const float* src = (const float*)" << src0 << " + t * " << cols << ";\n";
+                ss << "            char* base = (char*)" << dst << ";\n";
+                ss << "            memcpy(base + idx0 * " << dst_row_bytes << ", src, "
                    << cols << " * 4);\n";
+                ss << "        }\n";
                 ss << "    }\n";
             } else if (op.dst_type == GGML_TYPE_BF16) {
                 ss << "    {\n";
-                ss << "        int64_t idx0 = (int64_t) pos;\n";
                 ss << "        int cols = " << cols << ";\n";
-                ss << "        const float* src = (const float*)" << src0 << ";\n";
-                ss << "        char* row = (char*)" << dst << " + idx0 * " << dst_row_bytes << ";\n";
-                ss << "        uint16_t* drow = (uint16_t*)row;\n";
+                ss << "        char* dstbase = (char*)" << dst << ";\n";
+                ss << "        const float* src0p = (const float*)" << src0 << ";\n";
                 ss << "        #pragma omp for\n";
-                ss << "        for (int j = 0; j < cols; j++) {\n";
-                ss << "            uint32_t u; memcpy(&u, &src[j], 4);\n";
-                ss << "            drow[j] = (uint16_t)(u >> 16);\n";
+                ss << "        for (long t = 0; t < n_tok; t++) {\n";
+                ss << "            int64_t idx0 = positions[t];\n";
+                ss << "            const float* src = src0p + t * cols;\n";
+                ss << "            uint16_t* drow = (uint16_t*)(dstbase + idx0 * " << dst_row_bytes << ");\n";
+                ss << "            for (int j = 0; j < cols; j++) {\n";
+                ss << "                uint32_t u; memcpy(&u, &src[j], 4);\n";
+                ss << "                drow[j] = (uint16_t)(u >> 16);\n";
+                ss << "            }\n";
                 ss << "        }\n";
                 ss << "    }\n";
             } else {
@@ -1055,41 +1129,51 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             // back to ne[1] when ne[2] is 1 so we don't silently produce a
             // single-head kernel.
             int head_dim  = (int) op.src0_ne[0];
+            // Q is [D, N, H, B]; H lives in ne[2] (n_tokens N is ne[1]). For
+            // N>1 prompt eval n_q_heads is still ne[2]. Fall back to ne[1] only
+            // for the legacy single-head synthetic shapes (ne[2]==1).
             int n_q_heads = (op.src0_ne[2] > 1) ? (int) op.src0_ne[2]
                                                 : (int) op.src0_ne[1];
             int n_kv_heads= (int) op.p.flash_attn.n_kv_heads;
-            int seq_len_curr_pos = -1;  // pass position+1 from runtime
-            (void) seq_len_curr_pos;
             ss << "    {\n";
             ss << "        int head_dim   = " << head_dim   << ";\n";
             ss << "        int n_q_heads  = " << n_q_heads  << ";\n";
             ss << "        int n_kv_heads = " << n_kv_heads << ";\n";
-            ss << "        int seq_len    = (int)(pos + 1);\n";
             ss << "        float scale    = " << flit(op.p.flash_attn.scale) << ";\n";
             ss << "        size_t nb_k1=" << op.p.flash_attn.nb_k1 << "u, nb_k2=" << op.p.flash_attn.nb_k2 << "u;\n";
             ss << "        size_t nb_v1=" << op.p.flash_attn.nb_v1 << "u, nb_v2=" << op.p.flash_attn.nb_v2 << "u;\n";
-            if (std::getenv("GGML_VE_KERNEL_TRACE")) {
-                ss << "        #pragma omp single\n"
-                   << "        {fprintf(stderr,\"[VE-K]   FA args: hd=%d nqh=%d nkvh=%d seq=%d pos=%ld\\n\","
-                   << "head_dim,n_q_heads,n_kv_heads,seq_len,(long)pos);fflush(stderr);}\n";
-            }
-            ss << "        float* outp = (float*)" << dst  << ";\n";
-            ss << "        const float* qp = (const float*)" << src0 << ";\n";
+            // Q per-token / per-head and out per-head / per-token byte strides.
+            ss << "        size_t q_nb1=" << op.p.flash_attn.q_nb1 << "u, q_nb2=" << op.p.flash_attn.q_nb2 << "u;\n";
+            ss << "        size_t o_nb1=" << op.p.flash_attn.o_nb1 << "u, o_nb2=" << op.p.flash_attn.o_nb2 << "u;\n";
+            ss << "        char* outp = (char*)" << dst  << ";\n";
+            ss << "        const char* qp = (const char*)" << src0 << ";\n";
             ss << "        const void*  kp = (const void*)"  << src1 << ";\n";
             ss << "        const void*  vp = (const void*)"  << src2 << ";\n";
             if (op.p.flash_attn.kv_type == (int) GGML_TYPE_BF16) {
-                // _inner: uses `#pragma omp for` internally, implicit barrier.
-                ss << "        attention_f32q_bf16kv_fused_gqa_inner(outp, qp, kp, vp, "
-                   << "head_dim, n_q_heads, n_kv_heads, seq_len, scale, "
-                   << "nb_k1, nb_k2, nb_v1, nb_v2);\n";
+                // One query token at a time; the strided _inner shares heads
+                // across the team via `#pragma omp for` (no fork). seq_len =
+                // positions[t]+1 is the causal mask. Decode = the n_tok==1,
+                // q_nb2==head_dim*4 special case.
+                ss << "        for (int64_t t = 0; t < n_tok; t++) {\n";
+                ss << "            int seq_len = positions[t] + 1;\n";
+                ss << "            attention_f32q_bf16kv_fused_gqa_inner_strided(\n";
+                ss << "                (float*)(outp + t*o_nb2), (const float*)(qp + t*q_nb1),\n";
+                ss << "                kp, vp, head_dim, n_q_heads, n_kv_heads, seq_len, scale,\n";
+                ss << "                q_nb2, o_nb1, nb_k1, nb_k2, nb_v1, nb_v2);\n";
+                ss << "        }\n";
             } else {
-                // F32 KV path doesn't have an _inner variant yet — fall back
-                // to omp single. Bumping this is task #16 follow-up.
+                // F32 KV: no strided _inner; per-token omp-single fallback (the
+                // contiguous-head assumption is fine at decode n_tok==1; N>1
+                // F32-KV graphs are refused in trace so we never get here).
                 ss << "        #pragma omp single\n";
                 ss << "        {\n";
-                ss << "            attention_f32_raw_gqa_stride_omp(outp, qp, kp, vp, "
+                ss << "            for (int64_t t = 0; t < n_tok; t++) {\n";
+                ss << "                int seq_len = positions[t] + 1;\n";
+                ss << "                attention_f32_raw_gqa_stride_omp((float*)(outp + t*o_nb2), "
+                   << "(const float*)(qp + t*q_nb1), kp, vp, "
                    << "head_dim, n_q_heads, n_kv_heads, seq_len, scale, "
                    << "nb_k1, nb_k2, nb_v1, nb_v2);\n";
+                ss << "            }\n";
                 ss << "        }\n";
             }
             ss << "    }\n";
@@ -1142,7 +1226,8 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             // the external swiglu_hbm_full_inner only split over nr, leaving
             // 7 threads idle at decode where nr==1). Clamp before expf — the
             // VE's vectorised expf returns NaN past |x|~88 (see CLAUDE.md).
-            ss << "        long total = (long)nc * (nr > 0 ? nr : 1);\n";
+            ss << "        long total = (long)(" << elem_n << ");\n";
+            ss << "        (void)nc; (void)nr;\n";
             ss << "        #pragma omp for\n";
             ss << "        for (long i = 0; i < total; i++) {\n";
             ss << "            float g = gate[i];\n";
@@ -1218,6 +1303,9 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     ss << "extern void attention_f32q_bf16kv_fused_gqa_inner(float* out, const float* q, const void* k, const void* v,"
        << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, float scale,"
        << " size_t nb_k1, size_t nb_k2, size_t nb_v1, size_t nb_v2);\n";
+    ss << "extern void attention_f32q_bf16kv_fused_gqa_inner_strided(float* out, const float* q, const void* k, const void* v,"
+       << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, float scale,"
+       << " size_t q_nb2, size_t o_nb1, size_t nb_k1, size_t nb_k2, size_t nb_v1, size_t nb_v2);\n";
     ss << "extern void swiglu_hbm_full_inner(float* y, float* gate, float* up, int nc, int nr);\n\n";
 
     // Ops are grouped into small static chunk functions instead of one giant
@@ -1237,8 +1325,8 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     const int  n_chunks = (n_ops + CHUNK - 1) / CHUNK;
     for (int c = 0; c < n_chunks; ++c) {
         ss << "static void gc_chunk_" << c
-           << "(void** p, void* input, void* output, int64_t pos) {\n";
-        ss << "    (void)p; (void)input; (void)output; (void)pos;\n";
+           << "(void** p, void* input, void* output, int64_t pos, int64_t n_tok, const int* positions) {\n";
+        ss << "    (void)p; (void)input; (void)output; (void)pos; (void)n_tok; (void)positions;\n";
         const int lo = c * CHUNK, hi = std::min(lo + CHUNK, n_ops);
         for (int i = lo; i < hi; ++i) {
             if (ktrace) {
@@ -1269,7 +1357,9 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     ss << "    VEDAdeviceptr* tptr_hbm,  // [" << n_slots << "] tensor HBM ptrs\n";
     ss << "    void* input,              // HMEM token id (i32)\n";
     ss << "    void* output,             // HMEM logits out (f32)\n";
-    ss << "    int64_t pos) {            // current decode position\n";
+    ss << "    int64_t pos,               // positions[0] (back-comp)\n";
+    ss << "    int64_t n_tok,             // number of tokens (1=decode, N=prompt)\n";
+    ss << "    const int* positions) {    // HMEM: n_tok token positions (i32)\n";
 
     // Convert all tensor HBM pointers to raw VE addresses. We re-resolve
     // every call (cheap: just translates an opaque handle to a flat VE
@@ -1355,7 +1445,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     ss << "    #pragma omp parallel num_threads(8)\n";
     ss << "    {\n";
     for (int c = 0; c < n_chunks; ++c) {
-        ss << "        gc_chunk_" << c << "(p, input, output, pos);\n";
+        ss << "        gc_chunk_" << c << "(p, input, output, pos, n_tok, positions);\n";
     }
     ss << "    }\n";   // end #pragma omp parallel
 
@@ -1915,39 +2005,76 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         }
         return (w == 8) ? v64 : (int64_t) v32;
     };
+    // Read all ne[0] entries of an index/position leaf as i32 (i64 leaves are
+    // narrowed). Used for the per-token id array (GET_ROWS) and the positions
+    // array (ROPE/SET_ROWS). Returns empty on failure.
+    auto read_leaf_all = [&](const ggml_tensor * t) -> std::vector<int32_t> {
+        std::vector<int32_t> out;
+        if (!t) return out;
+        const int64_t cnt = t->ne[0] > 0 ? t->ne[0] : 1;
+        const size_t  w   = ggml_type_size(t->type);
+        std::vector<uint8_t> raw((size_t) cnt * w);
+        VEDAdeviceptr hbm = hbm_ptr_for_tensor(t);
+        if (hbm) {
+            if (vedaMemcpyDtoH(raw.data(), hbm, raw.size()) != VEDA_SUCCESS) return out;
+        } else if (t->data) {
+            std::memcpy(raw.data(), t->data, raw.size());
+        } else {
+            return out;
+        }
+        out.resize((size_t) cnt);
+        for (int64_t i = 0; i < cnt; ++i) {
+            out[i] = (w == 8) ? (int32_t) ((const int64_t *) raw.data())[i]
+                              : ((const int32_t *) raw.data())[i];
+        }
+        return out;
+    };
 
-    int32_t token_id = 0;
+    std::vector<int32_t> token_ids;
     int64_t position = 0;
     bool    have_pos = false;
     for (int i = 0; i < current_graph->n_nodes; ++i) {
         const ggml_tensor * n = current_graph->nodes[i];
         if (n && n->op == GGML_OP_GET_ROWS && n->src[1]) {
-            token_id = (int32_t) read_leaf0(n->src[1]);
+            token_ids = read_leaf_all(n->src[1]);
             break;
         }
     }
+    if (token_ids.empty()) token_ids.assign(1, 0);
     // Decode position drives ROPE's angle, SET_ROWS' KV-cell row, and FA's
-    // seq_len (= pos+1). Prefer ROPE's inp_pos; fall back to the SET_ROWS
-    // index leaf (i64) for attention subgraphs that contain SET_ROWS/FA but
-    // no ROPE — without this they baked pos=0, writing the wrong KV row and
-    // attending to a single position (garbage decode output).
+    // seq_len (= pos+1). For prompt eval (N>1) every token has its own
+    // position; we stage the whole inp_pos array. Prefer ROPE's inp_pos
+    // (i32); fall back to the SET_ROWS index leaf (i64) for attention
+    // subgraphs that contain SET_ROWS/FA but no ROPE — without this they
+    // baked pos=0, writing the wrong KV row and attending to a single
+    // position (garbage decode output).
+    const ggml_tensor * pos_leaf = nullptr;
     for (int i = 0; i < current_graph->n_nodes; ++i) {
         const ggml_tensor * n = current_graph->nodes[i];
-        if (n && n->op == GGML_OP_ROPE && n->src[1]) {
-            position = read_leaf0(n->src[1]);
-            have_pos = true;
-            break;
-        }
+        if (n && n->op == GGML_OP_ROPE && n->src[1]) { pos_leaf = n->src[1]; break; }
     }
-    if (!have_pos) {
+    if (!pos_leaf) {
         for (int i = 0; i < current_graph->n_nodes; ++i) {
             const ggml_tensor * n = current_graph->nodes[i];
-            if (n && n->op == GGML_OP_SET_ROWS && n->src[1]) {
-                position = read_leaf0(n->src[1]);
-                have_pos = true;
-                break;
-            }
+            if (n && n->op == GGML_OP_SET_ROWS && n->src[1]) { pos_leaf = n->src[1]; break; }
         }
+    }
+    // Read the full positions array (one entry per token). n_tok==1 for decode;
+    // positions[0] also feeds the legacy `pos` arg.
+    std::vector<int32_t> positions_host = read_leaf_all(pos_leaf);
+    int64_t n_tok = 1;
+    if (!positions_host.empty()) {
+        n_tok = (int64_t) positions_host.size();
+        position = positions_host[0];
+        have_pos = true;
+    } else {
+        positions_host.assign(1, (int32_t) position);
+    }
+    // Sanity: the GET_ROWS token-id count should match n_tok for prompt eval.
+    // If a graph has no ROPE/SET_ROWS leaf (n_tok defaulted to 1) but does have
+    // N token ids, trust the token count.
+    if ((int64_t) token_ids.size() > n_tok && pos_leaf == nullptr) {
+        n_tok = (int64_t) token_ids.size();
     }
 
     // HMEM in/out — sized once, reused across every execute() of the same
@@ -1955,10 +2082,21 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     // entirely through HBM slot pointers), but allocating them lazily up
     // front is cheap and saves the pool acquire/release pair on every
     // token.
-    if (graph->in_hmem == 0) {
-        if (!ggml_ve_ok(vedaHMemAlloc(&graph->in_hmem, sizeof(int32_t)),
-                        "vedaHMemAlloc(gcomp in)")) {
-            return false;
+    {
+        // in_hmem holds the n_tok input token ids (GET_ROWS). Grow if needed.
+        size_t in_need = token_ids.size() * sizeof(int32_t);
+        if (in_need == 0) in_need = sizeof(int32_t);
+        if (graph->in_hmem != 0 && graph->in_cap < in_need) {
+            vedaHMemFree(graph->in_hmem);
+            graph->in_hmem = 0;
+            graph->in_cap  = 0;
+        }
+        if (graph->in_hmem == 0) {
+            if (!ggml_ve_ok(vedaHMemAlloc(&graph->in_hmem, in_need),
+                            "vedaHMemAlloc(gcomp in)")) {
+                return false;
+            }
+            graph->in_cap = in_need;
         }
     }
     if (graph->out_hmem == 0) {
@@ -1968,12 +2106,38 @@ bool GraphCompiler::execute(CompiledGraph * graph,
             return false;
         }
     }
+    // Positions array HMEM — sized to n_tok, grown if a later graph has more
+    // tokens. Reused across tokens of the same compiled graph.
+    {
+        size_t need = positions_host.size() * sizeof(int32_t);
+        if (need == 0) need = sizeof(int32_t);
+        if (graph->pos_hmem != 0 && graph->pos_cap < need) {
+            vedaHMemFree(graph->pos_hmem);
+            graph->pos_hmem = 0;
+            graph->pos_cap  = 0;
+        }
+        if (graph->pos_hmem == 0) {
+            if (!ggml_ve_ok(vedaHMemAlloc(&graph->pos_hmem, need),
+                            "vedaHMemAlloc(gcomp pos)")) {
+                return false;
+            }
+            graph->pos_cap = need;
+        }
+    }
     VEDAhmemptr in_hmem  = graph->in_hmem;
     VEDAhmemptr out_hmem = graph->out_hmem;
+    VEDAhmemptr pos_hmem = graph->pos_hmem;
 
     if (!ggml_ve_ok(vedaHMemcpy(reinterpret_cast<void *>(in_hmem),
-                                 &token_id, sizeof(int32_t)),
+                                 token_ids.data(),
+                                 token_ids.size() * sizeof(int32_t)),
                     "vedaHMemcpy(token in)")) {
+        return false;
+    }
+    if (!ggml_ve_ok(vedaHMemcpy(reinterpret_cast<void *>(pos_hmem),
+                                 positions_host.data(),
+                                 positions_host.size() * sizeof(int32_t)),
+                    "vedaHMemcpy(positions in)")) {
         return false;
     }
 
@@ -1996,6 +2160,8 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     vedaArgsSetHMEM (args, 1, in_hmem);
     vedaArgsSetHMEM (args, 2, out_hmem);
     vedaArgsSetI64  (args, 3, position);
+    vedaArgsSetI64  (args, 4, n_tok);
+    vedaArgsSetHMEM (args, 5, pos_hmem);
 
     // vedaLaunchKernel (without Ex) auto-destroys args on success. We sync
     // after to surface VE-side errors at the right point.

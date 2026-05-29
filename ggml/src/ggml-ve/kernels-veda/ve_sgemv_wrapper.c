@@ -13181,6 +13181,46 @@ void attention_f32q_bf16kv_fused_gqa_inner(
     }
 }
 
+// Strided variant: Q (and out) head stride given in BYTES instead of the
+// assumed-contiguous head_dim*sizeof(float). For prompt-eval the graph compiler
+// calls this once per query token with q/out advanced by the per-token stride
+// and seq_len = positions[t]+1 (causal mask via length, no explicit mask for a
+// single-sequence prompt). Decode is the q_nb2 == head_dim*4 special case.
+// Shares the team via `#pragma omp for` (no fork) like the contiguous _inner
+// above, so it composes inside the one fused decode/prompt parallel region.
+void attention_f32q_bf16kv_fused_gqa_inner_strided(
+    float* out,
+    const float* q,
+    const void* k,
+    const void* v,
+    int head_dim,
+    int n_q_heads,
+    int n_kv_heads,
+    int seq_len,
+    float scale,
+    size_t q_nb2,    // Q   head stride (bytes)
+    size_t o_nb1,    // out head stride (bytes)
+    size_t nb_k1,
+    size_t nb_k2,
+    size_t nb_v1,
+    size_t nb_v2)
+{
+    int h;
+    #pragma omp for private(h)
+    for (h = 0; h < n_q_heads; h++) {
+        int kv_h = h * n_kv_heads / n_q_heads;
+        const float* qh = (const float*)((const char*)q + (size_t)h * q_nb2);
+        float* out_h = (float*)((char*)out + (size_t)h * o_nb1);
+        const bf16* kh = (const bf16*)((const char*)k + kv_h * nb_k2);
+        const bf16* vh = (const bf16*)((const char*)v + kv_h * nb_v2);
+        flash_attn_single_head_intrinsics(
+            out_h, qh, kh, vh, NULL,
+            head_dim, seq_len,
+            (int64_t)nb_k1, (int64_t)nb_v1,
+            scale, 0.0f, 1.0f);
+    }
+}
+
 /*
  * =============================================================================
  * BF16 Column-Major Batched SGEMM
