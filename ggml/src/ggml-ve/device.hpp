@@ -60,6 +60,7 @@ enum kernel_id {
     K_Q4K_MATMUL_FULL_HBM,         // batched N>1: dequant once per tile, N matvecs against cache
     K_Q4K_MATVEC_STD_HBM,          // DIRECT-dispatch on standard block_q4_K (144 B/blk), no canon
     K_Q4K_MATVEC_STD_HDR_HBM,      // DIRECT + pre-decoded hdr cache (saves per-block h2f+q4k_sm)
+    K_VEBP_MATVEC_HBM,             // VEBP ternary matvec (vpcnt, interleaved planes + group scales)
     K_DEQUANT_Q2K_BF16,
     K_DEQUANT_Q8_0_BF16,
     K_DEQUANT_MXFP4_BF16_HMEM,

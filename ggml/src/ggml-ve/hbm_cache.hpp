@@ -206,6 +206,99 @@ public:
         return true;
     }
 
+    // ---- VEBP upload: repack on-disk block_vebp -> interleaved planes ----
+    //
+    // On-disk block_vebp (row-major [M][nblk][68]): per 256-elem block,
+    //   d[2] fp16 (2 group-128 scales), nz[32] (256-bit), sign[32] (256-bit).
+    // Interleaved (lane = row, block of 256 rows) for the VE kernel:
+    //   Ws_il/Wn_il: [rowblk][word=k/64][256 rows] uint64
+    //   wscale_il  : [rowblk][group=k/128][256 rows] f32
+    // Three HBM buffers, cached by name. ~2 GB for an 8B model.
+    // Hit-only lookup (no upload). Lets the caller skip an expensive
+    // device->host bounce of the weight when it's already cached.
+    bool vebp_lookup(const char * tensor_name, uint64_t M, uint64_t K,
+                     VEDAdeviceptr * ws_vptr, VEDAdeviceptr * wn_vptr,
+                     VEDAdeviceptr * wsc_vptr) {
+        const long   wpr  = (long) K / 64;
+        const long   ng   = (long) K / 128;
+        const long   Mpad = ((long) M + 255) / 256 * 256;
+        const size_t ws_total  = (size_t) Mpad * wpr * sizeof(uint64_t);
+        const size_t wsc_total = (size_t) Mpad * ng  * sizeof(float);
+        std::string ws_key  = std::string(tensor_name ? tensor_name : "?") + "/vebp_ws";
+        std::string wn_key  = std::string(tensor_name ? tensor_name : "?") + "/vebp_wn";
+        std::string wsc_key = std::string(tensor_name ? tensor_name : "?") + "/vebp_wsc";
+        VEDAdeviceptr ws = 0, wn = 0, wsc = 0;
+        for (auto & e : entries_) {
+            if (e.name == ws_key  && e.size == ws_total)  ws  = e.vptr;
+            if (e.name == wn_key  && e.size == ws_total)  wn  = e.vptr;
+            if (e.name == wsc_key && e.size == wsc_total) wsc = e.vptr;
+        }
+        if (ws && wn && wsc) { hits_ += 3; *ws_vptr=ws; *wn_vptr=wn; *wsc_vptr=wsc; return true; }
+        return false;
+    }
+
+    bool get_or_upload_vebp(const char * tensor_name, const void * src_blocks,
+                            uint64_t M, uint64_t K,
+                            VEDAdeviceptr * ws_vptr, VEDAdeviceptr * wn_vptr,
+                            VEDAdeviceptr * wsc_vptr) {
+        const int    nblk = (int) K / 256;
+        const long   wpr  = (long) K / 64;
+        const long   ng   = (long) K / 128;
+        // Pad rows up to a multiple of 256 (the kernel's rowblock width).
+        // Pad rows are zero (calloc) -> all-zero ternary -> y=0, harmless;
+        // they only exist so the last block's 256-lane loads stay in-bounds.
+        const long   Mpad = ((long) M + 255) / 256 * 256;
+        const size_t ws_total  = (size_t) Mpad * wpr * sizeof(uint64_t);
+        const size_t wsc_total = (size_t) Mpad * ng  * sizeof(float);
+
+        std::string ws_key  = std::string(tensor_name ? tensor_name : "?") + "/vebp_ws";
+        std::string wn_key  = std::string(tensor_name ? tensor_name : "?") + "/vebp_wn";
+        std::string wsc_key = std::string(tensor_name ? tensor_name : "?") + "/vebp_wsc";
+        VEDAdeviceptr ws = 0, wn = 0, wsc = 0;
+        for (auto & e : entries_) {
+            if (e.name == ws_key  && e.size == ws_total)  ws  = e.vptr;
+            if (e.name == wn_key  && e.size == ws_total)  wn  = e.vptr;
+            if (e.name == wsc_key && e.size == wsc_total) wsc = e.vptr;
+        }
+        if (ws && wn && wsc) { hits_ += 3; *ws_vptr=ws; *wn_vptr=wn; *wsc_vptr=wsc; return true; }
+
+        // calloc so the padded rows (M..Mpad-1) are zero.
+        uint64_t * ws_h  = (uint64_t *) std::calloc(ws_total,  1);
+        uint64_t * wn_h  = (uint64_t *) std::calloc(ws_total,  1);
+        float    * wsc_h = (float *)    std::calloc(wsc_total, 1);
+        if (!ws_h || !wn_h || !wsc_h) { std::free(ws_h); std::free(wn_h); std::free(wsc_h); return false; }
+
+        const uint8_t * S = (const uint8_t *) src_blocks;  // M*nblk*68, row-major
+        for (long m = 0; m < (long) M; m++) {
+            const long rb = m / 256, r = m % 256;
+            const uint8_t * row = S + (size_t) m * nblk * 68;
+            for (int b = 0; b < nblk; b++) {
+                const uint8_t * blk = row + (size_t) b * 68;
+                for (int gg = 0; gg < 2; gg++) {
+                    uint16_t h; std::memcpy(&h, blk + gg*2, 2);
+                    const long g = 2*b + gg;
+                    wsc_h[(rb*ng + g)*256 + r] = q4k_h2f(h);
+                }
+                for (int ww = 0; ww < 4; ww++) {
+                    uint64_t nzw, sgw;
+                    std::memcpy(&nzw, blk + 4  + ww*8, 8);
+                    std::memcpy(&sgw, blk + 36 + ww*8, 8);
+                    const long w = 4*b + ww;
+                    wn_h[(rb*wpr + w)*256 + r] = nzw;
+                    ws_h[(rb*wpr + w)*256 + r] = sgw;
+                }
+            }
+        }
+
+        ws  = upload(ws_h,  ws_total);  if (ws)  record(ws,  ws_total,  src_blocks, ws_key.c_str(),  GGML_VE_HBM_VEBP_WS);
+        wn  = upload(wn_h,  ws_total);  if (wn)  record(wn,  ws_total,  src_blocks, wn_key.c_str(),  GGML_VE_HBM_VEBP_WN);
+        wsc = upload(wsc_h, wsc_total); if (wsc) record(wsc, wsc_total, src_blocks, wsc_key.c_str(), GGML_VE_HBM_VEBP_WSCALE);
+        std::free(ws_h); std::free(wn_h); std::free(wsc_h);
+        if (!ws || !wn || !wsc) return false;
+        *ws_vptr = ws; *wn_vptr = wn; *wsc_vptr = wsc;
+        return true;
+    }
+
     // ---- Decoded-header ONLY upload (for direct-dispatch Q4_K kernel) ----
     //
     // Same per-block decoded header layout as get_or_upload_q4k_canon (8 fp32

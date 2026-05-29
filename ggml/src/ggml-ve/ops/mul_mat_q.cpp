@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <memory>
+#include <vector>
 
 namespace ggml_ve {
 namespace ops {
@@ -82,6 +83,8 @@ bool is_supported_quant_type(ggml_type t) {
     //       and commit 7ddc2fa26). Opt-out via GGML_VE_NO_Q4K=1.
     if (t == GGML_TYPE_Q8_0) return true;
     if (t == GGML_TYPE_Q4_K) return std::getenv("GGML_VE_NO_Q4K") == nullptr;
+    // VEBP: VE-native trained-ternary. vpcnt matvec, interleaved planes.
+    if (t == GGML_TYPE_VEBP) return std::getenv("GGML_VE_NO_VEBP") == nullptr;
     return false;
 }
 
@@ -90,6 +93,7 @@ int blk_size(ggml_type t) {
     switch (t) {
         case GGML_TYPE_Q8_0: return 32;
         case GGML_TYPE_Q2_K: return 256;
+        case GGML_TYPE_VEBP: return 256;
         case GGML_TYPE_Q4_K: return 256;
         default:             return 0;
     }
@@ -191,8 +195,9 @@ bool mul_mat_q_supports(const ggml_tensor * op) {
      * only (prompt-eval N>1 falls to CPU -- correct, and canon's 2x HBM
      * blowup at N>1 is exactly what we avoid). GGML_VE_Q4K_N_GT_1=1
      * forces N>1 acceptance regardless (legacy testing hook). */
-    if (w->type == GGML_TYPE_Q4_K &&
-        (q4k_route_is_direct() || std::getenv("GGML_VE_Q4K_N_GT_1") != nullptr)) {
+    if (w->type == GGML_TYPE_VEBP ||
+        (w->type == GGML_TYPE_Q4_K &&
+         (q4k_route_is_direct() || std::getenv("GGML_VE_Q4K_N_GT_1") != nullptr))) {
         if (N < 1) return reject("N<1");
     } else {
         if (N != 1) return reject("N!=1");
@@ -252,9 +257,12 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
     // the raw-weight cache, so skip resolve_in(w) -- otherwise the same
     // weight gets uploaded TWICE (raw + canonical-split), doubling the
     // HBM footprint and OOMing 27B-class models around layer 42.
-    const VEDAdeviceptr w_hbm = (w->type == GGML_TYPE_Q4_K) ? 0 : ctx->resolve_in(w);
+    // Q4_K and VEBP use their own repack caches below (not the raw-weight
+    // cache), so skip resolve_in(w) for them — avoids a double upload.
+    const bool w_own_cache = (w->type == GGML_TYPE_Q4_K) || (w->type == GGML_TYPE_VEBP);
+    const VEDAdeviceptr w_hbm = w_own_cache ? 0 : ctx->resolve_in(w);
     if (y_hbm == 0 || x_hbm == 0) return false;
-    if (w->type != GGML_TYPE_Q4_K && w_hbm == 0) return false;
+    if (!w_own_cache && w_hbm == 0) return false;
 
     const uint64_t M = (uint64_t) w->ne[1];
     const uint64_t K = (uint64_t) w->ne[0];
@@ -466,6 +474,55 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
         VEDAfunction fn = ctx->fn(K_Q2K_BF16_MATVEC_HBM);
         if (fn == 0) return false;
         ok = launch_kquant_hbm_weights_hmem_io(ctx, fn, y_hbm, w_hbm, x_hbm, M, K);
+    } else if (w->type == GGML_TYPE_VEBP) {
+        // VE-native ternary. Repack on-disk block_vebp -> interleaved planes
+        // (cached in HBM), then the vpcnt matvec. Decode (N=1) is one launch;
+        // prompt-eval (N>1) loops columns (the kernel reuses static activation
+        // scratch, so sync between columns).
+        VEDAfunction fn = ctx->fn(K_VEBP_MATVEC_HBM);
+        if (fn == 0) return false;
+        const char * name = (w->name && w->name[0]) ? w->name : nullptr;
+        const int64_t N = dst->ne[1];
+
+        // Peek the cache first. The interleaved planes are built+cached once;
+        // only on a miss do we pay the (one-time) device->host bounce + repack.
+        // Bouncing every call would re-download the whole weight from HBM each
+        // token -> ~3 GB/token of DtoH, which dominated decode before this.
+        VEDAdeviceptr ws = 0, wn = 0, wsc = 0;
+        if (!ctx->cache().vebp_lookup(name, (uint64_t) M, (uint64_t) K, &ws, &wn, &wsc)) {
+            const void * src = w->data;
+            std::unique_ptr<uint8_t[]> bounce;
+            const int64_t wbytes = (int64_t) M * (K / 256) * 68;
+            if (w->buffer && !ggml_backend_buffer_is_host(w->buffer)) {
+                bounce.reset(new uint8_t[wbytes]);
+                if (vedaMemcpyDtoH(bounce.get(), (VEDAdeviceptr)(uintptr_t) w->data,
+                                   wbytes) != VEDA_SUCCESS) {
+                    return false;
+                }
+                src = bounce.get();
+            }
+            if (!ctx->cache().get_or_upload_vebp(name, src, (uint64_t) M, (uint64_t) K,
+                                                 &ws, &wn, &wsc)) {
+                return false;
+            }
+        }
+        ok = true;
+        for (int64_t n = 0; n < N && ok; n++) {
+            VEDAargs args = nullptr;
+            if (!ggml_ve_ok(vedaArgsCreate(&args), "vedaArgsCreate(vebp)")) { ok = false; break; }
+            VEDAdeviceptr y_col = (VEDAdeviceptr)((uintptr_t) y_hbm + n * M * sizeof(float));
+            VEDAdeviceptr x_col = (VEDAdeviceptr)((uintptr_t) x_hbm + n * K * sizeof(float));
+            vedaArgsSetVPtr(args, 0, y_col);
+            vedaArgsSetVPtr(args, 1, ws);
+            vedaArgsSetVPtr(args, 2, wn);
+            vedaArgsSetVPtr(args, 3, wsc);
+            vedaArgsSetVPtr(args, 4, x_col);
+            vedaArgsSetU64 (args, 5, (uint64_t) M);
+            vedaArgsSetU64 (args, 6, (uint64_t) K);
+            ok = ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, 1, nullptr),
+                            "vedaLaunchKernelEx(vebp_matvec)");
+            if (ok && N > 1) vedaCtxSynchronize();
+        }
     }
 
     if (ok) {

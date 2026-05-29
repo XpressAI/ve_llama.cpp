@@ -86,6 +86,9 @@ enum ggml_ve_hbm_format {
     GGML_VE_HBM_Q8_0          = 4,
     GGML_VE_HBM_Q4K_CANON_QS  = 5,  // qs bytes in canonical-nibble order
     GGML_VE_HBM_Q4K_CANON_HDR = 6,  // headers (d, dmin, scales) separately
+    GGML_VE_HBM_VEBP_WS       = 7,  // VEBP interleaved sign plane  [blk][word][256]
+    GGML_VE_HBM_VEBP_WN       = 8,  // VEBP interleaved nonzero plane
+    GGML_VE_HBM_VEBP_WSCALE   = 9,  // VEBP interleaved group scales [blk][grp][256]
 };
 
 #endif // GGML_VE_COMMON_HPP
