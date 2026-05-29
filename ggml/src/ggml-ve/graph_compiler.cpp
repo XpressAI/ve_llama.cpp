@@ -1097,6 +1097,22 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
         }
 
         case OpType::CPY: {
+            // The attention-mask copy (attn_inp_kq_mask -> "(copy)") feeds
+            // FLASH_ATTN, but the VE FA kernel takes NO mask argument — it does
+            // causal masking via seq_len — so the copy is dead. Critically its
+            // byte count equals the KV-length-dependent mask size; baking that
+            // made the generated source change every time the context grew past
+            // a pad boundary, triggering a 30-60s NCC recompile *mid-generation*.
+            // Skip it: the decode graph is then fully size-independent and one
+            // cached .so serves the whole run. The slot stays allocated and
+            // populated at execute(); nothing reads it.
+            if (op.name.find("kq_mask") != std::string::npos ||
+                op.name.find("KQ_mask") != std::string::npos) {
+                ss << "    /* op " << idx << ": CPY of attention mask skipped — "
+                   << "VE flash-attn ignores it (causal via seq_len); its kv-length "
+                   << "size was forcing mid-generation recompiles */\n";
+                break;
+            }
             int elem_bytes = (op.dst_type == GGML_TYPE_F32  ? 4
                              : op.dst_type == GGML_TYPE_BF16 ? 2
                              : op.dst_type == GGML_TYPE_F16  ? 2 : 4);
