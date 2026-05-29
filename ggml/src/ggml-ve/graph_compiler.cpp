@@ -580,11 +580,24 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
         }
     }
 
+    // Tensors PRODUCED by a compute op in this graph (canonical). VIEW/RESHAPE/
+    // PERMUTE/TRANSPOSE/NONE don't produce data — they reference it.
+    std::set<const ggml_tensor *> pre_produced;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (!n) continue;
+        if (n->op == GGML_OP_VIEW    || n->op == GGML_OP_RESHAPE ||
+            n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE ||
+            n->op == GGML_OP_NONE) continue;
+        pre_produced.insert(canonical(n));
+    }
+
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         if (!n) continue;
         const ggml_tensor * srcs[GGML_MAX_SRC + 1] = { n, n->src[0], n->src[1], n->src[2] };
-        for (const ggml_tensor * t : srcs) {
+        for (int s = 0; s < (int) (sizeof(srcs)/sizeof(srcs[0])); ++s) {
+            const ggml_tensor * t = srcs[s];
             if (!t) continue;
             // Pure-metadata ops (VIEW / RESHAPE / PERMUTE / TRANSPOSE) carry
             // no data of their own; their canonical tensor's buffer is what
@@ -598,29 +611,29 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
             const char * bn = buft ? ggml_backend_buft_name(buft) : nullptr;
             const bool host = !bn || std::strncmp(bn, "VE", 2) != 0 || !std::strstr(bn, "_HBM");
             if (!host) continue;
-            // Q4_K weights are a special case: they typically live on
-            // CPU_Mapped (mmap'd from the GGUF file) but get pulled into HBM
-            // via the q4k canonical-split cache at execute time. Allow them
-            // through the pre-pass; execute() will populate the qs/hdr
-            // companion slots from hbm_cache::get_or_upload_q4k_canon.
-            if (is_weight(t) && t->type == GGML_TYPE_Q4_K) continue;
-            // VEBP weights: same deal — pulled into HBM via the interleaved
-            // cache at execute time (vebp companion slots).
-            if (is_weight(t) && t->type == GGML_TYPE_VEBP) continue;
-            // CPU-resident operands are all handled at execute() now:
-            //  - NON-weights (cross-split hidden states like 'embd'/'l_out-N',
-            //    the attention mask, the pre-attention Q view) are staged
-            //    host<->HBM per token.
-            //  - WEIGHTS (e.g. token_embd.weight, which llama.cpp keeps on
-            //    CPU_Mapped because only GET_ROWS reads it) are uploaded ONCE
-            //    to HBM via the weight cache and reused every token.
-            // So nothing on a CPU buffer forces a fallback any more — this is
-            // what lets the whole 875-node decode graph compile into a single
-            // fused kernel instead of bailing on the first CPU operand (no
-            // other backend has that limitation). execute() still returns
-            // false (-> interpreter) if an individual upload genuinely fails.
-            (void) bn;
-            continue;
+
+            // Self-containment gate. CPU-resident operands execute() can supply:
+            //   - WEIGHTS (token_embd.weight etc.) -> one-time HBM cache upload.
+            //   - LEAF inputs (op == NONE: inp_pos / KV index / mask) and the
+            //     graph's own outputs -> per-token host<->HBM scratch.
+            // What it must NOT accept is a computed INTERMEDIATE produced by a
+            // DIFFERENT subgraph and read here (s>0, op != NONE, not produced
+            // in this graph) — i.e. this cgraph is a middle fragment of a
+            // scheduler-split decode. Chaining those compiled fragments through
+            // host staging produces wrong values (Qwen3 per-head-norm models
+            // fragment this way). The whole-decode-graph case (Llama) has no
+            // such cross-fragment intermediate inputs and compiles cleanly.
+            // Refuse middle fragments and let the interpreter run them.
+            if (is_weight(t)) continue;                      // cache upload
+            if (s == 0) continue;                            // this op's own dst (output)
+            if (t->op == GGML_OP_NONE) continue;             // leaf input
+            if (pre_produced.count(canonical(t))) continue;  // produced here
+            if (debug_enabled()) {
+                fprintf(stderr, "[VE-GC] refuse: cross-fragment intermediate input '%s' (%s) at op #%d — interpreter will run this fragment\n",
+                        t->name ? t->name : "?", bn ? bn : "<no-buffer>", i);
+            }
+            trace_valid_ = false;
+            return false;
         }
     }
 
