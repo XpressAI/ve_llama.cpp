@@ -133,12 +133,21 @@ static uint64_t cgraph_signature(const ggml_cgraph * g) {
         if (t == nullptr) { mix(0); return; }
         mix((uint64_t) t->type | (uint64_t)(slot + 1) << 32);
         const bool wild = is_kv_or_mask_tensor(t);
+        // The attention mask's GROWING dim is ne[0] (= padded n_kv), unlike the
+        // KV cache whose growing dim is ne[1] (ne[0] = stable head_dim). The
+        // mask no longer affects the generated source at all (its CPY is
+        // skipped — VE flash-attn masks causally via seq_len), so wildcard ALL
+        // of the mask's spatial dims; otherwise the decode signature changed
+        // at every mask-pad boundary, forcing a needless re-trace + .so reload.
+        const bool is_mask = t->name &&
+            std::strncmp(t->name, "attn_inp_kq_mask", 16) == 0;
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
             // Hash ne[0] always (head_dim / embed_dim — stable per model).
             // For KV / mask tensors skip ne[1..2] (the seq + mask dims
             // that grow as KV occupancy crosses power-of-2 chunk
             // boundaries); ne[3] back in since batch is meaningful.
-            if (wild && (d == 1 || d == 2)) {
+            // For the mask also skip ne[0] (its growing n_kv dim).
+            if ((wild && (d == 1 || d == 2)) || (is_mask && d == 0)) {
                 mix((uint64_t) 0xFFFFFFFFFFFFFFFFULL);  // wildcard marker
             } else {
                 mix((uint64_t) t->ne[d]);
