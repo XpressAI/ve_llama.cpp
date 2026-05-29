@@ -44,6 +44,7 @@ enum class OpType {
     MUL_MAT_F32,
     MUL_MAT_BF16,
     MUL_MAT_Q4K,      // Q4_K weights, F32 activations; canonical-split + pre-decoded hdr
+    MUL_MAT_VEBP,     // VEBP ternary weights, F32 activations; vpcnt matvec
     ROPE,             // mode 0 (normal) and 2 (NeoX)
     SET_ROWS,
     FLASH_ATTN,
@@ -57,6 +58,9 @@ enum class BufferKind {
     WEIGHT_COLMAJOR,  // F32 column-major copy of a BF16 weight (cache populated lazily)
     WEIGHT_Q4K_QS,    // Canonical-packed qs bytes for Q4_K (lazy from hbm cache)
     WEIGHT_Q4K_HDR,   // Pre-decoded fp32 d_sub+m_sub for Q4_K (lazy from hbm cache)
+    WEIGHT_VEBP_WS,   // VEBP interleaved sign plane    (lazy from hbm cache)
+    WEIGHT_VEBP_WN,   // VEBP interleaved nonzero plane (lazy from hbm cache)
+    WEIGHT_VEBP_WSC,  // VEBP interleaved group scales  (lazy from hbm cache)
     KV_CACHE,         // persistent across tokens, mutates each step
     INTERMEDIATE,     // scratch, reused inside the kernel
     INPUT,            // pseudo: input embedding row
@@ -86,6 +90,12 @@ struct TracedOp {
     // hbm_cache::get_or_upload_q4k_canon). -1 = not a Q4_K op.
     int     q4k_qs_idx   = -1;
     int     q4k_hdr_idx  = -1;
+    // For MUL_MAT_VEBP ops, the slots holding the interleaved sign/nz
+    // planes and per-group scales (populated at execute via
+    // hbm_cache::get_or_upload_vebp). -1 = not a VEBP op.
+    int     vebp_ws_idx  = -1;
+    int     vebp_wn_idx  = -1;
+    int     vebp_wsc_idx = -1;
     BufferKind dst_kind  = BufferKind::INTERMEDIATE;
     BufferKind src0_kind = BufferKind::INTERMEDIATE;
     BufferKind src1_kind = BufferKind::INTERMEDIATE;
@@ -125,6 +135,18 @@ struct Q4KSpec {
     int64_t K           = 0;
 };
 
+// Spec for the VEBP interleaved companion slots: at execute time we look
+// up (or build) the interleaved sign/nz planes + group scales for the VEBP
+// weight, keyed by tensor name, and stash all three HBM pointers.
+struct VebpSpec {
+    int     src0_slot = -1;     // original weight slot (identity key)
+    int     ws_slot   = -1;     // populated with interleaved sign-plane pointer
+    int     wn_slot   = -1;     // populated with interleaved nz-plane pointer
+    int     wsc_slot  = -1;     // populated with interleaved group-scale pointer
+    int64_t M         = 0;
+    int64_t K         = 0;
+};
+
 struct CompiledGraph {
     VEDAmodule   module    = 0;
     VEDAfunction run_func  = 0;
@@ -149,6 +171,10 @@ struct CompiledGraph {
     // Q4_K companion slots populated at execute time via
     // hbm_cache::get_or_upload_q4k_canon. Empty if no Q4_K MUL_MAT.
     std::vector<Q4KSpec>      q4k_specs;
+
+    // VEBP companion slots populated at execute time via
+    // hbm_cache::get_or_upload_vebp. Empty if no VEBP MUL_MAT.
+    std::vector<VebpSpec>     vebp_specs;
 
     // Reusable HMEM staging buffers for the kernel's `input` (token id)
     // and `output` (logits row) args. Allocated lazily on first execute
@@ -204,6 +230,8 @@ private:
     std::vector<ColmajorSpec>           colmajor_specs_;
     // Q4_K companion slots created during trace, populated at execute.
     std::vector<Q4KSpec>                q4k_specs_;
+    // VEBP companion slots created during trace, populated at execute.
+    std::vector<VebpSpec>               vebp_specs_;
 
     bool trace_valid_ = false;
 

@@ -343,11 +343,12 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
         case GGML_OP_MUL_MAT:
             if (op.src_type == GGML_TYPE_BF16)      op.type = OpType::MUL_MAT_BF16;
             else if (op.src_type == GGML_TYPE_Q4_K) op.type = OpType::MUL_MAT_Q4K;
+            else if (op.src_type == GGML_TYPE_VEBP) op.type = OpType::MUL_MAT_VEBP;
             else                                     op.type = OpType::MUL_MAT_F32;
-            // Q4_K only supported at N=1 (matvec); N>1 case crashes today
-            // (see mul_mat_q.cpp KNOWN-BUG comment). Compiler must not emit
-            // a Q4_K op with N>1 because there's no inner that handles it.
-            if (op.type == OpType::MUL_MAT_Q4K && node->src[1] && node->src[1]->ne[1] != 1) {
+            // Q4_K / VEBP inners are matvec-only (N=1). The compiler already
+            // refuses N>1 MUL_MAT above (prompt eval), but guard explicitly.
+            if ((op.type == OpType::MUL_MAT_Q4K || op.type == OpType::MUL_MAT_VEBP)
+                && node->src[1] && node->src[1]->ne[1] != 1) {
                 return false;
             }
             break;
@@ -467,6 +468,25 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
         op.q4k_hdr_idx = sp.hdr_slot;
     }
 
+    // VEBP MUL_MAT: register three companion slots (sign/nz planes + scales).
+    // execute() fills them from hbm_cache::get_or_upload_vebp.
+    if (op.type == OpType::MUL_MAT_VEBP && op.src0_idx >= 0) {
+        VebpSpec sp;
+        sp.src0_slot = op.src0_idx;
+        sp.M         = op.src0_ne[1];
+        sp.K         = op.src0_ne[0];
+        sp.ws_slot   = (int) tensor_slot_order_.size();
+        tensor_slot_order_.push_back({nullptr, BufferKind::WEIGHT_VEBP_WS});
+        sp.wn_slot   = (int) tensor_slot_order_.size();
+        tensor_slot_order_.push_back({nullptr, BufferKind::WEIGHT_VEBP_WN});
+        sp.wsc_slot  = (int) tensor_slot_order_.size();
+        tensor_slot_order_.push_back({nullptr, BufferKind::WEIGHT_VEBP_WSC});
+        vebp_specs_.push_back(sp);
+        op.vebp_ws_idx  = sp.ws_slot;
+        op.vebp_wn_idx  = sp.wn_slot;
+        op.vebp_wsc_idx = sp.wsc_slot;
+    }
+
     traced_ops_.push_back(op);
     return true;
 }
@@ -482,6 +502,7 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     tensor_slot_order_.clear();
     colmajor_specs_.clear();
     q4k_specs_.clear();
+    vebp_specs_.clear();
     trace_valid_ = true;
 
     // Pre-pass: refuse if any weight tensor referenced by this cgraph
@@ -531,6 +552,9 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
             // through the pre-pass; execute() will populate the qs/hdr
             // companion slots from hbm_cache::get_or_upload_q4k_canon.
             if (is_weight(t) && t->type == GGML_TYPE_Q4_K) continue;
+            // VEBP weights: same deal — pulled into HBM via the interleaved
+            // cache at execute time (vebp companion slots).
+            if (is_weight(t) && t->type == GGML_TYPE_VEBP) continue;
             if (debug_enabled()) {
                 fprintf(stderr, "[VE-GC] refuse: %s '%s' is on non-HBM buffer (%s) at op #%d\n",
                         is_weight(t) ? "weight" : "tensor",
@@ -809,6 +833,23 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             break;
         }
 
+        case OpType::MUL_MAT_VEBP: {
+            // VEBP ternary matvec. Interleaved sign/nz planes + per-group
+            // scales come from the VebpSpec companion slots (filled at
+            // execute via hbm_cache::get_or_upload_vebp).
+            int64_t M = op.src0_ne[1], K = op.src0_ne[0];
+            std::string ws_p  = "p[" + std::to_string(op.vebp_ws_idx)  + "]";
+            std::string wn_p  = "p[" + std::to_string(op.vebp_wn_idx)  + "]";
+            std::string wsc_p = "p[" + std::to_string(op.vebp_wsc_idx) + "]";
+            ss << "    ve_vebp_matvec_ptr_inner((float*)" << dst
+               << ", (const unsigned long*)" << ws_p
+               << ", (const unsigned long*)" << wn_p
+               << ", (const float*)" << wsc_p
+               << ", (const float*)" << src1
+               << ", " << M << ", " << K << ");\n";
+            break;
+        }
+
         case OpType::ROPE: {
             int n_heads = (op.ne[1] > 1) ? op.ne[1] : 1;
             int head_sz = (int) op.ne[0];
@@ -1041,6 +1082,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
     // OpType::FLASH_ATTN F32 fallback (kept until we add an _inner there).
     ss << "extern void ve_bf16_matvec_rowmajor_ptr_inner(float* y, const uint16_t* W, const float* x, int M, int K);\n";
     ss << "extern void ve_q4k_matvec_rowmajor_ptr_inner(float* y, const unsigned char* qs, const unsigned char* hdr, const float* x, int M, int K);\n";
+    ss << "extern void ve_vebp_matvec_ptr_inner(float* y, const unsigned long* ws, const unsigned long* wn, const float* wsc, const float* x, int M, int K);\n";
     ss << "extern void ve_f32_matvec_ptr(float* y, const float* W, const float* x, int M, int K);\n";
     ss << "extern void attention_f32_raw_gqa_stride_omp(float* out, const float* q, const void* k, const void* v,"
        << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, float scale,"
@@ -1258,6 +1300,7 @@ CompiledGraph * GraphCompiler::load_compiled(const std::string & so_path, const 
     }
     cg->colmajor_specs = colmajor_specs_;
     cg->q4k_specs      = q4k_specs_;
+    cg->vebp_specs     = vebp_specs_;
     return cg;
 }
 
@@ -1369,7 +1412,10 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         while (slot_pos < (size_t) graph->num_slots
                && (graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_COLMAJOR
                    || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_Q4K_QS
-                   || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_Q4K_HDR)) {
+                   || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_Q4K_HDR
+                   || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_VEBP_WS
+                   || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_VEBP_WN
+                   || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_VEBP_WSC)) {
             ++slot_pos;
         }
     };
@@ -1457,6 +1503,43 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         }
     }
 
+    // VEBP companion slots (interleaved sign/nz planes + group scales).
+    if (!graph->vebp_specs.empty() && bctx) {
+        size_t spec_i = 0;
+        for (int i = 0; i < current_graph->n_nodes && spec_i < graph->vebp_specs.size(); i++) {
+            const ggml_tensor * node = current_graph->nodes[i];
+            if (!node || node->op != GGML_OP_MUL_MAT) continue;
+            const ggml_tensor * w = node->src[0];
+            if (!w || w->type != GGML_TYPE_VEBP) continue;
+            const VebpSpec & sp = graph->vebp_specs[spec_i++];
+            VEDAdeviceptr ws = 0, wn = 0, wsc = 0;
+            const char * name = (w->name && w->name[0]) ? w->name : nullptr;
+            // weights are device-resident here -> peek cache, bounce only on miss
+            if (!bctx->cache().vebp_lookup(name, (uint64_t) sp.M, (uint64_t) sp.K,
+                                           &ws, &wn, &wsc)) {
+                const void * src = w->data;
+                std::unique_ptr<uint8_t[]> bounce;
+                const int64_t wbytes = (int64_t) sp.M * (sp.K / 256) * 68;
+                if (w->buffer && !ggml_backend_buffer_is_host(w->buffer)) {
+                    bounce.reset(new uint8_t[wbytes]);
+                    if (vedaMemcpyDtoH(bounce.get(), (VEDAdeviceptr)(uintptr_t) w->data,
+                                       wbytes) != VEDA_SUCCESS) return false;
+                    src = bounce.get();
+                }
+                if (!bctx->cache().get_or_upload_vebp(name, src, (uint64_t) sp.M,
+                                                      (uint64_t) sp.K, &ws, &wn, &wsc)) {
+                    if (debug_enabled())
+                        fprintf(stderr, "[VE-GC] vebp upload failed for %s (M=%ld K=%ld)\n",
+                                name ? name : "?", (long) sp.M, (long) sp.K);
+                    return false;
+                }
+            }
+            if (sp.ws_slot  >= 0 && sp.ws_slot  < (int) tptrs.size()) tptrs[sp.ws_slot]  = ws;
+            if (sp.wn_slot  >= 0 && sp.wn_slot  < (int) tptrs.size()) tptrs[sp.wn_slot]  = wn;
+            if (sp.wsc_slot >= 0 && sp.wsc_slot < (int) tptrs.size()) tptrs[sp.wsc_slot] = wsc;
+        }
+    }
+
     // After walking the cgraph + populating colmajor slots, slot_pos should
     // have stepped past every WEIGHT/KV/INTERMEDIATE slot in the table —
     // anything less means try_push ran out of cgraph tensors before filling
@@ -1480,6 +1563,9 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         if (graph->slot_kinds[i] == BufferKind::WEIGHT_COLMAJOR) continue;
         if (graph->slot_kinds[i] == BufferKind::WEIGHT_Q4K_QS)   continue;
         if (graph->slot_kinds[i] == BufferKind::WEIGHT_Q4K_HDR)  continue;
+        if (graph->slot_kinds[i] == BufferKind::WEIGHT_VEBP_WS)  continue;
+        if (graph->slot_kinds[i] == BufferKind::WEIGHT_VEBP_WN)  continue;
+        if (graph->slot_kinds[i] == BufferKind::WEIGHT_VEBP_WSC) continue;
         if (tptrs[i] == 0) {
             if (debug_enabled()) {
                 fprintf(stderr, "[VE-GC] slot %zu kind=%d is NULL — abort\n",

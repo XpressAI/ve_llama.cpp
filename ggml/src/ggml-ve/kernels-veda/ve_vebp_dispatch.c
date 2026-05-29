@@ -31,6 +31,57 @@ extern void vebp_build_act_planes(const float *x, int nbits, long wpr,
 /* reusable activation scratch (single-threaded VEDA kernel context) */
 static uint64_t *g_asign = NULL, *g_amag = NULL;
 static size_t    g_acap = 0;   /* in uint64 units of wpr */
+static float     g_ptr_ax = 0.0f;  /* shares ax single->for in ptr_inner */
+
+/* Pointer-arg variant for the graph compiler's generated kernel. Called
+ * from INSIDE the kernel's `#pragma omp parallel` region (all threads enter).
+ * Builds the activation planes once via `#pragma omp single` (implicit
+ * barrier publishes the shared scratch + scale), then shares the rowblock
+ * matmul across the team with `#pragma omp for`. Pointers are raw HBM
+ * (resolved by the slot table) -- no vedaMemPtr here. */
+void ve_vebp_matvec_ptr_inner(float *y, const uint64_t *ws, const uint64_t *wn,
+                              const float *wsc, const float *x, int M, int K) {
+    const long wpr = (long) K / 64;
+    const long ng  = (long) K / 128;
+    const long Mfull = (long) M / VEBP_RB;
+    const long Mtail = (long) M % VEBP_RB;
+
+    #pragma omp single
+    {
+        if ((size_t) wpr > g_acap) {
+            if (g_asign) free(g_asign);
+            if (g_amag)  free(g_amag);
+            g_asign = (uint64_t *) aligned_alloc(64, (size_t) wpr * sizeof(uint64_t));
+            g_amag  = (uint64_t *) aligned_alloc(64, (size_t) VEBP_NB * wpr * sizeof(uint64_t));
+            g_acap  = wpr;
+        }
+        float amax = 0.0f;
+        for (long k = 0; k < (long) K; k++) { float a = fabsf(x[k]); if (a > amax) amax = a; }
+        g_ptr_ax = amax / 127.0f + 1e-12f;
+        vebp_build_act_planes(x, VEBP_NB, wpr, g_asign, g_amag, 1.0f / g_ptr_ax);
+    }  /* implicit barrier */
+
+    #pragma omp for
+    for (long rb = 0; rb < Mfull; rb++) {
+        vebp_block_vpcnt_scaled(ws  + rb * wpr * VEBP_RB,
+                                wn  + rb * wpr * VEBP_RB,
+                                wsc + rb * ng  * VEBP_RB,
+                                g_asign, g_amag, VEBP_NB, wpr, g_ptr_ax,
+                                y + rb * VEBP_RB);
+    }
+    if (Mtail) {
+        #pragma omp single
+        {
+            float ytail[VEBP_RB];
+            const long rb = Mfull;
+            vebp_block_vpcnt_scaled(ws  + rb * wpr * VEBP_RB,
+                                    wn  + rb * wpr * VEBP_RB,
+                                    wsc + rb * ng  * VEBP_RB,
+                                    g_asign, g_amag, VEBP_NB, wpr, g_ptr_ax, ytail);
+            for (long r = 0; r < Mtail; r++) y[rb * VEBP_RB + r] = ytail[r];
+        }
+    }
+}
 
 uint64_t ve_vebp_matvec_hbm(uint64_t y_vptr, uint64_t Ws_vptr, uint64_t Wn_vptr,
                             uint64_t wscale_vptr, uint64_t x_vptr,
