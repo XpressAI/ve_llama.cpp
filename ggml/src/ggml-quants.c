@@ -2411,6 +2411,58 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ====================== VEBP (VE-native ternary, sign+nonzero planes)
+
+void quantize_row_vebp_ref(const float * GGML_RESTRICT x, block_vebp * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_VEBP == 0);
+    const int64_t nb = k / QK_VEBP;
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_VEBP;
+        memset(y[i].nz,   0, sizeof(y[i].nz));
+        memset(y[i].sign, 0, sizeof(y[i].sign));
+        for (int g = 0; g < 2; ++g) {               // two 128-groups
+            // scale = mean magnitude over nonzero (absmean ternary)
+            float sum = 0.0f; int cnt = 0;
+            for (int j = 0; j < 128; ++j) {
+                float v = xb[g*128 + j];
+                if (v != 0.0f) { sum += fabsf(v); cnt++; }
+            }
+            float scale = cnt ? sum / cnt : 0.0f;
+            y[i].d[g] = GGML_FP32_TO_FP16(scale);
+            const float inv = scale > 0.0f ? 1.0f/scale : 0.0f;
+            for (int j = 0; j < 128; ++j) {
+                int idx = g*128 + j;
+                float v = xb[idx];
+                int q = (int) lrintf(v * inv);      // round to {-1,0,1}
+                if (q >  1) q =  1;
+                if (q < -1) q = -1;
+                if (q != 0) {
+                    y[i].nz[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+                    if (q > 0) y[i].sign[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+                }
+            }
+        }
+    }
+}
+
+void dequantize_row_vebp(const block_vebp * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_VEBP == 0);
+    const int64_t nb = k / QK_VEBP;
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d0 = GGML_FP16_TO_FP32(x[i].d[0]);
+        const float d1 = GGML_FP16_TO_FP32(x[i].d[1]);
+        for (int idx = 0; idx < QK_VEBP; ++idx) {
+            const int byte = idx >> 3, bit = idx & 7;
+            if ((x[i].nz[byte] >> bit) & 1) {
+                const float d = (idx < 128) ? d0 : d1;
+                *y++ = ((x[i].sign[byte] >> bit) & 1) ? d : -d;
+            } else {
+                *y++ = 0.0f;
+            }
+        }
+    }
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {

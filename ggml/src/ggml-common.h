@@ -277,6 +277,20 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// VEBP: VE-native ternary {-1,0,+1}. 256 elements = 2 groups of 128, each
+// with its own fp16 scale. Stored as two bit-planes (sign + nonzero) so the
+// VE matvec is bitwise-AND + hardware popcount. 68 B / 256 = 2.125 bits/elem.
+//   weight[i] = 0                         if (nz bit i)==0
+//             = +d[i/128]  if nz and sign bit i == 1
+//             = -d[i/128]  if nz and sign bit i == 0
+#define QK_VEBP 256
+typedef struct {
+    ggml_half d[2];              // per-128-group scales
+    uint8_t   nz[QK_VEBP/8];     // nonzero plane (256 bits)
+    uint8_t   sign[QK_VEBP/8];   // sign plane    (256 bits)
+} block_vebp;
+static_assert(sizeof(block_vebp) == 2*sizeof(ggml_half) + QK_VEBP/4, "wrong vebp block size/padding");
+
 //
 // Super-block quantization structures
 //
