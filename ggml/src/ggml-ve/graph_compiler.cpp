@@ -726,8 +726,12 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
     const std::string elem_n = scales_n ? (std::to_string(pt) + "LL * n_tok")
                                         : (std::to_string(full) + "LL");
 
+    // NOTE: keep this comment free of N-dependent values (n, NB) — the JIT
+    // cache key is the source hash, so baking the token count here would force
+    // a separate compile per prompt length. pt is per-token (N-independent).
+    (void) n;
     ss << "    // op " << idx << ": " << op_type_name(op.type)
-       << "  '" << op.name << "'  n=" << n << " pt=" << pt << " NB=" << NB << "\n";
+       << "  '" << op.name << "'  pt=" << pt << "\n";
 
     switch (op.type) {
         case OpType::GET_ROWS: {
@@ -1209,25 +1213,19 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
         }
 
         case OpType::GLU_SWIGLU: {
-            // SWIGLU: y = silu(gate) * up. gate/up/dst are F32 with the
-            // same shape; row count is ggml_nrows(gate) = ne[1]*ne[2]*ne[3].
-            int64_t nc = op.ne[0];
-            int64_t nr = (op.ne[1] > 0 ? op.ne[1] : 1) *
-                         (op.ne[2] > 0 ? op.ne[2] : 1) *
-                         (op.ne[3] > 0 ? op.ne[3] : 1);
+            // SWIGLU: y = silu(gate) * up. gate/up/dst are F32 with the same
+            // shape. We parallelise the flat element range (= per-token ffn dim
+            // * n_tok) with one `#pragma omp for` (all 8 threads share it; the
+            // external swiglu_hbm_full_inner split over rows, leaving 7 threads
+            // idle at decode where there's one row). NOTE: emit no N-dependent
+            // size here — elem_n is per-token*n_tok, keeping the source
+            // size-independent. Clamp before expf — the VE's vectorised expf
+            // returns NaN past |x|~88 (see CLAUDE.md).
             ss << "    {\n";
-            ss << "        int nc = " << nc << ", nr = " << nr << ";\n";
             ss << "        float* y    = (float*)" << dst  << ";\n";
             ss << "        float* gate = (float*)" << src0 << ";\n";
             ss << "        float* up   = (float*)" << src1 << ";\n";
-            // Inline SWIGLU over the flat element range. gate/up/y are
-            // contiguous row-major [nc,nr], so we parallelise the whole
-            // nc*nr range with one `#pragma omp for` (all 8 threads share it;
-            // the external swiglu_hbm_full_inner only split over nr, leaving
-            // 7 threads idle at decode where nr==1). Clamp before expf — the
-            // VE's vectorised expf returns NaN past |x|~88 (see CLAUDE.md).
             ss << "        long total = (long)(" << elem_n << ");\n";
-            ss << "        (void)nc; (void)nr;\n";
             ss << "        #pragma omp for\n";
             ss << "        for (long i = 0; i < total; i++) {\n";
             ss << "            float g = gate[i];\n";
