@@ -616,12 +616,19 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
             if (s == 0) continue;                            // this op's own dst (output)
             if (t->op == GGML_OP_NONE) continue;             // leaf input
             if (pre_produced.count(canonical(t))) continue;  // produced here
-            // GGML_VE_GC_ALLOW_FRAGMENTS=1: bypass the gate to debug why
-            // chaining compiled middle fragments garbles (task #70).
-            static const bool allow_frags = (std::getenv("GGML_VE_GC_ALLOW_FRAGMENTS") != nullptr);
-            if (allow_frags) continue;
+            // Cross-fragment intermediate input: a computed tensor produced by
+            // a DIFFERENT subgraph and read here (e.g. 'embd' from a CPU-side
+            // GET_ROWS when token_embd is F16). execute() stages it host<->HBM;
+            // the producing subgraph (interpreted, or a prior compiled graph)
+            // writes the host tensor before this one runs, so it's correct.
+            // This was refused while un-implemented YaRN rope made fragmented
+            // compiles garble; with YaRN + chunking fixed it's safe and lets
+            // VEBP/Qwen3 models compile (Ternary-Bonsai-8B VEBP: 10.6 -> 33
+            // tok/s). GGML_VE_GC_STRICT=1 restores the refusal.
+            static const bool strict = (std::getenv("GGML_VE_GC_STRICT") != nullptr);
+            if (!strict) continue;
             if (debug_enabled()) {
-                fprintf(stderr, "[VE-GC] refuse: cross-fragment intermediate input '%s' (%s) at op #%d — interpreter will run this fragment\n",
+                fprintf(stderr, "[VE-GC] refuse (strict): cross-fragment intermediate input '%s' (%s) at op #%d\n",
                         t->name ? t->name : "?", bn ? bn : "<no-buffer>", i);
             }
             trace_valid_ = false;

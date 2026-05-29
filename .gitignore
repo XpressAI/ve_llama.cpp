@@ -163,3 +163,5 @@ AGENTS.local.md
 ftrace.out.*
 ve_sgemv_wrapper.L
 PR_DESCRIPTION.md
+graph_*.L
+graph_*.so.c
