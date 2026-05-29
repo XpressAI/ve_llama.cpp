@@ -38,7 +38,11 @@ bool mul_mat_supports(const ggml_tensor * op) {
     const ggml_tensor * x = op->src[1];
     if (w == nullptr || x == nullptr) return rej("missing srcs");
     if (x->type != GGML_TYPE_F32) return rej("x not f32");
-    if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16) return rej("w type");
+    // F16 weights (e.g. a tied/F16 token_embd used as the lm_head) are accepted:
+    // the VE has no F16 path, so they're converted to BF16 once at HBM upload
+    // (same byte size) and run through the BF16 matvec/colmajor paths below.
+    if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16 &&
+        w->type != GGML_TYPE_F16) return rej("w type");
 
     // Shapes: dst = src0 @ src1^T  ->  K matches, M = src0 row dim, N = src1 row dim.
     const int64_t K = w->ne[0];
@@ -62,9 +66,9 @@ bool mul_mat_supports(const ggml_tensor * op) {
     //   BF16  N>1  : ve_bf16_matmul_hbm_full     (sgemv_packed_bf16_unr per batch)
     //    F32  N=1  : ve_f32_matvec_hbm_full
     //    F32  N>1  : ve_f32_sgemm_batched_cblas_hbm  (NLC cblas_sgemm)
-    if (w->type == GGML_TYPE_BF16 && (K % 16) != 0) {
+    if ((w->type == GGML_TYPE_BF16 || w->type == GGML_TYPE_F16) && (K % 16) != 0) {
         // The packed BF16 sgemv unrolls 16 across K, so K must be a multiple
-        // of 16 to stay inside the row.
+        // of 16 to stay inside the row. (F16 is converted to BF16, same rule.)
         return rej("BF16 K%16 != 0");
     }
     if (M <= 0 || K <= 0 || N <= 0) return rej("zero dim");
@@ -108,7 +112,13 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
     const uint64_t K = (uint64_t) w->ne[0];
     const uint64_t N = (uint64_t) x->ne[1];
 
-    const VEDAdeviceptr w_vptr = ctx->resolve_in(w);
+    // F16 weight -> BF16 once on upload (same byte size); downstream treats it
+    // as BF16 (w_is_bf16). All other types go through the normal resolver.
+    const bool w_is_bf16 = (w->type == GGML_TYPE_BF16 || w->type == GGML_TYPE_F16);
+    const VEDAdeviceptr w_vptr =
+        (w->type == GGML_TYPE_F16)
+            ? ctx->cache().get_or_upload_f16_as_bf16(w->name, w->data, ggml_nbytes(w))
+            : ctx->resolve_in(w);
     const VEDAdeviceptr x_vptr = ctx->resolve_in(x);
     const VEDAdeviceptr y_vptr = ctx->resolve_out(dst);
     if (w_vptr == 0 || x_vptr == 0 || y_vptr == 0) return false;
@@ -149,7 +159,7 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
         (std::getenv("GGML_VE_COLMAJOR_N1") != nullptr);
     if (colmajor_enabled
         && (N > 1 || n1_colmajor)
-        && w->type == GGML_TYPE_BF16
+        && w_is_bf16
         && ctx->dev() && ctx->dev()->colmajor
         && ctx->fn(K_BF16_TO_F32_COLMAJOR_HBM) != 0
         && ctx->fn(K_F32_SGEMM_BATCHED_CBLAS_HBM_NOTRANS) != 0) {
@@ -196,7 +206,7 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
     VEDAfunction fn = 0;
     bool include_N = false;
 
-    if (w->type == GGML_TYPE_BF16) {
+    if (w_is_bf16) {
         if (N == 1) {
             fn = ctx->fn(K_BF16_MATVEC_HBM_FULL);
         } else {

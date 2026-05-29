@@ -229,7 +229,12 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
         }
         out_idx = assign_buffer(src, out_kind);
         for (int i = 0; i < 4; ++i) out_ne[i] = src->ne[i];
-        if (slot == 0) op.src_type = src->type;
+        // F16 weights are uploaded as BF16 (the VE has no F16 path); map the
+        // type here so MUL_MAT classification and the GET_ROWS codegen take the
+        // BF16 path, matching the BF16-converted HBM copy uploaded at execute.
+        if (slot == 0) {
+            op.src_type = (src->type == GGML_TYPE_F16) ? GGML_TYPE_BF16 : src->type;
+        }
     };
     fill_src(0, node->src[0], op.src0_idx, op.src0_kind, op.src0_ne);
 
@@ -309,12 +314,11 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
             else if (op.src_type == GGML_TYPE_Q4_K) op.type = OpType::MUL_MAT_Q4K;
             else if (op.src_type == GGML_TYPE_VEBP) op.type = OpType::MUL_MAT_VEBP;
             else                                     op.type = OpType::MUL_MAT_F32;
-            // Q4_K / VEBP inners are matvec-only (N=1). The compiler already
-            // refuses N>1 MUL_MAT above (prompt eval), but guard explicitly.
-            if ((op.type == OpType::MUL_MAT_Q4K || op.type == OpType::MUL_MAT_VEBP)
-                && node->src[1] && node->src[1]->ne[1] != 1) {
-                return false;
-            }
+            // N>1 prompt eval is handled by looping the matvec _inner over the
+            // n_tok activation columns (see gen_op_code MUL_MAT_VEBP/Q4K), so
+            // Q4_K / VEBP MUL_MAT no longer needs to be matvec-only. (Removing
+            // this guard is what lets the VEBP/Q4K prompt graph compile instead
+            // of being exiled to the interpreter.)
             break;
         case GGML_OP_ROPE: {
             int32_t mode = 0, n_dims = 0;
@@ -805,8 +809,8 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "        float eps = " << flit(op.p.rms_norm.eps) << ";\n";
                 ss << "        #pragma omp for\n";
                 ss << "        for (long r = 0; r < rows; r++) {\n";
-                ss << "            const float* x = (const float*)" << src0 << " + r * cols;\n";
-                ss << "            float* y = (float*)" << dst << " + r * cols;\n";
+                ss << "            const float * restrict x = (const float*)" << src0 << " + r * cols;\n";
+                ss << "            float * restrict y = (float*)" << dst << " + r * cols;\n";
                 ss << "            float sumsq = 0.f;\n";
                 ss << "            for (int j = 0; j < cols; j++) sumsq += x[j] * x[j];\n";
                 ss << "            float inv = 1.f / sqrtf(sumsq / cols + eps);\n";
@@ -822,8 +826,8 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "        float eps = " << flit(op.p.rms_norm.eps) << ";\n";
                 ss << "        #pragma omp for\n";
                 ss << "        for (long r = 0; r < rows; r++) {\n";
-                ss << "            const float* x = (const float*)" << src0 << " + r * cols;\n";
-                ss << "            float* y = (float*)" << dst << " + r * cols;\n";
+                ss << "            const float * restrict x = (const float*)" << src0 << " + r * cols;\n";
+                ss << "            float * restrict y = (float*)" << dst << " + r * cols;\n";
                 ss << "            float sumsq = 0.f;\n";
                 ss << "            for (int j = 0; j < cols; j++) sumsq += x[j] * x[j];\n";
                 ss << "            float inv = 1.f / sqrtf(sumsq / cols + eps);\n";
@@ -870,11 +874,24 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             int64_t src1_period = op.src1_ne[0] * op.src1_ne[1] * op.src1_ne[2] * op.src1_ne[3];
             if (src1_period == 0) src1_period = op.src1_ne[0];
             if (src1_period <= 0) src1_period = 1;
-            ss << "    #pragma omp for\n";
-            ss << "    for (int64_t e = 0; e < " << elem_n << "; e++) {\n";
-            ss << "        ((float*)" << dst << ")[e] = "
-               << "((float*)" << src0 << ")[e] * "
-               << "((float*)" << src1 << ")[e % " << src1_period << "LL];\n";
+            // Nested (broadcast-block) form, NOT `src1[e % period]`: a modulo in
+            // the inner loop trips NCC's "loop division overhead" and forces
+            // scalar code. The inner loop runs the (compile-time-constant)
+            // period with contiguous src1[i], so it vectorises; the outer loop
+            // (reps = total/period, runtime) is shared across the team.
+            // `restrict` kills the void*-cast aliasing ("Dependency unknown").
+            ss << "    {\n";
+            ss << "        float * restrict yv = (float*)" << dst << ";\n";
+            ss << "        const float * restrict av = (const float*)" << src0 << ";\n";
+            ss << "        const float * restrict bv = (const float*)" << src1 << ";\n";
+            ss << "        const int64_t period = " << src1_period << "LL;\n";
+            ss << "        const int64_t reps   = (" << elem_n << ") / period;\n";
+            ss << "        #pragma omp for\n";
+            ss << "        for (int64_t r = 0; r < reps; r++) {\n";
+            ss << "            const float * restrict ar = av + r*period;\n";
+            ss << "            float * restrict yr = yv + r*period;\n";
+            ss << "            for (int64_t i = 0; i < period; i++) yr[i] = ar[i] * bv[i];\n";
+            ss << "        }\n";
             ss << "    }\n";
             break;
         }
@@ -882,10 +899,13 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
         case OpType::ADD:
             // src0 and src1 are the same shape (residual + branch). Element-wise
             // over the full per-token range (pt*n_tok when scaling, else full).
-            ss << "    #pragma omp for\n";
-            ss << "    for (int64_t e = 0; e < " << elem_n << "; e++) {\n";
-            ss << "        ((float*)" << dst << ")[e] = "
-               << "((float*)" << src0 << ")[e] + ((float*)" << src1 << ")[e];\n";
+            // restrict pointers so NCC vectorises (no assumed aliasing).
+            ss << "    {\n";
+            ss << "        float * restrict yv = (float*)" << dst << ";\n";
+            ss << "        const float * restrict av = (const float*)" << src0 << ";\n";
+            ss << "        const float * restrict bv = (const float*)" << src1 << ";\n";
+            ss << "        #pragma omp for\n";
+            ss << "        for (int64_t e = 0; e < " << elem_n << "; e++) yv[e] = av[e] + bv[e];\n";
             ss << "    }\n";
             break;
 
@@ -1222,9 +1242,9 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             // size-independent. Clamp before expf — the VE's vectorised expf
             // returns NaN past |x|~88 (see CLAUDE.md).
             ss << "    {\n";
-            ss << "        float* y    = (float*)" << dst  << ";\n";
-            ss << "        float* gate = (float*)" << src0 << ";\n";
-            ss << "        float* up   = (float*)" << src1 << ";\n";
+            ss << "        float * restrict y    = (float*)" << dst  << ";\n";
+            ss << "        const float * restrict gate = (const float*)" << src0 << ";\n";
+            ss << "        const float * restrict up   = (const float*)" << src1 << ";\n";
             ss << "        long total = (long)(" << elem_n << ");\n";
             ss << "        #pragma omp for\n";
             ss << "        for (long i = 0; i < total; i++) {\n";
@@ -1790,9 +1810,15 @@ bool GraphCompiler::execute(CompiledGraph * graph,
                 // 875-node decode graph was refused over this one weight.
                 size_t nb = ggml_nbytes(c);
                 const char * nm = (c->name && c->name[0]) ? c->name : nullptr;
-                VEDAdeviceptr w_hbm = nm
-                    ? bctx->cache().get_or_upload_by_name(nm, c->data, nb)
-                    : bctx->cache().get_or_upload(c->data, nb);
+                // F16 weights (e.g. a tied/F16 token_embd) have no VE F16 path:
+                // convert to BF16 once on upload (same byte size, so the view
+                // offset below is unchanged). The codegen treats this slot as
+                // BF16 (src_type is mapped F16->BF16 at trace).
+                VEDAdeviceptr w_hbm = (c->type == GGML_TYPE_F16)
+                    ? bctx->cache().get_or_upload_f16_as_bf16(nm, c->data, nb)
+                    : (nm
+                        ? bctx->cache().get_or_upload_by_name(nm, c->data, nb)
+                        : bctx->cache().get_or_upload(c->data, nb));
                 if (w_hbm) {
                     size_t off = (const uint8_t *) src_for_addr->data - (const uint8_t *) c->data;
                     hbm = w_hbm + off;

@@ -419,6 +419,10 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
                 if (cg2) {
                     new_entry.cg         = cg2;
                     new_entry.executable = gc.execute(cg2, ctx, cgraph);
+                    if (gc_verbose) {
+                        fprintf(stderr, "[VE-GC] first execute sig=%016lx n_nodes=%d -> executable=%d\n",
+                                (unsigned long) sig, cgraph->n_nodes, (int) new_entry.executable);
+                    }
                 } else if (gc_verbose) {
                     fprintf(stderr, "[VE-GC] compile failed for sig=%016lx\n", (unsigned long) sig);
                 }

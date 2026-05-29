@@ -21,7 +21,10 @@ bool get_rows_supports(const ggml_tensor * op) {
     const ggml_tensor * src = op->src[0];  // embeddings
     const ggml_tensor * idx = op->src[1];  // i32 indices
     if (src == nullptr || idx == nullptr) return false;
-    if (src->type != GGML_TYPE_BF16 && src->type != GGML_TYPE_F32) return false;
+    // F16 src (e.g. a tied/F16 token_embd) is accepted: the VE has no F16 path,
+    // so it's converted to BF16 once at HBM upload and served by the BF16 kernel.
+    if (src->type != GGML_TYPE_BF16 && src->type != GGML_TYPE_F32 &&
+        src->type != GGML_TYPE_F16) return false;
     if (idx->type != GGML_TYPE_I32) return false;
     // Need contiguous indices and output.
     if (!ggml_is_contiguous(idx) || !ggml_is_contiguous(op)) return false;
@@ -37,8 +40,12 @@ bool get_rows(backend_context * ctx, ggml_tensor * dst) {
 
     // src (embedding table) is typically a CPU-side BF16 weight on first
     // call; resolve_in uploads it via hbm_weight_cache so subsequent calls
-    // re-use the cached HBM ptr.
-    const VEDAdeviceptr src_hbm = ctx->resolve_in(src);
+    // re-use the cached HBM ptr. F16 weights are converted to BF16 once on
+    // upload (same byte size) and served by the BF16 kernel below.
+    const VEDAdeviceptr src_hbm =
+        (src->type == GGML_TYPE_F16)
+            ? ctx->cache().get_or_upload_f16_as_bf16(src->name, src->data, ggml_nbytes(src))
+            : ctx->resolve_in(src);
     const VEDAdeviceptr dst_hbm = ctx->resolve_out(dst);
     if (src_hbm == 0 || dst_hbm == 0) return false;
 
@@ -72,7 +79,7 @@ bool get_rows(backend_context * ctx, ggml_tensor * dst) {
     }
     ctx->enqueue_hbm_free(idx_tmp);
 
-    kernel_id kid = (src->type == GGML_TYPE_BF16)
+    kernel_id kid = (src->type == GGML_TYPE_BF16 || src->type == GGML_TYPE_F16)
         ? K_GET_ROWS_BF16_F32_HBM_HBM
         : K_GET_ROWS_F32_F32_HBM_HBM;
     VEDAfunction fn = ctx->fn(kid);

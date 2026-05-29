@@ -64,7 +64,8 @@ public:
         for (auto & e : entries_) {
             if (e.host_data == host_data && e.size == size &&
                 e.format != GGML_VE_HBM_FP32_COLMAJOR &&
-                e.format != GGML_VE_HBM_BF16_COLMAJOR) {
+                e.format != GGML_VE_HBM_BF16_COLMAJOR &&
+                e.format != GGML_VE_HBM_BF16_FROM_F16) {
                 hits_++;
                 return e.vptr;
             }
@@ -98,6 +99,56 @@ public:
         VEDAdeviceptr v = upload(host_data, size);
         if (v == 0) return 0;
         record(v, size, host_data, tensor_name, GGML_VE_HBM_FP32);
+        return v;
+    }
+
+    // F16 weight -> BF16 on upload. The VE has no F16 vector path, so we
+    // re-pack each F16 element to BF16 (both are 2 bytes, so the byte size and
+    // every row stride are identical) and serve it through the normal BF16
+    // kernels — this is what lets VEBP's F16 token_embd run GET_ROWS and the
+    // tied lm_head MUL_MAT on the VE instead of fragmenting onto the CPU.
+    // Keyed by name with a distinct format so it never aliases a raw entry.
+    VEDAdeviceptr get_or_upload_f16_as_bf16(const char * tensor_name,
+                                            const void * host_f16,
+                                            size_t size_bytes) {
+        if (tensor_name != nullptr) {
+            for (auto & e : entries_) {
+                if (e.format == GGML_VE_HBM_BF16_FROM_F16 &&
+                    e.name == tensor_name && e.size == size_bytes) {
+                    hits_++;
+                    return e.vptr;
+                }
+            }
+        }
+        for (auto & e : entries_) {
+            if (e.format == GGML_VE_HBM_BF16_FROM_F16 &&
+                e.host_data == host_f16 && e.size == size_bytes) {
+                hits_++;
+                return e.vptr;
+            }
+        }
+        const size_t n = size_bytes / sizeof(uint16_t);
+        std::vector<uint16_t> bf16(n);
+        const ggml_fp16_t * src = (const ggml_fp16_t *) host_f16;
+        // Convert via ggml's row helpers (F16C-accelerated F16->F32, then a
+        // shift+round F32->BF16) in chunks. A per-element ggml_fp16_to_fp32 /
+        // ggml_fp32_to_bf16 call loop is ~16 ns/elem (~10 s for a 621M-element
+        // token_embd) — slow enough to dominate the first prompt eval; the row
+        // helpers bring it to well under a second.
+        {
+            const size_t CHUNK = 1u << 20;  // 1M elems -> 4 MB f32 scratch
+            std::vector<float> f32(CHUNK < n ? CHUNK : n);
+            for (size_t off = 0; off < n; off += CHUNK) {
+                const size_t cnt = (n - off < CHUNK) ? (n - off) : CHUNK;
+                ggml_fp16_to_fp32_row(src + off, f32.data(), (int64_t) cnt);
+                ggml_fp32_to_bf16_row(f32.data(),
+                                      (ggml_bf16_t *) (bf16.data() + off),
+                                      (int64_t) cnt);
+            }
+        }
+        VEDAdeviceptr v = upload(bf16.data(), size_bytes);
+        if (v == 0) return 0;
+        record(v, size_bytes, host_f16, tensor_name, GGML_VE_HBM_BF16_FROM_F16);
         return v;
     }
 

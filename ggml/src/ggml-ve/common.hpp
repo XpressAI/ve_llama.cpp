@@ -89,6 +89,9 @@ enum ggml_ve_hbm_format {
     GGML_VE_HBM_VEBP_WS       = 7,  // VEBP interleaved sign plane  [blk][word][256]
     GGML_VE_HBM_VEBP_WN       = 8,  // VEBP interleaved nonzero plane
     GGML_VE_HBM_VEBP_WSCALE   = 9,  // VEBP interleaved group scales [blk][grp][256]
+    GGML_VE_HBM_BF16_FROM_F16 = 10, // F16 weight converted to BF16 on upload
+                                    // (VE has no F16 path; BF16 is the same
+                                    //  2-byte size, so strides are unchanged)
 };
 
 #endif // GGML_VE_COMMON_HPP
