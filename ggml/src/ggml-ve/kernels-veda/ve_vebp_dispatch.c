@@ -33,6 +33,11 @@ static uint64_t *g_asign = NULL, *g_amag = NULL;
 static size_t    g_acap = 0;   /* in uint64 units of wpr */
 static float     g_ptr_ax = 0.0f;  /* shares ax single->for in ptr_inner */
 
+/* batched (N-column) activation scratch for ve_vebp_matmul_ptr_inner */
+static uint64_t *g_asignN = NULL, *g_amagN = NULL;
+static float    *g_axN    = NULL;
+static long      g_Ncap = 0, g_wprcapN = 0;
+
 /* Pointer-arg variant for the graph compiler's generated kernel. Called
  * from INSIDE the kernel's `#pragma omp parallel` region (all threads enter).
  * Builds the activation planes once via `#pragma omp single` (implicit
@@ -79,6 +84,84 @@ void ve_vebp_matvec_ptr_inner(float *y, const uint64_t *ws, const uint64_t *wn,
                                     wsc + rb * ng  * VEBP_RB,
                                     g_asign, g_amag, VEBP_NB, wpr, g_ptr_ax, ytail);
             for (long r = 0; r < Mtail; r++) y[rb * VEBP_RB + r] = ytail[r];
+        }
+    }
+}
+
+/* Batched matmul variant: y[M,N] = W[M,K] @ X[K,N], one fused call instead of
+ * the graph compiler's per-column matvec loop. Called from INSIDE the kernel's
+ * `#pragma omp parallel`. Quantises all N activation columns in parallel, then
+ * shares ONE rowblock loop across the team — each rowblock's interleaved weight
+ * is loaded from HBM once and reused (from cache) across all N columns, instead
+ * of the col-loop re-traversing the whole weight from HBM N times. The vpcnt
+ * work itself is inherently N x (one dot product per column), so this recovers
+ * the weight-traffic + barrier + serial-quant overhead, not the compute.
+ * y column j is at y + j*M (matches the col-major dst the codegen used). */
+void ve_vebp_matmul_ptr_inner(float *y, const uint64_t *ws, const uint64_t *wn,
+                              const float *wsc, const float *x,
+                              int M, int K, int N) {
+    const long wpr   = (long) K / 64;
+    const long ng    = (long) K / 128;
+    const long Mfull = (long) M / VEBP_RB;
+    const long Mtail = (long) M % VEBP_RB;
+
+    #pragma omp single
+    {
+        if ((long) N > g_Ncap || wpr > g_wprcapN) {
+            if (g_asignN) free(g_asignN);
+            if (g_amagN)  free(g_amagN);
+            if (g_axN)    free(g_axN);
+            g_asignN = (uint64_t *) aligned_alloc(64, (size_t) N * wpr * sizeof(uint64_t));
+            g_amagN  = (uint64_t *) aligned_alloc(64, (size_t) N * VEBP_NB * wpr * sizeof(uint64_t));
+            g_axN    = (float *)    aligned_alloc(64, (size_t) N * sizeof(float));
+            g_Ncap = N; g_wprcapN = wpr;
+        }
+    }  /* implicit barrier: scratch published */
+
+    /* Quantise each of the N activation columns (independent -> omp for). */
+    #pragma omp for
+    for (long j = 0; j < (long) N; j++) {
+        const float *xj = x + j * (long) K;
+        float amax = 0.0f;
+        for (long k = 0; k < (long) K; k++) { float a = fabsf(xj[k]); if (a > amax) amax = a; }
+        float axj = amax / 127.0f + 1e-12f;
+        g_axN[j] = axj;
+        vebp_build_act_planes(xj, VEBP_NB, wpr,
+                              g_asignN + j * wpr,
+                              g_amagN  + j * VEBP_NB * wpr,
+                              1.0f / axj);
+    }  /* implicit barrier: all planes ready */
+
+    /* One rowblock loop; inner N columns reuse the cached weight block. */
+    #pragma omp for
+    for (long rb = 0; rb < Mfull; rb++) {
+        const uint64_t *wsb  = ws  + rb * wpr * VEBP_RB;
+        const uint64_t *wnb  = wn  + rb * wpr * VEBP_RB;
+        const float    *wscb = wsc + rb * ng  * VEBP_RB;
+        for (long j = 0; j < (long) N; j++) {
+            vebp_block_vpcnt_scaled(wsb, wnb, wscb,
+                                    g_asignN + j * wpr,
+                                    g_amagN  + j * VEBP_NB * wpr,
+                                    VEBP_NB, wpr, g_axN[j],
+                                    y + j * (long) M + rb * VEBP_RB);
+        }
+    }
+    if (Mtail) {
+        #pragma omp single
+        {
+            float ytail[VEBP_RB];
+            const long rb = Mfull;
+            const uint64_t *wsb  = ws  + rb * wpr * VEBP_RB;
+            const uint64_t *wnb  = wn  + rb * wpr * VEBP_RB;
+            const float    *wscb = wsc + rb * ng  * VEBP_RB;
+            for (long j = 0; j < (long) N; j++) {
+                vebp_block_vpcnt_scaled(wsb, wnb, wscb,
+                                        g_asignN + j * wpr,
+                                        g_amagN  + j * VEBP_NB * wpr,
+                                        VEBP_NB, wpr, g_axN[j], ytail);
+                for (long r = 0; r < Mtail; r++)
+                    y[j * (long) M + rb * VEBP_RB + r] = ytail[r];
+            }
         }
     }
 }

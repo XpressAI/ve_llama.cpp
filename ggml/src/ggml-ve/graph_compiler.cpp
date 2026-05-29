@@ -1002,13 +1002,26 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             std::string ws_p  = "p[" + std::to_string(op.vebp_ws_idx)  + "]";
             std::string wn_p  = "p[" + std::to_string(op.vebp_wn_idx)  + "]";
             std::string wsc_p = "p[" + std::to_string(op.vebp_wsc_idx) + "]";
-            ss << "    for (int64_t col = 0; col < " << col_n << "; col++)\n";
-            ss << "        ve_vebp_matvec_ptr_inner((float*)" << dst << " + col*" << M
-               << ", (const unsigned long*)" << ws_p
-               << ", (const unsigned long*)" << wn_p
-               << ", (const float*)" << wsc_p
-               << ", (const float*)" << src1 << " + col*" << K
-               << ", " << M << ", " << K << ");\n";
+            if (scales_n) {
+                // N>1: one batched call — the rowblock weight is read once and
+                // reused across all n_tok columns (vs the col-loop re-traversing
+                // the whole weight from HBM per column).
+                ss << "    ve_vebp_matmul_ptr_inner((float*)" << dst
+                   << ", (const unsigned long*)" << ws_p
+                   << ", (const unsigned long*)" << wn_p
+                   << ", (const float*)" << wsc_p
+                   << ", (const float*)" << src1
+                   << ", " << M << ", " << K << ", (int)n_tok);\n";
+            } else {
+                // decode / n_out tail: per-column matvec (col_n is 1).
+                ss << "    for (int64_t col = 0; col < " << col_n << "; col++)\n";
+                ss << "        ve_vebp_matvec_ptr_inner((float*)" << dst << " + col*" << M
+                   << ", (const unsigned long*)" << ws_p
+                   << ", (const unsigned long*)" << wn_p
+                   << ", (const float*)" << wsc_p
+                   << ", (const float*)" << src1 << " + col*" << K
+                   << ", " << M << ", " << K << ");\n";
+            }
             break;
         }
 
@@ -1314,6 +1327,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     ss << "extern void ve_bf16_matvec_rowmajor_ptr_inner(float* y, const uint16_t* W, const float* x, int M, int K);\n";
     ss << "extern void ve_q4k_matvec_rowmajor_ptr_inner(float* y, const unsigned char* qs, const unsigned char* hdr, const float* x, int M, int K);\n";
     ss << "extern void ve_vebp_matvec_ptr_inner(float* y, const unsigned long* ws, const unsigned long* wn, const float* wsc, const float* x, int M, int K);\n";
+    ss << "extern void ve_vebp_matmul_ptr_inner(float* y, const unsigned long* ws, const unsigned long* wn, const float* wsc, const float* x, int M, int K, int N);\n";
     ss << "extern void ve_f32_matvec_ptr(float* y, const float* W, const float* x, int M, int K);\n";
     ss << "extern void attention_f32_raw_gqa_stride_omp(float* out, const float* q, const void* k, const void* v,"
        << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, float scale,"
