@@ -11647,6 +11647,18 @@ uint64_t ve_rope_neox_hbm_omp_nocache(VEDAdeviceptr y_hbm,
     float corr_lo, corr_hi;
     ve_rope_corr_dims(nd, (int)n_ctx_orig, freq_base, beta_fast, beta_slow, &corr_lo, &corr_hi);
 
+    /* Vectorisation prep. The old per-element ve_rope_yarn() call + the
+     * theta *= theta_scale recurrence forced the inner loop fully SCALAR
+     * (V.OP 0%, ~30M calls = 32% of prompt-eval). Precompute theta_scale^i
+     * once (breaks the recurrence -> theta[i] independent) and fold YaRN into
+     * a branchless form (ramp_mix == 0 when ext_factor == 0), so the inner
+     * loop is call-free + branch-free and NCC vectorises cos/sin (libsysve). */
+    float ts_pow[512];
+    { float p = 1.0f; for (int i = 0; i < half_nd && i < 512; i++) { ts_pow[i] = p; p *= theta_scale; } }
+    const float ms_eff    = (ext_factor != 0.0f) ? mscale * (1.0f + 0.1f * logf(1.0f / freq_scale)) : mscale;
+    float denom = corr_hi - corr_lo; if (denom < 0.001f) denom = 0.001f;
+    const float inv_denom = 1.0f / denom;
+
     int total_rows = batch * ctx * heads;
 
     #pragma omp parallel for
@@ -11656,7 +11668,7 @@ uint64_t ve_rope_neox_hbm_omp_nocache(VEDAdeviceptr y_hbm,
         int i2 = rem / heads;
         int i1 = rem % heads;
 
-        float theta_extrap = (float)pos[i2];   /* NOT freq-scaled — YaRN needs extrap */
+        const float posf = (float)pos[i2];
 
         size_t src_offset = i3 * nb3 + i2 * nb2 + i1 * nb1;
         size_t dst_offset = src_offset;
@@ -11664,20 +11676,23 @@ uint64_t ve_rope_neox_hbm_omp_nocache(VEDAdeviceptr y_hbm,
         const float* src = (const float*)((const char*)x + src_offset);
         float* dst = (float*)((char*)y + dst_offset);
 
-        /* NeoX style: rotate first half with second half */
+        /* NeoX style: rotate first half with second half. Branchless YaRN. */
         #pragma _NEC ivdep
         for (int i0 = 0; i0 < half_nd; i0++) {
-            float cos_val, sin_val;
-            ve_rope_yarn(theta_extrap, freq_scale, corr_lo, corr_hi, i0,
-                         ext_factor, mscale, &cos_val, &sin_val);
+            float theta_extrap = posf * ts_pow[i0];
+            float theta_interp = freq_scale * theta_extrap;
+            float yv = ((float) i0 - corr_lo) * inv_denom;
+            yv = yv < 0.0f ? 0.0f : (yv > 1.0f ? 1.0f : yv);
+            float rmix = (1.0f - yv) * ext_factor;            /* 0 when ext_factor==0 */
+            float theta = theta_interp * (1.0f - rmix) + theta_extrap * rmix;
+            float c = cosf(theta) * ms_eff;
+            float s = sinf(theta) * ms_eff;
 
             float x0 = src[i0];
             float x1 = src[i0 + half_nd];
 
-            dst[i0]           = x0 * cos_val - x1 * sin_val;
-            dst[i0 + half_nd] = x0 * sin_val + x1 * cos_val;
-
-            theta_extrap *= theta_scale;
+            dst[i0]           = x0 * c - x1 * s;
+            dst[i0 + half_nd] = x0 * s + x1 * c;
         }
 
         /* Copy remaining elements unchanged */
