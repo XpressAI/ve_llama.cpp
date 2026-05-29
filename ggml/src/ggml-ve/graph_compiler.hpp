@@ -211,7 +211,7 @@ public:
     // Compile the traced graph. The on-disk cache key is the hash of
     // the emitted source itself, so two cgraphs that produce identical
     // code share a single .so.
-    CompiledGraph * compile(int64_t n_ctx);
+    CompiledGraph * compile();
 
     // Execute a previously-compiled graph for the current cgraph.
     // - resolves weight HBM pointers via name lookup from current_graph
@@ -250,7 +250,7 @@ private:
     bool        is_weight(const ggml_tensor * t) const;
     int         assign_buffer(const ggml_tensor * t, BufferKind & kind_out);
     bool        trace_one(ggml_tensor * node);
-    std::string generate_source(const std::string & func_name, int64_t n_ctx) const;
+    std::string generate_source(const std::string & func_name) const;
     std::string gen_op_code(const TracedOp & op, int idx) const;
     static std::string compute_hash(const std::string & source);
     static std::string cache_dir();

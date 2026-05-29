@@ -530,35 +530,13 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     // 30-second NCC compile on a graph the executor can't run.
     // One-shot diagnostic: dump EVERY host-resident operand in this cgraph
     // (not just the first) so the CPU-operand set can be designed against.
+    // GGML_VE_GC_DUMP=1: list every host(CPU)-resident operand in the cgraph,
+    // classified (weight / leaf / intermediate). The single diagnostic for
+    // "why didn't this graph compile" — a cross-fragment intermediate input
+    // means it's a middle fragment of a split decode (refused below).
     if (std::getenv("GGML_VE_GC_DUMP")) {
         fprintf(stderr, "[VE-GC-DUMP] cgraph: %d nodes, %d leafs\n",
                 cgraph->n_nodes, cgraph->n_leafs);
-        // Full per-node view: op, dst name/buffer, and each src's name+buffer.
-        // A src whose producing node is NOT in this cgraph is a split-INPUT
-        // (must be uploaded host->HBM); a dst consumed only outside is a
-        // split-OUTPUT (must be downloaded HBM->host).
-        std::set<const ggml_tensor *> produced_here;
-        for (int i = 0; i < cgraph->n_nodes; ++i) if (cgraph->nodes[i]) produced_here.insert(cgraph->nodes[i]);
-        for (int i = 0; std::getenv("GGML_VE_GC_DUMP")[0] == '2' && i < cgraph->n_nodes; ++i) {
-            const ggml_tensor * n = cgraph->nodes[i];
-            if (!n) continue;
-            auto bufname = [](const ggml_tensor * t) -> const char * {
-                if (!t || !t->buffer) return "<none>";
-                auto bt = ggml_backend_buffer_get_type(t->buffer);
-                return bt ? ggml_backend_buft_name(bt) : "<none>";
-            };
-            fprintf(stderr, "[VE-GC-DUMP] #%2d %-14s dst '%s'[%s]", i,
-                    ggml_op_name(n->op), n->name ? n->name : "?", bufname(n));
-            for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
-                const ggml_tensor * c = n->src[s];
-                while (c && c->view_src) c = c->view_src;
-                bool ext = c && produced_here.find(c) == produced_here.end() &&
-                           (!c || c->op == GGML_OP_NONE || produced_here.find(n->src[s]) == produced_here.end());
-                fprintf(stderr, "  s%d '%s'[%s]%s", s, n->src[s]->name ? n->src[s]->name : "?",
-                        bufname(n->src[s]), ext ? "*IN" : "");
-            }
-            fprintf(stderr, "\n");
-        }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * n = cgraph->nodes[i];
             if (!n) continue;
@@ -1146,15 +1124,14 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
     return ss.str();
 }
 
-std::string GraphCompiler::generate_source(const std::string & func_name, int64_t n_ctx) const {
+std::string GraphCompiler::generate_source(const std::string & func_name) const {
     std::ostringstream ss;
 
     ss << "// Auto-generated VE graph kernel\n";
     ss << "// ops=" << traced_ops_.size()
        << " weights=" << weight_tensors_.size()
        << " kv=" << kv_cache_tensors_.size()
-       << " inter=" << intermediate_bufs_.size()
-       << " n_ctx=" << n_ctx << "\n\n";
+       << " inter=" << intermediate_bufs_.size() << "\n\n";
 
     ss << "#include <stdint.h>\n";
     ss << "#include <stdio.h>\n";
@@ -1193,9 +1170,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
     ss << "    VEDAdeviceptr* tptr_hbm,  // [" << n_slots << "] tensor HBM ptrs\n";
     ss << "    void* input,              // HMEM token id (i32)\n";
     ss << "    void* output,             // HMEM logits out (f32)\n";
-    ss << "    int64_t pos,              // current decode position\n";
-    ss << "    int64_t n_ctx) {\n";
-    ss << "    (void)n_ctx;\n";
+    ss << "    int64_t pos) {            // current decode position\n";
 
     // Convert all tensor HBM pointers to raw VE addresses. We re-resolve
     // every call (cheap: just translates an opaque handle to a flat VE
@@ -1408,7 +1383,7 @@ CompiledGraph * GraphCompiler::load_compiled(const std::string & so_path, const 
     return cg;
 }
 
-CompiledGraph * GraphCompiler::compile(int64_t n_ctx) {
+CompiledGraph * GraphCompiler::compile() {
     if (traced_ops_.empty() || !trace_valid_) return nullptr;
 
     // Emit with a fixed placeholder so the hash captures the graph
@@ -1418,7 +1393,7 @@ CompiledGraph * GraphCompiler::compile(int64_t n_ctx) {
     // different signatures but identical bodies generated two
     // separate .so files and forced redundant NCC compiles.
     static const std::string placeholder = "ve_graph_run_PLACEHOLDER";
-    std::string source = generate_source(placeholder, n_ctx);
+    std::string source = generate_source(placeholder);
     std::string hash   = compute_hash(source);
 
     // Substitute the real, hash-derived function name into the source
@@ -1919,7 +1894,6 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     vedaArgsSetHMEM (args, 1, in_hmem);
     vedaArgsSetHMEM (args, 2, out_hmem);
     vedaArgsSetI64  (args, 3, position);
-    vedaArgsSetI64  (args, 4, /*n_ctx*/ 4096);
 
     // vedaLaunchKernel (without Ex) auto-destroys args on success. We sync
     // after to surface VE-side errors at the right point.

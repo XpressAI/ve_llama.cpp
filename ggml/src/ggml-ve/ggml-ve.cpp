@@ -332,12 +332,13 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     }
 
     // --- Compiled-graph fast path (opt-in via GGML_VE_COMPILE_GRAPH=1) ----
-    // No node-count threshold by default. ncc compile is ~30 s per unique
-    // cgraph signature, but a per-token decode chunk repeats ~50× per
-    // second — even a 6-node chunk amortises in under a minute. The
-    // previous default of 100 prevented the compiler from ever engaging
-    // on Llama-class decode, where the scheduler hands us 6- and 23-node
-    // chunks. Set GGML_VE_COMPILE_MIN_NODES=N to override.
+    // What actually compiles is decided by the trace pre-pass's
+    // self-containment check (see graph_compiler.cpp), not a node count:
+    // whole self-contained decode graphs fuse, scheduler-split middle
+    // fragments fall back to the interpreter. GGML_VE_COMPILE_MIN_NODES is
+    // an optional perf knob (default 1 = no threshold) to also skip
+    // JIT-compiling small graphs not worth the ~30 s ncc cost. Documented
+    // in README.md.
     static const int gc_min_nodes = []{
         const char * env = std::getenv("GGML_VE_COMPILE_MIN_NODES");
         return env ? std::atoi(env) : 1;
@@ -405,7 +406,7 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
             bool traced = gc.trace(cgraph);
             cached_graph new_entry;  // cg=null, executable=true by default
             if (traced) {
-                gcomp::CompiledGraph * cg2 = gc.compile(/*n_ctx=*/ 4096);
+                gcomp::CompiledGraph * cg2 = gc.compile();
                 if (cg2) {
                     new_entry.cg         = cg2;
                     new_entry.executable = gc.execute(cg2, ctx, cgraph);
