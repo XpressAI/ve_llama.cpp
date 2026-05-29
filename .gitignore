@@ -160,3 +160,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+ftrace.out.*
+ve_sgemv_wrapper.L
+PR_DESCRIPTION.md

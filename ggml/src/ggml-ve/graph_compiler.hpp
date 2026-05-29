@@ -184,6 +184,18 @@ struct CompiledGraph {
     // is destroyed.
     VEDAhmemptr  in_hmem  = 0;
     VEDAhmemptr  out_hmem = 0;
+
+    // Per-slot HBM scratch for CPU-resident operands. The ggml scheduler
+    // parks a handful of small boundary tensors (cross-split hidden states,
+    // the attention mask, etc.) on a CPU buffer even though the rest of the
+    // subgraph lives in HBM. For those slots we stage host<->HBM each token
+    // (upload before launch, and download after for graph-produced ones) so
+    // the fused kernel can address everything uniformly through p[]. Sized
+    // num_slots, allocated lazily on first use, reused every token. This is
+    // what lets the compiler engage on the main decode graph instead of
+    // bailing to the interpreter on the first CPU operand.
+    std::vector<VEDAdeviceptr> stage_hbm;   // scratch base per slot (0 = none)
+    std::vector<size_t>        stage_cap;   // bytes allocated per slot
 };
 
 class GraphCompiler {

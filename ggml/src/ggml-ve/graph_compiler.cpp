@@ -528,6 +528,58 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     // for warmup or small ubatches sometimes have CPU-resident operands
     // even when the weights ARE on HBM. Refuse those before we waste a
     // 30-second NCC compile on a graph the executor can't run.
+    // One-shot diagnostic: dump EVERY host-resident operand in this cgraph
+    // (not just the first) so the CPU-operand set can be designed against.
+    if (std::getenv("GGML_VE_GC_DUMP")) {
+        fprintf(stderr, "[VE-GC-DUMP] cgraph: %d nodes, %d leafs\n",
+                cgraph->n_nodes, cgraph->n_leafs);
+        // Full per-node view: op, dst name/buffer, and each src's name+buffer.
+        // A src whose producing node is NOT in this cgraph is a split-INPUT
+        // (must be uploaded host->HBM); a dst consumed only outside is a
+        // split-OUTPUT (must be downloaded HBM->host).
+        std::set<const ggml_tensor *> produced_here;
+        for (int i = 0; i < cgraph->n_nodes; ++i) if (cgraph->nodes[i]) produced_here.insert(cgraph->nodes[i]);
+        for (int i = 0; std::getenv("GGML_VE_GC_DUMP")[0] == '2' && i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            if (!n) continue;
+            auto bufname = [](const ggml_tensor * t) -> const char * {
+                if (!t || !t->buffer) return "<none>";
+                auto bt = ggml_backend_buffer_get_type(t->buffer);
+                return bt ? ggml_backend_buft_name(bt) : "<none>";
+            };
+            fprintf(stderr, "[VE-GC-DUMP] #%2d %-14s dst '%s'[%s]", i,
+                    ggml_op_name(n->op), n->name ? n->name : "?", bufname(n));
+            for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
+                const ggml_tensor * c = n->src[s];
+                while (c && c->view_src) c = c->view_src;
+                bool ext = c && produced_here.find(c) == produced_here.end() &&
+                           (!c || c->op == GGML_OP_NONE || produced_here.find(n->src[s]) == produced_here.end());
+                fprintf(stderr, "  s%d '%s'[%s]%s", s, n->src[s]->name ? n->src[s]->name : "?",
+                        bufname(n->src[s]), ext ? "*IN" : "");
+            }
+            fprintf(stderr, "\n");
+        }
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            if (!n) continue;
+            const ggml_tensor * srcs[GGML_MAX_SRC + 1] = { n, n->src[0], n->src[1], n->src[2] };
+            for (int s = 0; s < (int) (sizeof(srcs)/sizeof(srcs[0])); ++s) {
+                const ggml_tensor * t = srcs[s];
+                if (!t) continue;
+                ggml_backend_buffer_type_t bt = t->buffer ? ggml_backend_buffer_get_type(t->buffer) : nullptr;
+                const char * bnn = bt ? ggml_backend_buft_name(bt) : nullptr;
+                const bool h = !bnn || std::strncmp(bnn, "VE", 2) != 0 || !std::strstr(bnn, "_HBM");
+                if (!h) continue;
+                fprintf(stderr, "[VE-GC-DUMP]  op#%d %-12s %s '%s' type=%s ne=[%ld,%ld,%ld,%ld] buf=%s weight=%d leaf=%d\n",
+                        i, ggml_op_name(n->op), s == 0 ? "DST" : "src",
+                        t->name ? t->name : "?", ggml_type_name(t->type),
+                        (long)t->ne[0],(long)t->ne[1],(long)t->ne[2],(long)t->ne[3],
+                        bnn ? bnn : "<none>", is_weight(t) ? 1 : 0,
+                        (t->op == GGML_OP_NONE) ? 1 : 0);
+            }
+        }
+    }
+
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         if (!n) continue;
@@ -555,13 +607,20 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
             // VEBP weights: same deal — pulled into HBM via the interleaved
             // cache at execute time (vebp companion slots).
             if (is_weight(t) && t->type == GGML_TYPE_VEBP) continue;
-            if (debug_enabled()) {
-                fprintf(stderr, "[VE-GC] refuse: %s '%s' is on non-HBM buffer (%s) at op #%d\n",
-                        is_weight(t) ? "weight" : "tensor",
-                        t->name ? t->name : "?", bn ? bn : "<no-buffer>", i);
-            }
-            trace_valid_ = false;
-            return false;
+            // CPU-resident operands are all handled at execute() now:
+            //  - NON-weights (cross-split hidden states like 'embd'/'l_out-N',
+            //    the attention mask, the pre-attention Q view) are staged
+            //    host<->HBM per token.
+            //  - WEIGHTS (e.g. token_embd.weight, which llama.cpp keeps on
+            //    CPU_Mapped because only GET_ROWS reads it) are uploaded ONCE
+            //    to HBM via the weight cache and reused every token.
+            // So nothing on a CPU buffer forces a fallback any more — this is
+            // what lets the whole 875-node decode graph compile into a single
+            // fused kernel instead of bailing on the first CPU operand (no
+            // other backend has that limitation). execute() still returns
+            // false (-> interpreter) if an individual upload genuinely fails.
+            (void) bn;
+            continue;
         }
     }
 
@@ -972,6 +1031,11 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             ss << "        float scale    = " << flit(op.p.flash_attn.scale) << ";\n";
             ss << "        size_t nb_k1=" << op.p.flash_attn.nb_k1 << "u, nb_k2=" << op.p.flash_attn.nb_k2 << "u;\n";
             ss << "        size_t nb_v1=" << op.p.flash_attn.nb_v1 << "u, nb_v2=" << op.p.flash_attn.nb_v2 << "u;\n";
+            if (std::getenv("GGML_VE_KERNEL_TRACE")) {
+                ss << "        #pragma omp single\n"
+                   << "        {fprintf(stderr,\"[VE-K]   FA args: hd=%d nqh=%d nkvh=%d seq=%d pos=%ld\\n\","
+                   << "head_dim,n_q_heads,n_kv_heads,seq_len,(long)pos);fflush(stderr);}\n";
+            }
             ss << "        float* outp = (float*)" << dst  << ";\n";
             ss << "        const float* qp = (const float*)" << src0 << ";\n";
             ss << "        const void*  kp = (const void*)"  << src1 << ";\n";
@@ -1019,8 +1083,20 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             ss << "        float* y    = (float*)" << dst  << ";\n";
             ss << "        float* gate = (float*)" << src0 << ";\n";
             ss << "        float* up   = (float*)" << src1 << ";\n";
-            // _inner: uses `#pragma omp for` internally.
-            ss << "        swiglu_hbm_full_inner(y, gate, up, nc, nr);\n";
+            // Inline SWIGLU over the flat element range. gate/up/y are
+            // contiguous row-major [nc,nr], so we parallelise the whole
+            // nc*nr range with one `#pragma omp for` (all 8 threads share it;
+            // the external swiglu_hbm_full_inner only split over nr, leaving
+            // 7 threads idle at decode where nr==1). Clamp before expf — the
+            // VE's vectorised expf returns NaN past |x|~88 (see CLAUDE.md).
+            ss << "        long total = (long)nc * (nr > 0 ? nr : 1);\n";
+            ss << "        #pragma omp for\n";
+            ss << "        for (long i = 0; i < total; i++) {\n";
+            ss << "            float g = gate[i];\n";
+            ss << "            if (g < -80.0f) g = -80.0f;\n";
+            ss << "            if (g >  80.0f) g =  80.0f;\n";
+            ss << "            y[i] = (g / (1.0f + expf(-g))) * up[i];\n";
+            ss << "        }\n";
             ss << "    }\n";
             break;
         }
@@ -1188,8 +1264,23 @@ std::string GraphCompiler::generate_source(const std::string & func_name, int64_
     ss << "    #pragma omp parallel num_threads(8)\n";
     ss << "    {\n";
 
+    const bool ktrace = (std::getenv("GGML_VE_KERNEL_TRACE") != nullptr);
     for (size_t i = 0; i < traced_ops_.size(); ++i) {
+        if (ktrace) {
+            // Synchronised checkpoint: barrier forces the whole team to finish
+            // the previous op before one thread prints, so the last line before
+            // a VE fault is exactly the op that crashed.
+            ss << "    #pragma omp barrier\n";
+            ss << "    #pragma omp single\n    {fprintf(stderr,\"[VE-K] op " << i
+               << " " << op_type_name(traced_ops_[i].type) << " dst_slot="
+               << traced_ops_[i].dst_idx << " START\\n\");fflush(stderr);}\n";
+        }
         ss << gen_op_code(traced_ops_[i], (int) i);
+        if (ktrace) {
+            ss << "    #pragma omp barrier\n";
+            ss << "    #pragma omp single\n    {fprintf(stderr,\"[VE-K] op " << i
+               << " DONE\\n\");fflush(stderr);}\n";
+        }
     }
 
     ss << "    }\n";   // end #pragma omp parallel
@@ -1420,6 +1511,86 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         }
     };
 
+    // --- host-operand staging -------------------------------------------
+    // A few small boundary tensors land on a CPU buffer even though the rest
+    // of the subgraph is HBM-resident (cross-split hidden states, the mask,
+    // the pre-attention Q view). For those we stage host<->HBM each token so
+    // the fused kernel can dereference p[] uniformly. Inputs are uploaded
+    // before launch; tensors PRODUCED by this subgraph are also downloaded
+    // afterwards (so later splits / the sampler see them).
+    if ((int) graph->stage_hbm.size() != graph->num_slots) {
+        graph->stage_hbm.assign(graph->num_slots, 0);
+        graph->stage_cap.assign(graph->num_slots, 0);
+    }
+    std::set<const ggml_tensor *> produced_here;
+    for (int i = 0; i < current_graph->n_nodes; ++i) {
+        const ggml_tensor * n = current_graph->nodes[i];
+        if (!n) continue;
+        // Only COMPUTE ops produce data. VIEW/RESHAPE/PERMUTE/TRANSPOSE nodes
+        // merely reference a tensor produced elsewhere — counting their
+        // canonical as "produced here" wrongly tags a cross-split INPUT
+        // (e.g. 'Qcur-0', read by FA via a permuted view) as an OUTPUT,
+        // triggering a needless copy-back.
+        if (n->op == GGML_OP_VIEW    || n->op == GGML_OP_RESHAPE ||
+            n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE ||
+            n->op == GGML_OP_NONE) {
+            continue;
+        }
+        produced_here.insert(canonical(n));
+    }
+    struct OutCopy { void * host_dst; VEDAdeviceptr hbm_src; size_t bytes; };
+    std::vector<OutCopy> out_copies;
+    bool stage_failed = false;
+
+    auto ensure_scratch = [&](int s, size_t bytes) -> VEDAdeviceptr {
+        if (graph->stage_hbm[s] && graph->stage_cap[s] >= bytes) return graph->stage_hbm[s];
+        if (graph->stage_hbm[s]) { vedaMemFreeAsync(graph->stage_hbm[s], 0); graph->stage_hbm[s] = 0; }
+        // Trailing guard: VE vectorised kernels (FA dot, SET_ROWS narrowing,
+        // matvec) round the element count up to MVL=256 and over-access a few
+        // hundred elements past the logical end. ggml's own buffers carry
+        // slack; our exact-sized scratch did not, so the over-access fell into
+        // the adjacent HBM heap chunk -> "malloc corruption" (when mapped) or
+        // "DMA missing space" (when not). 64 KiB covers any reasonable
+        // unroll/pack width.
+        size_t alloc = (bytes + (64u << 10) + 4095) & ~size_t(4095);
+        VEDAdeviceptr p = 0;
+        if (vedaMemAllocAsync(&p, alloc, 0) != VEDA_SUCCESS) return 0;
+        vedaCtxSynchronize();
+        graph->stage_hbm[s] = p;
+        graph->stage_cap[s] = alloc;
+        return p;
+    };
+
+    // Stage the CPU-resident operand at slot `s` and return its offset-correct
+    // HBM pointer (mirrors the canonical's whole host buffer so view offsets
+    // stay valid). Returns 0 on failure.
+    auto stage_host_operand = [&](int s, const ggml_tensor * raw, const ggml_tensor * c) -> VEDAdeviceptr {
+        if (!c->data) return 0;                       // nothing to copy
+        if (is_weight(c)) return 0;                   // never bounce a weight per-token
+        const size_t nb = ggml_nbytes(c);
+        if (nb == 0 || nb > (64u << 20)) {            // sanity cap (64 MiB)
+            if (debug_enabled())
+                fprintf(stderr, "[VE-GC] won't stage '%s' (%zu bytes)\n", c->name ? c->name : "?", nb);
+            return 0;
+        }
+        VEDAdeviceptr scratch = ensure_scratch(s, nb);
+        if (!scratch) return 0;
+        // Mirror current host contents (also preserves the un-written part of
+        // a partial-view output).
+        if (vedaMemcpyHtoD(scratch, c->data, nb) != VEDA_SUCCESS) return 0;
+        if (produced_here.count(c)) out_copies.push_back({ c->data, scratch, nb });
+        const ggml_tensor * addr = raw->data ? raw : c;
+        size_t off = (const uint8_t *) addr->data - (const uint8_t *) c->data;
+        if (std::getenv("GGML_VE_STAGE_DEBUG")) {
+            fprintf(stderr, "[VE-STAGE] slot=%d '%s' canon='%s' nb=%zu off=%zu %s ne=[%ld,%ld,%ld,%ld] raw_ne=[%ld,%ld,%ld,%ld]\n",
+                    s, raw->name ? raw->name : "?", c->name ? c->name : "?", nb, off,
+                    produced_here.count(c) ? "OUT" : "in",
+                    (long)c->ne[0],(long)c->ne[1],(long)c->ne[2],(long)c->ne[3],
+                    (long)raw->ne[0],(long)raw->ne[1],(long)raw->ne[2],(long)raw->ne[3]);
+        }
+        return scratch + off;
+    };
+
     auto try_push = [&](const ggml_tensor * raw) {
         if (!raw) return;
         const ggml_tensor * c = canonical(raw);
@@ -1431,6 +1602,31 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         // pure metadata tensor with no buffer/data, the slot stays 0.
         const ggml_tensor * src_for_addr = raw->data ? raw : c;
         VEDAdeviceptr hbm = hbm_ptr_for_tensor(src_for_addr);
+        if (hbm == 0 && src_for_addr->data) {
+            if (is_weight(c)) {
+                // CPU-resident WEIGHT (e.g. token_embd.weight, which llama.cpp
+                // leaves on CPU_Mapped since only GET_ROWS touches it). Upload
+                // ONCE to HBM via the weight cache (keyed by name) and reuse the
+                // cached pointer every token — never a per-token bounce. This is
+                // the "GET_ROWS weight on CPU mmap" path; without it the whole
+                // 875-node decode graph was refused over this one weight.
+                size_t nb = ggml_nbytes(c);
+                const char * nm = (c->name && c->name[0]) ? c->name : nullptr;
+                VEDAdeviceptr w_hbm = nm
+                    ? bctx->cache().get_or_upload_by_name(nm, c->data, nb)
+                    : bctx->cache().get_or_upload(c->data, nb);
+                if (w_hbm) {
+                    size_t off = (const uint8_t *) src_for_addr->data - (const uint8_t *) c->data;
+                    hbm = w_hbm + off;
+                } else {
+                    stage_failed = true;
+                }
+            } else {
+                // CPU-resident intermediate / leaf / boundary: per-token scratch.
+                hbm = stage_host_operand((int) slot_pos, raw, c);
+                if (hbm == 0) stage_failed = true;
+            }
+        }
         tptrs[slot_pos++] = hbm;
     };
 
@@ -1443,6 +1639,13 @@ bool GraphCompiler::execute(CompiledGraph * graph,
             try_push(n->src[1]);
         }
         try_push(n->src[2]);
+    }
+
+    if (stage_failed) {
+        if (debug_enabled()) {
+            fprintf(stderr, "[VE-GC] host-operand staging failed — abort (interpreter will run this graph)\n");
+        }
+        return false;
     }
 
     // Colmajor companion slots aren't tensors in the cgraph — we resize
@@ -1607,32 +1810,53 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     // Token id and decode position — for graphs that include GET_ROWS / ROPE
     // we look them up from the leaf tensors, reading through vedaMemcpyDtoH
     // when the leaf actually lives in HBM.
-    auto read_i32_leaf = [&](const ggml_tensor * t) -> int32_t {
+    auto read_leaf0 = [&](const ggml_tensor * t) -> int64_t {
+        // Read element [0] of a position/index leaf, honouring its width
+        // (i32 inp_pos vs i64 SET_ROWS index) and HBM vs host residency.
         if (!t || !t->data) return 0;
+        const size_t w = ggml_type_size(t->type);  // 4 (i32) or 8 (i64)
         VEDAdeviceptr hbm = hbm_ptr_for_tensor(t);
-        int32_t v = 0;
+        int64_t v64 = 0; int32_t v32 = 0;
+        void * dst = (w == 8) ? (void *) &v64 : (void *) &v32;
         if (hbm) {
-            if (vedaMemcpyDtoH(&v, hbm, sizeof(int32_t)) != VEDA_SUCCESS) v = 0;
+            if (vedaMemcpyDtoH(dst, hbm, w) != VEDA_SUCCESS) return 0;
         } else {
-            v = ((const int32_t *) t->data)[0];
+            std::memcpy(dst, t->data, w);
         }
-        return v;
+        return (w == 8) ? v64 : (int64_t) v32;
     };
 
     int32_t token_id = 0;
     int64_t position = 0;
+    bool    have_pos = false;
     for (int i = 0; i < current_graph->n_nodes; ++i) {
         const ggml_tensor * n = current_graph->nodes[i];
         if (n && n->op == GGML_OP_GET_ROWS && n->src[1]) {
-            token_id = read_i32_leaf(n->src[1]);
+            token_id = (int32_t) read_leaf0(n->src[1]);
             break;
         }
     }
+    // Decode position drives ROPE's angle, SET_ROWS' KV-cell row, and FA's
+    // seq_len (= pos+1). Prefer ROPE's inp_pos; fall back to the SET_ROWS
+    // index leaf (i64) for attention subgraphs that contain SET_ROWS/FA but
+    // no ROPE — without this they baked pos=0, writing the wrong KV row and
+    // attending to a single position (garbage decode output).
     for (int i = 0; i < current_graph->n_nodes; ++i) {
         const ggml_tensor * n = current_graph->nodes[i];
         if (n && n->op == GGML_OP_ROPE && n->src[1]) {
-            position = (int64_t) read_i32_leaf(n->src[1]);
+            position = read_leaf0(n->src[1]);
+            have_pos = true;
             break;
+        }
+    }
+    if (!have_pos) {
+        for (int i = 0; i < current_graph->n_nodes; ++i) {
+            const ggml_tensor * n = current_graph->nodes[i];
+            if (n && n->op == GGML_OP_SET_ROWS && n->src[1]) {
+                position = read_leaf0(n->src[1]);
+                have_pos = true;
+                break;
+            }
         }
     }
 
@@ -1693,6 +1917,16 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     if (vedaCtxSynchronize() != VEDA_SUCCESS) {
         fprintf(stderr, "[VE-GC] sync after kernel returned non-success\n");
         return false;
+    }
+
+    // Download CPU-resident outputs this subgraph produced back to their host
+    // buffers, so a later split (or the sampler) that reads them from host
+    // sees the computed values. Inputs needed no copy-back (read-only).
+    for (const auto & oc : out_copies) {
+        if (vedaMemcpyDtoH(oc.host_dst, oc.hbm_src, oc.bytes) != VEDA_SUCCESS) {
+            fprintf(stderr, "[VE-GC] output copy-back (%zu bytes) failed\n", oc.bytes);
+            return false;
+        }
     }
 
     return true;
