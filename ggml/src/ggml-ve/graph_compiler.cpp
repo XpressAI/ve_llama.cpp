@@ -606,6 +606,10 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
             if (s == 0) continue;                            // this op's own dst (output)
             if (t->op == GGML_OP_NONE) continue;             // leaf input
             if (pre_produced.count(canonical(t))) continue;  // produced here
+            // GGML_VE_GC_ALLOW_FRAGMENTS=1: bypass the gate to debug why
+            // chaining compiled middle fragments garbles (task #70).
+            static const bool allow_frags = (std::getenv("GGML_VE_GC_ALLOW_FRAGMENTS") != nullptr);
+            if (allow_frags) continue;
             if (debug_enabled()) {
                 fprintf(stderr, "[VE-GC] refuse: cross-fragment intermediate input '%s' (%s) at op #%d — interpreter will run this fragment\n",
                         t->name ? t->name : "?", bn ? bn : "<no-buffer>", i);
@@ -1526,7 +1530,7 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         }
         produced_here.insert(canonical(n));
     }
-    struct OutCopy { void * host_dst; VEDAdeviceptr hbm_src; size_t bytes; };
+    struct OutCopy { void * host_dst; VEDAdeviceptr hbm_src; size_t bytes; const char * name; int type; };
     std::vector<OutCopy> out_copies;
     bool stage_failed = false;
 
@@ -1566,7 +1570,15 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         // Mirror current host contents (also preserves the un-written part of
         // a partial-view output).
         if (vedaMemcpyHtoD(scratch, c->data, nb) != VEDA_SUCCESS) return 0;
-        if (produced_here.count(c)) out_copies.push_back({ c->data, scratch, nb });
+        const bool is_out = produced_here.count(c) != 0;
+        if (is_out) out_copies.push_back({ c->data, scratch, nb, c->name, (int) c->type });
+        // Cross-fragment value trace: dump host[0..3] of each staged INPUT
+        // (what the consumer reads). Compared against [XOUT] of the producer.
+        if (std::getenv("GGML_VE_XFRAG_DEBUG") && !is_out && c->type == GGML_TYPE_F32 && nb >= 16) {
+            const float * f = (const float *) c->data;
+            fprintf(stderr, "[XIN ] '%s' %g %g %g %g\n", c->name ? c->name : "?",
+                    f[0], f[1], f[2], f[3]);
+        }
         const ggml_tensor * addr = raw->data ? raw : c;
         size_t off = (const uint8_t *) addr->data - (const uint8_t *) c->data;
         if (std::getenv("GGML_VE_STAGE_DEBUG")) {
@@ -1913,6 +1925,14 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         if (vedaMemcpyDtoH(oc.host_dst, oc.hbm_src, oc.bytes) != VEDA_SUCCESS) {
             fprintf(stderr, "[VE-GC] output copy-back (%zu bytes) failed\n", oc.bytes);
             return false;
+        }
+        // Cross-fragment value trace: host[0..3] of each produced output, after
+        // copy-back (what the producer wrote). Compared against [XIN] of the
+        // consumer fragment that reads the same tensor.
+        if (std::getenv("GGML_VE_XFRAG_DEBUG") && oc.type == GGML_TYPE_F32 && oc.bytes >= 16) {
+            const float * f = (const float *) oc.host_dst;
+            fprintf(stderr, "[XOUT] '%s' %g %g %g %g\n", oc.name ? oc.name : "?",
+                    f[0], f[1], f[2], f[3]);
         }
     }
 
