@@ -325,11 +325,15 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     if (time_enabled) {
         char buf[256];
         int counts[GGML_OP_COUNT] = {0};
+        int64_t n_tok = 1;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_op op = cgraph->nodes[i]->op;
             if ((int) op < GGML_OP_COUNT) counts[op]++;
+            if (op == GGML_OP_MUL_MAT && cgraph->nodes[i]->ne[1] > n_tok) {
+                n_tok = cgraph->nodes[i]->ne[1];
+            }
         }
-        int off = std::snprintf(buf, sizeof(buf), "n=%d", cgraph->n_nodes);
+        int off = std::snprintf(buf, sizeof(buf), "n=%d,ntok=%lld", cgraph->n_nodes, (long long) n_tok);
         for (int i = 0; i < GGML_OP_COUNT && off < (int) sizeof(buf) - 32; ++i) {
             if (counts[i] > 0) {
                 off += std::snprintf(buf + off, sizeof(buf) - off,
@@ -339,6 +343,22 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
         }
         gtime_sig = buf;
     }
+    bool gtime_recorded = false;
+    auto record_gtime = [&]() {
+        if (!time_enabled || gtime_recorded) return;
+        auto end = std::chrono::steady_clock::now();
+        double ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - gtime_start).count();
+        // Linear search — there are < 50 distinct cgraph shapes per token.
+        bool found = false;
+        for (auto & e : gtimes) {
+            if (e.sig == gtime_sig) { e.count++; e.ns_total += ns; found = true; break; }
+        }
+        if (!found) {
+            gtime_entry e; e.sig = gtime_sig; e.count = 1; e.ns_total = ns;
+            gtimes.push_back(std::move(e));
+        }
+        gtime_recorded = true;
+    };
 
     // --- Compiled-graph fast path (opt-in via GGML_VE_COMPILE_GRAPH=1) ----
     // What actually compiles is decided by the trace pre-pass's
@@ -393,6 +413,7 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
             if (entry.executable && entry.cg) {
                 if (gc.execute(entry.cg, ctx, cgraph)) {
                     ctx->ops_total() += cgraph->n_nodes;
+                    record_gtime();
                     return GGML_STATUS_SUCCESS;
                 }
                 // Execute regressed — remember and stop trying.
@@ -441,6 +462,7 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
             }
             if (new_entry.cg && new_entry.executable) {
                 ctx->ops_total() += cgraph->n_nodes;
+                record_gtime();
                 return GGML_STATUS_SUCCESS;
             }
             // Compile or execute didn't pan out (or trace refused). Whatever
@@ -477,6 +499,7 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
                     node->src[0] ? ggml_type_name(node->src[0]->type) : "-", src0_buft,
                     node->src[1] ? ggml_type_name(node->src[1]->type) : "-", src1_buft);
             ctx->abort_pending();
+            record_gtime();
             return GGML_STATUS_FAILED;
         }
         ctx->ops_total()++;
@@ -493,19 +516,7 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     // legacy. Trust the scheduler — anything that legitimately needs to
     // be sync'd will route through backend_synchronize.
 
-    if (time_enabled) {
-        auto end = std::chrono::steady_clock::now();
-        double ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - gtime_start).count();
-        // Linear search — there are < 50 distinct cgraph shapes per token.
-        bool found = false;
-        for (auto & e : gtimes) {
-            if (e.sig == gtime_sig) { e.count++; e.ns_total += ns; found = true; break; }
-        }
-        if (!found) {
-            gtime_entry e; e.sig = gtime_sig; e.count = 1; e.ns_total = ns;
-            gtimes.push_back(std::move(e));
-        }
-    }
+    record_gtime();
     return GGML_STATUS_SUCCESS;
 }
 

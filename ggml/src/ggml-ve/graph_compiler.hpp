@@ -62,6 +62,7 @@ enum class BufferKind {
     WEIGHT_VEBP_WN,   // VEBP interleaved nonzero plane (lazy from hbm cache)
     WEIGHT_VEBP_WSC,  // VEBP interleaved group scales  (lazy from hbm cache)
     KV_CACHE,         // persistent across tokens, mutates each step
+    KV_SHADOW,        // BF16 KV cache shadow in seq-unit-stride col-major layout
     INTERMEDIATE,     // scratch, reused inside the kernel
     INPUT,            // pseudo: input embedding row
     OUTPUT,           // pseudo: output logits
@@ -96,6 +97,12 @@ struct TracedOp {
     int     vebp_ws_idx  = -1;
     int     vebp_wn_idx  = -1;
     int     vebp_wsc_idx = -1;
+    // For BF16 KV cache ops, companion slots holding the col-major shadow.
+    // SET_ROWS uses dst_shadow_idx to mirror freshly-written rows; FLASH_ATTN
+    // uses src1/src2 shadow slots for K/V reads when seq_len is large enough.
+    int     dst_shadow_idx  = -1;
+    int     src1_shadow_idx = -1;
+    int     src2_shadow_idx = -1;
     BufferKind dst_kind  = BufferKind::INTERMEDIATE;
     BufferKind src0_kind = BufferKind::INTERMEDIATE;
     BufferKind src1_kind = BufferKind::INTERMEDIATE;
@@ -117,6 +124,7 @@ struct TracedOp {
                  float ext_factor, beta_fast, beta_slow; int n_ctx_orig; } rope;
         struct { float scale, max_bias, softcap;
                  int   kv_type; int64_t n_kv_heads;
+                 int64_t kv_seq_max;
                  size_t nb_k1, nb_k2, nb_v1, nb_v2;
                  // Q byte strides (src0 nb): per-token (nb1) and per-head (nb2).
                  // For prompt eval Q is permuted [D,N,H] so the head stride is
@@ -161,6 +169,15 @@ struct VebpSpec {
     int64_t K         = 0;
 };
 
+// Spec for a BF16 KV-cache col-major shadow companion slot. The shadow is
+// keyed by the row-major KV cache HBM pointer and allocated via kv_shadow_cache.
+struct KvShadowSpec {
+    int     source_slot = -1;
+    int     shadow_slot = -1;
+    int64_t channels    = 0;
+    int64_t seq_max     = 0;
+};
+
 struct CompiledGraph {
     VEDAmodule   module    = 0;
     VEDAfunction run_func  = 0;
@@ -189,6 +206,9 @@ struct CompiledGraph {
     // VEBP companion slots populated at execute time via
     // hbm_cache::get_or_upload_vebp. Empty if no VEBP MUL_MAT.
     std::vector<VebpSpec>     vebp_specs;
+
+    // KV-shadow companion slots populated at execute time via kv_shadow_cache.
+    std::vector<KvShadowSpec> kv_shadow_specs;
 
     // Reusable HMEM staging buffers for the kernel's `input` (token id)
     // and `output` (logits row) args. Allocated lazily on first execute
@@ -269,6 +289,8 @@ private:
     std::vector<Q4KSpec>                q4k_specs_;
     // VEBP companion slots created during trace, populated at execute.
     std::vector<VebpSpec>               vebp_specs_;
+    // KV-shadow companion slots created during trace, populated at execute.
+    std::vector<KvShadowSpec>           kv_shadow_specs_;
 
     bool trace_valid_ = false;
 

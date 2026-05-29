@@ -7,6 +7,7 @@
 #include "common.hpp"
 #include "device.hpp"
 #include "hbm_cache.hpp"
+#include "kv_shadow_cache.hpp"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -363,8 +364,10 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
             const ggml_tensor * K = node->src[1];
             const ggml_tensor * V = node->src[2];
             if (!K || !V) return false;
+            const ggml_tensor * Kc = canonical(K);
             op.p.flash_attn.n_kv_heads = K->ne[2];
             op.p.flash_attn.kv_type    = (int) K->type;
+            op.p.flash_attn.kv_seq_max = Kc ? Kc->ne[1] : K->ne[1];
             op.p.flash_attn.nb_k1      = K->nb[1];
             op.p.flash_attn.nb_k2      = K->nb[2];
             op.p.flash_attn.nb_v1      = V->nb[1];
@@ -481,6 +484,47 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
         op.vebp_wsc_idx = sp.wsc_slot;
     }
 
+    // BF16 KV-cache col-major shadow companions. The interpreter path keeps
+    // these shadows up to date in ops/set_rows.cpp and consumes them in
+    // ops/flash_attn.cpp. Compiled graphs bypass those hooks, so mirror the
+    // SET_ROWS writes in generated code and read the same shadows from FA.
+    static const bool kv_shadow_enabled =
+        std::getenv("GGML_VE_NO_KV_SHADOW") == nullptr;
+    if (kv_shadow_enabled && op.type == OpType::SET_ROWS &&
+        op.dst_kind == BufferKind::KV_CACHE && op.dst_type == GGML_TYPE_BF16 &&
+        op.dst_idx >= 0 && op.src0_ne[0] > 0 && op.ne[1] > 0) {
+        KvShadowSpec sp;
+        sp.source_slot = op.dst_idx;
+        sp.channels    = op.src0_ne[0];
+        sp.seq_max     = op.ne[1];
+        sp.shadow_slot = (int) tensor_slot_order_.size();
+        tensor_slot_order_.push_back({nullptr, BufferKind::KV_SHADOW});
+        kv_shadow_specs_.push_back(sp);
+        op.dst_shadow_idx = sp.shadow_slot;
+    }
+    if (kv_shadow_enabled && op.type == OpType::FLASH_ATTN &&
+        op.p.flash_attn.kv_type == (int) GGML_TYPE_BF16 &&
+        op.src1_idx >= 0 && op.src2_idx >= 0 && op.src1_ne[0] > 0 && op.src1_ne[1] > 0) {
+        const int64_t channels = op.src1_ne[0] * op.p.flash_attn.n_kv_heads;
+        KvShadowSpec ksp;
+        ksp.source_slot = op.src1_idx;
+        ksp.channels    = channels;
+        ksp.seq_max     = op.p.flash_attn.kv_seq_max;
+        ksp.shadow_slot = (int) tensor_slot_order_.size();
+        tensor_slot_order_.push_back({nullptr, BufferKind::KV_SHADOW});
+        kv_shadow_specs_.push_back(ksp);
+        op.src1_shadow_idx = ksp.shadow_slot;
+
+        KvShadowSpec vsp;
+        vsp.source_slot = op.src2_idx;
+        vsp.channels    = channels;
+        vsp.seq_max     = op.p.flash_attn.kv_seq_max;
+        vsp.shadow_slot = (int) tensor_slot_order_.size();
+        tensor_slot_order_.push_back({nullptr, BufferKind::KV_SHADOW});
+        kv_shadow_specs_.push_back(vsp);
+        op.src2_shadow_idx = vsp.shadow_slot;
+    }
+
     traced_ops_.push_back(op);
     return true;
 }
@@ -497,6 +541,7 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
     colmajor_specs_.clear();
     q4k_specs_.clear();
     vebp_specs_.clear();
+    kv_shadow_specs_.clear();
     trace_valid_ = true;
 
     // n_tokens of this cgraph: 1 = decode, N = prompt eval. Any MUL_MAT's dst
@@ -1169,6 +1214,10 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "        int cols = " << cols << ";\n";
                 ss << "        char* dstbase = (char*)" << dst << ";\n";
                 ss << "        const float* src0p = (const float*)" << src0 << ";\n";
+                if (op.dst_shadow_idx >= 0) {
+                    ss << "        uint16_t* shbase = (uint16_t*)p[" << op.dst_shadow_idx << "];\n";
+                    ss << "        int seq_max = " << op.ne[1] << ";\n";
+                }
                 ss << "        #pragma omp for\n";
                 ss << "        for (long t = 0; t < n_tok; t++) {\n";
                 ss << "            int64_t idx0 = positions[t];\n";
@@ -1176,7 +1225,11 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "            uint16_t* drow = (uint16_t*)(dstbase + idx0 * " << dst_row_bytes << ");\n";
                 ss << "            for (int j = 0; j < cols; j++) {\n";
                 ss << "                uint32_t u; memcpy(&u, &src[j], 4);\n";
-                ss << "                drow[j] = (uint16_t)(u >> 16);\n";
+                ss << "                uint16_t bf = (uint16_t)(u >> 16);\n";
+                ss << "                drow[j] = bf;\n";
+                if (op.dst_shadow_idx >= 0) {
+                    ss << "                shbase[(size_t)j * seq_max + idx0] = bf;\n";
+                }
                 ss << "            }\n";
                 ss << "        }\n";
                 ss << "    }\n";
@@ -1203,6 +1256,12 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             int n_q_heads = (op.src0_ne[2] > 1) ? (int) op.src0_ne[2]
                                                 : (int) op.src0_ne[1];
             int n_kv_heads= (int) op.p.flash_attn.n_kv_heads;
+            const bool has_kv_shadow = op.src1_shadow_idx >= 0 && op.src2_shadow_idx >= 0;
+            const int colmajor_min = []{
+                const char * e = std::getenv("GGML_VE_COLMAJOR_FA_MIN");
+                int v = e ? std::atoi(e) : 96;
+                return v > 0 ? v : 1;
+            }();
             ss << "    {\n";
             ss << "        int head_dim   = " << head_dim   << ";\n";
             ss << "        int n_q_heads  = " << n_q_heads  << ";\n";
@@ -1217,6 +1276,12 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             ss << "        const char* qp = (const char*)" << src0 << ";\n";
             ss << "        const void*  kp = (const void*)"  << src1 << ";\n";
             ss << "        const void*  vp = (const void*)"  << src2 << ";\n";
+            if (has_kv_shadow) {
+                ss << "        const uint16_t* kp_col = (const uint16_t*)p[" << op.src1_shadow_idx << "];\n";
+                ss << "        const uint16_t* vp_col = (const uint16_t*)p[" << op.src2_shadow_idx << "];\n";
+                ss << "        int seq_max = " << op.p.flash_attn.kv_seq_max << ";\n";
+                ss << "        int colmajor_min = " << colmajor_min << ";\n";
+            }
             if (op.p.flash_attn.kv_type == (int) GGML_TYPE_BF16) {
                 // One query token at a time; the strided _inner shares heads
                 // across the team via `#pragma omp for` (no fork). seq_len =
@@ -1224,10 +1289,21 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 // q_nb2==head_dim*4 special case.
                 ss << "        for (int64_t t = 0; t < n_tok; t++) {\n";
                 ss << "            int seq_len = positions[t] + 1;\n";
+                if (has_kv_shadow) {
+                    ss << "            if (seq_len >= colmajor_min) {\n";
+                    ss << "                attention_f32q_bf16kv_colmajor_inner_strided(\n";
+                    ss << "                    (float*)(outp + t*o_nb2), (const float*)(qp + t*q_nb1),\n";
+                    ss << "                    kp_col, vp_col, head_dim, n_q_heads, n_kv_heads, seq_len, seq_max, scale,\n";
+                    ss << "                    q_nb2, o_nb1);\n";
+                    ss << "            } else {\n";
+                }
                 ss << "            attention_f32q_bf16kv_fused_gqa_inner_strided(\n";
                 ss << "                (float*)(outp + t*o_nb2), (const float*)(qp + t*q_nb1),\n";
                 ss << "                kp, vp, head_dim, n_q_heads, n_kv_heads, seq_len, scale,\n";
                 ss << "                q_nb2, o_nb1, nb_k1, nb_k2, nb_v1, nb_v2);\n";
+                if (has_kv_shadow) {
+                    ss << "            }\n";
+                }
                 ss << "        }\n";
             } else {
                 // F32 KV: no strided _inner; per-token omp-single fallback (the
@@ -1369,6 +1445,9 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     ss << "extern void attention_f32q_bf16kv_fused_gqa_inner_strided(float* out, const float* q, const void* k, const void* v,"
        << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, float scale,"
        << " size_t q_nb2, size_t o_nb1, size_t nb_k1, size_t nb_k2, size_t nb_v1, size_t nb_v2);\n";
+    ss << "extern void attention_f32q_bf16kv_colmajor_inner_strided(float* out, const float* q, const uint16_t* k_col, const uint16_t* v_col,"
+       << " int head_dim, int n_q_heads, int n_kv_heads, int seq_len, int seq_max, float scale,"
+       << " size_t q_nb2, size_t o_nb1);\n";
     ss << "extern void swiglu_hbm_full_inner(float* y, float* gate, float* up, int nc, int nr);\n\n";
 
     // Ops are grouped into small static chunk functions instead of one giant
@@ -1628,6 +1707,7 @@ CompiledGraph * GraphCompiler::load_compiled(const std::string & so_path, const 
     cg->colmajor_specs = colmajor_specs_;
     cg->q4k_specs      = q4k_specs_;
     cg->vebp_specs     = vebp_specs_;
+    cg->kv_shadow_specs = kv_shadow_specs_;
     return cg;
 }
 
@@ -1762,7 +1842,8 @@ bool GraphCompiler::execute(CompiledGraph * graph,
                    || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_Q4K_HDR
                    || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_VEBP_WS
                    || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_VEBP_WN
-                   || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_VEBP_WSC)) {
+                   || graph->slot_kinds[slot_pos] == BufferKind::WEIGHT_VEBP_WSC
+                   || graph->slot_kinds[slot_pos] == BufferKind::KV_SHADOW)) {
             ++slot_pos;
         }
     };
@@ -2013,7 +2094,34 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         }
     }
 
-    // After walking the cgraph + populating colmajor slots, slot_pos should
+    // BF16 KV-cache col-major shadow slots. Generated SET_ROWS mirrors into
+    // these shadows and generated FLASH_ATTN can read them directly, preserving
+    // the interpreter's kv-shadow long-context optimization inside the fused graph.
+    if (!graph->kv_shadow_specs.empty() && bctx) {
+        auto * dev = bctx->dev();
+        auto * shadows = dev ? dev->kv_shadow : nullptr;
+        if (!shadows) {
+            if (debug_enabled()) fprintf(stderr, "[VE-GC] kv-shadow cache unavailable — abort\n");
+            return false;
+        }
+        for (const auto & sp : graph->kv_shadow_specs) {
+            if (sp.source_slot < 0 || sp.source_slot >= (int) tptrs.size()) continue;
+            if (sp.shadow_slot < 0 || sp.shadow_slot >= (int) tptrs.size()) continue;
+            VEDAdeviceptr src = tptrs[sp.source_slot];
+            if (src == 0) return false;
+            kv_shadow * sh = shadows->get_or_create(src, sp.channels, sp.seq_max);
+            if (!sh || sh->shadow_hbm == 0) {
+                if (debug_enabled()) {
+                    fprintf(stderr, "[VE-GC] kv-shadow lookup failed for slot %d (channels=%ld seq=%ld)\n",
+                            sp.source_slot, (long) sp.channels, (long) sp.seq_max);
+                }
+                return false;
+            }
+            tptrs[sp.shadow_slot] = sh->shadow_hbm;
+        }
+    }
+
+    // After walking the cgraph + populating companion slots, slot_pos should
     // have stepped past every WEIGHT/KV/INTERMEDIATE slot in the table —
     // anything less means try_push ran out of cgraph tensors before filling
     // all expected real slots.
@@ -2039,6 +2147,7 @@ bool GraphCompiler::execute(CompiledGraph * graph,
         if (graph->slot_kinds[i] == BufferKind::WEIGHT_VEBP_WS)  continue;
         if (graph->slot_kinds[i] == BufferKind::WEIGHT_VEBP_WN)  continue;
         if (graph->slot_kinds[i] == BufferKind::WEIGHT_VEBP_WSC) continue;
+        if (graph->slot_kinds[i] == BufferKind::KV_SHADOW)       continue;
         if (tptrs[i] == 0) {
             if (debug_enabled()) {
                 fprintf(stderr, "[VE-GC] slot %zu kind=%d is NULL — abort\n",

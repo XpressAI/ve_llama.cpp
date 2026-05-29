@@ -197,6 +197,45 @@ uint64_t ve_flash_attn_ext_f32q_bf16kv_colmajor_hbm(
     return 0;
 }
 
+/* Direct inner variant for compiled graph kernels. Caller must already be
+ * inside an OpenMP parallel region; this function shares heads with the caller's
+ * team and does not launch VEDA or convert pointers. The compiled graph uses
+ * causal seq_len instead of an explicit mask, matching its row-major FA inner. */
+void attention_f32q_bf16kv_colmajor_inner_strided(
+    float * out,
+    const float * q,
+    const bf16 * k_col,
+    const bf16 * v_col,
+    int head_dim,
+    int n_q_heads,
+    int n_kv_heads,
+    int seq_len,
+    int seq_max,
+    float scale,
+    size_t q_head_stride_bytes,
+    size_t out_head_stride_bytes) {
+
+    int hd = head_dim;
+    int nq = n_q_heads;
+    int nk = n_kv_heads;
+    int sl = seq_len;
+    int sm = seq_max;
+    int q_hstride   = (int)(q_head_stride_bytes   / sizeof(float));
+    int out_hstride = (int)(out_head_stride_bytes / sizeof(float));
+
+    int h;
+#pragma omp for private(h)
+    for (h = 0; h < nq; h++) {
+        int kv_h = h * nk / nq;
+        const float * qh   = q     + (size_t) h    * q_hstride;
+        float *       oh   = out   + (size_t) h    * out_hstride;
+        const bf16 *  k_h  = k_col + (size_t) kv_h * hd * sm;
+        const bf16 *  v_h  = v_col + (size_t) kv_h * hd * sm;
+        fa_colmajor_single_head(oh, qh, k_h, v_h, NULL,
+                                hd, sl, sm, scale, 1.0f);
+    }
+}
+
 /* ---------------------------------------------------------------------- */
 /* Mirror a single just-written K (or V) row into the col-major shadow.
  *
