@@ -1197,6 +1197,43 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
        << " size_t nb_k1, size_t nb_k2, size_t nb_v1, size_t nb_v2);\n";
     ss << "extern void swiglu_hbm_full_inner(float* y, float* gate, float* up, int nc, int nr);\n\n";
 
+    // Ops are grouped into small static chunk functions instead of one giant
+    // body. NCC's optimizer overflows its internal tables ("opt(): Internal
+    // Error: Table Overflow") on a single huge function — hundreds of ops, as
+    // in an 8B decode graph (~835 ops) — and silently falls back to scalar,
+    // serial code, so the whole kernel runs on ~1 core (8B decode was 2x
+    // SLOWER than the interpreter). Splitting into <=CHUNK-op functions keeps
+    // each well under the limit so it vectorises, and the orphaned
+    // `#pragma omp for`s still bind to the single enclosing parallel team —
+    // all chunks run inside one #pragma omp parallel (one fork per token),
+    // called in encounter order.
+    const bool ktrace   = (std::getenv("GGML_VE_KERNEL_TRACE") != nullptr);
+    const int  CHUNK    = []{ const char * e = std::getenv("GGML_VE_COMPILE_CHUNK");
+                              int v = e ? std::atoi(e) : 48; return v > 0 ? v : 48; }();
+    const int  n_ops    = (int) traced_ops_.size();
+    const int  n_chunks = (n_ops + CHUNK - 1) / CHUNK;
+    for (int c = 0; c < n_chunks; ++c) {
+        ss << "static void gc_chunk_" << c
+           << "(void** p, void* input, void* output, int64_t pos) {\n";
+        ss << "    (void)p; (void)input; (void)output; (void)pos;\n";
+        const int lo = c * CHUNK, hi = std::min(lo + CHUNK, n_ops);
+        for (int i = lo; i < hi; ++i) {
+            if (ktrace) {
+                ss << "    #pragma omp barrier\n";
+                ss << "    #pragma omp single\n    {fprintf(stderr,\"[VE-K] op " << i
+                   << " " << op_type_name(traced_ops_[i].type) << " dst_slot="
+                   << traced_ops_[i].dst_idx << " START\\n\");fflush(stderr);}\n";
+            }
+            ss << gen_op_code(traced_ops_[i], i);
+            if (ktrace) {
+                ss << "    #pragma omp barrier\n";
+                ss << "    #pragma omp single\n    {fprintf(stderr,\"[VE-K] op " << i
+                   << " DONE\\n\");fflush(stderr);}\n";
+            }
+        }
+        ss << "}\n\n";
+    }
+
     int n_slots = (int) tensor_slot_order_.size();
 
     // Entry point. Single tensor-pointer array `tptr_hbm` of length n_slots
@@ -1288,28 +1325,15 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     //
     // Threads fork once per kernel launch instead of once per op (~18×
     // for the attention+FFN block on Llama-3.2-3B).
+    // One fork for the whole cgraph; the chunk functions run in order inside
+    // it, each sharing work across the team via orphaned `#pragma omp for`.
+    // The implicit barrier at the end of every for synchronises before the
+    // next op (and chunk), so no explicit barriers between chunks are needed.
     ss << "    #pragma omp parallel num_threads(8)\n";
     ss << "    {\n";
-
-    const bool ktrace = (std::getenv("GGML_VE_KERNEL_TRACE") != nullptr);
-    for (size_t i = 0; i < traced_ops_.size(); ++i) {
-        if (ktrace) {
-            // Synchronised checkpoint: barrier forces the whole team to finish
-            // the previous op before one thread prints, so the last line before
-            // a VE fault is exactly the op that crashed.
-            ss << "    #pragma omp barrier\n";
-            ss << "    #pragma omp single\n    {fprintf(stderr,\"[VE-K] op " << i
-               << " " << op_type_name(traced_ops_[i].type) << " dst_slot="
-               << traced_ops_[i].dst_idx << " START\\n\");fflush(stderr);}\n";
-        }
-        ss << gen_op_code(traced_ops_[i], (int) i);
-        if (ktrace) {
-            ss << "    #pragma omp barrier\n";
-            ss << "    #pragma omp single\n    {fprintf(stderr,\"[VE-K] op " << i
-               << " DONE\\n\");fflush(stderr);}\n";
-        }
+    for (int c = 0; c < n_chunks; ++c) {
+        ss << "        gc_chunk_" << c << "(p, input, output, pos);\n";
     }
-
     ss << "    }\n";   // end #pragma omp parallel
 
     // Copy the very last op's output into the host-supplied `output` HMEM.
@@ -1358,8 +1382,16 @@ bool GraphCompiler::compile_source(const std::string & source, const std::string
         nlc_lib = "/opt/nec/ve/nlc/3.1.0/lib";
     }
 
+    // GGML_VE_COMPILE_FTRACE=1: build the generated kernel with -ftrace so the
+    // fused ve_graph_run_* function shows up in ftrace.out alongside the
+    // library _inner kernels — lets us see how much time is the inline codegen
+    // (rope/norm/add) vs the matvec/FA/GLU library calls. Off by default
+    // (ftrace adds per-function overhead). Also emit the NCC vectorization
+    // report so unvectorised loops in the generated source are visible.
+    const bool gc_ftrace = (std::getenv("GGML_VE_COMPILE_FTRACE") != nullptr);
     std::ostringstream cmd;
     cmd << "/opt/nec/ve/bin/ncc -O4 -fopenmp -fpic -shared "
+        << (gc_ftrace ? "-ftrace -report-all -fdiag-vector=2 " : "")
         << "-I/opt/nec/ve/share/veoffload-veda/include "
         << "-I" << nlc_lib << "/../include "
         << "-L" << kdir << " -Wl,-rpath," << kdir << " "

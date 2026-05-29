@@ -33,6 +33,7 @@ when tuning.
 | `GGML_VE_HBM` | off | Cache model weights in VE HBM (uploaded once, reused). The main inference fast path — strongly recommended. |
 | `GGML_VE_COMPILE_GRAPH` | off | JIT the whole decode graph into a single fused VE kernel (one launch/token instead of ~one-per-op). On a model whose decode is one self-contained cgraph (e.g. Llama-3.2-3B-BF16) this is ~2.1× over the interpreter. First run per unique graph pays a ~30–60 s `ncc` compile; the `.so` is cached under `~/.cache/ggml-ve-compiled/`. |
 | `GGML_VE_COMPILE_MIN_NODES` | `1` | Minimum cgraph node count the graph compiler will attempt. Default `1` = no threshold; the self-containment check (below) decides what actually compiles. Raise it (e.g. `64`) to skip JIT-compiling small graphs not worth the `ncc` cost. *This replaces the old hard-coded threshold — it is now purely an opt-in perf knob.* |
+| `GGML_VE_COMPILE_CHUNK` | `48` | Ops per generated chunk function. The fused kernel is split into `static` chunk functions of this many ops so NCC doesn't overflow its optimizer tables on large (8B-class, ~800-op) graphs and silently fall back to scalar/serial code. All chunks still run inside one `#pragma omp parallel`. Smaller = safer but more call-boundary overhead; larger risks the overflow. |
 | `GGML_VE_COLMAJOR_FA_MIN` | `96` | KV length at/above which flash-attention switches to the column-major CBLAS path (the Stage-1 crossover). Lower = use colmajor sooner. |
 | `GGML_VE_COLMAJOR_N1` | off | Force the N=1 (decode) matmul onto the colmajor F32 CBLAS path. |
 
@@ -60,6 +61,7 @@ Off by default; set to any value to enable.
 | `GGML_VE_GC_DUMP` | List every CPU-resident operand in each cgraph (weight/leaf/intermediate) — the "why didn't this compile" diagnostic. |
 | `GGML_VE_STAGE_DEBUG` | Log each host↔HBM operand staging (name, size, in/out). |
 | `GGML_VE_KERNEL_TRACE` | Emit a per-op checkpoint (and FA arg dump) into the generated kernel to pinpoint a faulting op. Adds barriers — for debugging only. |
+| `GGML_VE_COMPILE_FTRACE` | Build the generated kernel with `-ftrace -report-all` so the fused function shows up in `ftrace.out` (analyse with `/opt/nec/ve/bin/ftrace`) and NCC writes a `.L` vectorisation/parallelisation listing. For profiling the compiled kernel. |
 | `GGML_VE_DIAGNOSE_SIG` | On a compile-triggering cgraph-signature miss, print what changed vs the previous graph of the same node count. |
 | `GGML_VE_DEBUG_*` | Per-op debug logging (`_MUL_MAT`, `_ROPE`, `_FA`, `_CPY`, `_RMS_NORM`, `_SYNC`, …). |
 | `GGML_VE_NO_*` | Disable a specific op on VE so it falls back to CPU (`_MUL_MAT`, `_FA_TILE`, `_GLU`, `_GET_ROWS`, `_CPY`, `_KV_SHADOW`, `_COLMAJOR`, …) — for bisecting correctness. |
