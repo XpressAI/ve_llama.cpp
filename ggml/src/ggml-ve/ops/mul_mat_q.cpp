@@ -521,7 +521,10 @@ bool mul_mat_q(backend_context * ctx, ggml_tensor * dst) {
             vedaArgsSetU64 (args, 6, (uint64_t) K);
             ok = ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, 1, nullptr),
                             "vedaLaunchKernelEx(vebp_matvec)");
-            if (ok && N > 1) vedaCtxSynchronize();
+            // No per-column sync: the N column launches queue on the single
+            // VEDA stream and execute serially, so each refills the kernel's
+            // static activation scratch before reading it. Deferred sync at
+            // graph end covers them all (matches the BF16/Q4_K decode path).
         }
     }
 
