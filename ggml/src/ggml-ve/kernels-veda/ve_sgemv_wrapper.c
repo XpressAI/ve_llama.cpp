@@ -11575,6 +11575,40 @@ uint64_t ve_rope_normal_hbm_single_pos(VEDAdeviceptr y_hbm,
 /*
  * ROPE NeoX style with HBM input/output + OpenMP - no cache version
  */
+/* ---- YaRN rope helpers (match ggml-cpu/ops.cpp rope_yarn + ggml.c corr_dims) ----
+ * Lets the VE NeoX rope kernels support YaRN context scaling (ext_factor != 0),
+ * used by Qwen3-family models. Without it the scheduler exiled every rope to
+ * CPU, shattering the decode graph into per-layer fragments. */
+static inline void ve_rope_corr_dims(int n_dims, int n_ctx_orig, float freq_base,
+                                     float beta_fast, float beta_slow,
+                                     float* lo, float* hi) {
+    const float c = 2.0f * logf(freq_base);
+    float start = floorf((float)n_dims * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / c);
+    float end   =  ceilf((float)n_dims * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / c);
+    *lo = start < 0.0f ? 0.0f : start;
+    *hi = end > (float)(n_dims - 1) ? (float)(n_dims - 1) : end;
+}
+
+/* cos/sin for dim pair `ip` (=i0/2), already scaled by the (YaRN-corrected)
+ * magnitude. theta_extrap = pos * theta_scale^ip (NOT freq-scaled). */
+static inline void ve_rope_yarn(float theta_extrap, float freq_scale,
+                                float corr_lo, float corr_hi, int ip,
+                                float ext_factor, float mscale,
+                                float* cos_out, float* sin_out) {
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        float denom = corr_hi - corr_lo; if (denom < 0.001f) denom = 0.001f;
+        float y = ((float)ip - corr_lo) / denom;
+        y = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+        float ramp_mix = (1.0f - y) * ext_factor;           /* rope_yarn_ramp */
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    *cos_out = cosf(theta) * mscale;
+    *sin_out = sinf(theta) * mscale;
+}
+
 uint64_t ve_rope_neox_hbm_omp_nocache(VEDAdeviceptr y_hbm,
                                        VEDAdeviceptr x_hbm,
                                        VEDAdeviceptr pos_hbm,
@@ -11588,7 +11622,11 @@ uint64_t ve_rope_neox_hbm_omp_nocache(VEDAdeviceptr y_hbm,
                                        uint64_t nb3,
                                        float freq_base,
                                        float freq_scale,
-                                       float mscale) {
+                                       float mscale,
+                                       float ext_factor,
+                                       uint64_t n_ctx_orig,
+                                       float beta_fast,
+                                       float beta_slow) {
     /* Convert HBM pointers to raw VE addresses */
     float* y;
     const float* x;
@@ -11596,49 +11634,52 @@ uint64_t ve_rope_neox_hbm_omp_nocache(VEDAdeviceptr y_hbm,
     if (vedaMemPtr((void**)&y, y_hbm) != 0) return 1;
     if (vedaMemPtr((void**)&x, x_hbm) != 0) return 2;
     if (vedaMemPtr((void**)&pos, pos_hbm) != 0) return 3;
-    
+
     int heads = (int)n_heads;
     int ctx = (int)n_ctx;
     int batch = (int)n_batch;
     int nd = (int)n_dims;
     int half_nd = nd / 2;
     int elem_per_head = (int)ne0;
-    
-    /* Precompute theta_scale */
+
+    /* Precompute theta_scale + YaRN correction dims */
     float theta_scale = powf(freq_base, -2.0f/nd);
-    
+    float corr_lo, corr_hi;
+    ve_rope_corr_dims(nd, (int)n_ctx_orig, freq_base, beta_fast, beta_slow, &corr_lo, &corr_hi);
+
     int total_rows = batch * ctx * heads;
-    
+
     #pragma omp parallel for
     for (int row = 0; row < total_rows; row++) {
         int i3 = row / (ctx * heads);
         int rem = row % (ctx * heads);
         int i2 = rem / heads;
         int i1 = rem % heads;
-        
-        float theta = (float)pos[i2] * freq_scale;
-        
+
+        float theta_extrap = (float)pos[i2];   /* NOT freq-scaled — YaRN needs extrap */
+
         size_t src_offset = i3 * nb3 + i2 * nb2 + i1 * nb1;
         size_t dst_offset = src_offset;
-        
+
         const float* src = (const float*)((const char*)x + src_offset);
         float* dst = (float*)((char*)y + dst_offset);
-        
+
         /* NeoX style: rotate first half with second half */
         #pragma _NEC ivdep
         for (int i0 = 0; i0 < half_nd; i0++) {
-            float cos_val = cosf(theta) * mscale;
-            float sin_val = sinf(theta) * mscale;
-            
+            float cos_val, sin_val;
+            ve_rope_yarn(theta_extrap, freq_scale, corr_lo, corr_hi, i0,
+                         ext_factor, mscale, &cos_val, &sin_val);
+
             float x0 = src[i0];
             float x1 = src[i0 + half_nd];
-            
+
             dst[i0]           = x0 * cos_val - x1 * sin_val;
             dst[i0 + half_nd] = x0 * sin_val + x1 * cos_val;
-            
-            theta *= theta_scale;
+
+            theta_extrap *= theta_scale;
         }
-        
+
         /* Copy remaining elements unchanged */
         for (int i0 = nd; i0 < elem_per_head; i0++) {
             dst[i0] = src[i0];

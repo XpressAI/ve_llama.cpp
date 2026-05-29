@@ -43,10 +43,14 @@ bool rope_supports(const ggml_tensor * op) {
     const int32_t * params = (const int32_t *) op->op_params;
     const int mode = params[2];
 
-    // YaRN not yet wired in any of our kernels.
+    // YaRN (ext_factor != 0) is implemented only in the NeoX HBM kernels
+    // (ve_rope_neox_hbm_omp_nocache). Accept it there; for normal/mrope YaRN
+    // (rare) fall back to CPU rather than apply un-corrected angles.
     float ext_factor = 0.0f;
     std::memcpy(&ext_factor, params + 7, sizeof(float));
-    if (ext_factor != 0.0f) return rej("ext_factor != 0");
+    const bool neox  = (mode & ROPE_MODE_NEOX)  != 0;
+    const bool mrope = (mode & ROPE_MODE_MROPE) != 0;
+    if (ext_factor != 0.0f && (!neox || mrope)) return rej("yarn only on neox");
 
     // VISION mode uses a different pair layout; not yet supported.
     if (mode == ROPE_MODE_VISION) return rej("vision mode");
@@ -63,12 +67,17 @@ bool rope(backend_context * ctx, ggml_tensor * dst) {
     if (x_hbm == 0 || dst_hbm == 0) return false;
 
     const int32_t * params = (const int32_t *) dst->op_params;
-    const int n_dims   = params[1];
-    const int mode     = params[2];
-    float freq_base  = 0.0f, freq_scale = 0.0f, attn_factor = 0.0f;
+    const int n_dims     = params[1];
+    const int mode       = params[2];
+    const uint64_t n_ctx_orig = (uint64_t) params[4];
+    float freq_base = 0.0f, freq_scale = 0.0f, ext_factor = 0.0f,
+          attn_factor = 0.0f, beta_fast = 0.0f, beta_slow = 0.0f;
     std::memcpy(&freq_base,   params + 5, sizeof(float));
     std::memcpy(&freq_scale,  params + 6, sizeof(float));
+    std::memcpy(&ext_factor,  params + 7, sizeof(float));
     std::memcpy(&attn_factor, params + 8, sizeof(float));
+    std::memcpy(&beta_fast,   params + 9, sizeof(float));
+    std::memcpy(&beta_slow,   params + 10, sizeof(float));
 
     const bool mrope = (mode & ROPE_MODE_MROPE) != 0;
     const bool neox  = (mode & ROPE_MODE_NEOX)  != 0;
@@ -172,6 +181,10 @@ bool rope(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetF32 (args, 11, freq_base);
     vedaArgsSetF32 (args, 12, freq_scale);
     vedaArgsSetF32 (args, 13, attn_factor);
+    vedaArgsSetF32 (args, 14, ext_factor);
+    vedaArgsSetU64 (args, 15, n_ctx_orig);
+    vedaArgsSetF32 (args, 16, beta_fast);
+    vedaArgsSetF32 (args, 17, beta_slow);
 
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),
                     "vedaLaunchKernelEx(rope_hbm_omp_nocache)")) {

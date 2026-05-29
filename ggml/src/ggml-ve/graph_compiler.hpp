@@ -106,7 +106,8 @@ struct TracedOp {
 
     union {
         struct { float eps; }                                         rms_norm;
-        struct { float freq_base, freq_scale, mscale; int n_dims, mode; } rope;
+        struct { float freq_base, freq_scale, mscale; int n_dims, mode;
+                 float ext_factor, beta_fast, beta_slow; int n_ctx_orig; } rope;
         struct { float scale, max_bias, softcap;
                  int   kv_type; int64_t n_kv_heads;
                  size_t nb_k1, nb_k2, nb_v1, nb_v2; }                 flash_attn;

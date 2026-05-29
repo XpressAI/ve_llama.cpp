@@ -360,15 +360,25 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
             op.type = OpType::ROPE;
             op.p.rope.n_dims = n_dims;
             op.p.rope.mode   = mode;
-            float fb, fs, ef, af;
-            std::memcpy(&fb, (float *) node->op_params + 5, sizeof(float));
-            std::memcpy(&fs, (float *) node->op_params + 6, sizeof(float));
-            std::memcpy(&ef, (float *) node->op_params + 7, sizeof(float));
-            std::memcpy(&af, (float *) node->op_params + 8, sizeof(float));
-            if (ef != 0.0f) return false;   // YaRN not in our generator
+            int32_t n_ctx_orig = 0;
+            std::memcpy(&n_ctx_orig, (int32_t *) node->op_params + 4, sizeof(int32_t));
+            float fb, fs, ef, af, bf, bs;
+            std::memcpy(&fb, (float *) node->op_params + 5,  sizeof(float));
+            std::memcpy(&fs, (float *) node->op_params + 6,  sizeof(float));
+            std::memcpy(&ef, (float *) node->op_params + 7,  sizeof(float));
+            std::memcpy(&af, (float *) node->op_params + 8,  sizeof(float));
+            std::memcpy(&bf, (float *) node->op_params + 9,  sizeof(float));
+            std::memcpy(&bs, (float *) node->op_params + 10, sizeof(float));
+            // YaRN (ext_factor != 0) is emitted only on the NeoX path; for
+            // non-neox YaRN fall back (refuse -> interpreter/CPU).
+            if (ef != 0.0f && !(mode & 2 /* NEOX */)) return false;
             op.p.rope.freq_base  = fb;
             op.p.rope.freq_scale = fs;
             op.p.rope.mscale     = (af != 0.0f) ? af : 1.0f;
+            op.p.rope.ext_factor = ef;
+            op.p.rope.beta_fast  = bf;
+            op.p.rope.beta_slow  = bs;
+            op.p.rope.n_ctx_orig = n_ctx_orig;
             break;
         }
         case GGML_OP_SET_ROWS:
@@ -923,20 +933,45 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             ss << "        const float* in  = (const float*)" << src0 << ";\n";
             ss << "        float*       out = (float*)"      << dst  << ";\n";
             if (neox) {
+                // YaRN context scaling (ext_factor != 0; Qwen3 et al.). Matches
+                // ggml-cpu rope_yarn. ext_factor == 0 collapses to plain
+                // linear-scaled NeoX rope.
                 ss << "        int half = head_size / 2;\n";
                 ss << "        float theta_scale = powf(freq_base, -2.f / head_size);\n";
+                ss << "        float ext_factor = " << flit(op.p.rope.ext_factor) << ";\n";
+                ss << "        float corr_lo = 0.f, corr_hi = (float)(head_size - 1);\n";
+                ss << "        if (ext_factor != 0.f) {\n";
+                ss << "            float cc = 2.f * logf(freq_base);\n";
+                ss << "            corr_lo = floorf((float)head_size * logf(" << op.p.rope.n_ctx_orig
+                   << ".f / (" << flit(op.p.rope.beta_fast) << " * 2.f * (float)M_PI)) / cc);\n";
+                ss << "            corr_hi =  ceilf((float)head_size * logf(" << op.p.rope.n_ctx_orig
+                   << ".f / (" << flit(op.p.rope.beta_slow) << " * 2.f * (float)M_PI)) / cc);\n";
+                ss << "            if (corr_lo < 0.f) corr_lo = 0.f;\n";
+                ss << "            if (corr_hi > (float)(head_size-1)) corr_hi = (float)(head_size-1);\n";
+                ss << "        }\n";
+                ss << "        float ms_yarn = (ext_factor != 0.f) ? mscale * (1.f + 0.1f * logf(1.f/freq_scale)) : mscale;\n";
+                ss << "        float denom = corr_hi - corr_lo; if (denom < 0.001f) denom = 0.001f;\n";
                 ss << "        #pragma omp for\n";
                 ss << "        for (int h = 0; h < n_heads; h++) {\n";
-                ss << "            float theta = (float)pos_i * freq_scale;\n";
+                ss << "            float theta_extrap = (float)pos_i;\n";
                 ss << "            for (int i = 0; i < half; i++) {\n";
-                ss << "                float c = cosf(theta) * mscale;\n";
-                ss << "                float s = sinf(theta) * mscale;\n";
+                ss << "                float theta = freq_scale * theta_extrap;\n";
+                ss << "                float ms = mscale;\n";
+                ss << "                if (ext_factor != 0.f) {\n";
+                ss << "                    float yy = ((float)i - corr_lo) / denom;\n";
+                ss << "                    yy = yy < 0.f ? 0.f : (yy > 1.f ? 1.f : yy);\n";
+                ss << "                    float rmix = (1.f - yy) * ext_factor;\n";
+                ss << "                    theta = theta * (1.f - rmix) + theta_extrap * rmix;\n";
+                ss << "                    ms = ms_yarn;\n";
+                ss << "                }\n";
+                ss << "                float c = cosf(theta) * ms;\n";
+                ss << "                float s = sinf(theta) * ms;\n";
                 ss << "                int a = h * head_size + i;\n";
                 ss << "                int b = a + half;\n";
                 ss << "                float v0 = in[a], v1 = in[b];\n";
                 ss << "                out[a] = v0 * c - v1 * s;\n";
                 ss << "                out[b] = v0 * s + v1 * c;\n";
-                ss << "                theta *= theta_scale;\n";
+                ss << "                theta_extrap *= theta_scale;\n";
                 ss << "            }\n";
                 ss << "        }\n";
             } else {
