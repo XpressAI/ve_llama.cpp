@@ -104,6 +104,13 @@ struct TracedOp {
     int64_t src0_ne[4] = {0,0,0,0};
     int64_t src1_ne[4] = {0,0,0,0};
 
+    // Token-count scaling class for generated loops. Prompt graphs have a
+    // graph-wide token count (n_tok) in the backbone, then may slice to an
+    // output count (n_out) with GET_ROWS(hidden, inp_out_ids) for the tail.
+    bool    scales_graph_n  = false;
+    bool    scales_output_n = false;
+    int64_t scale_baked     = 1;
+
     union {
         struct { float eps; }                                         rms_norm;
         struct { float freq_base, freq_scale, mscale; int n_dims, mode;

@@ -16,8 +16,10 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <sstream>
 #include <sys/stat.h>
+#include <unordered_map>
 #include <unistd.h>
 
 namespace ggml_ve {
@@ -640,6 +642,31 @@ bool GraphCompiler::trace(ggml_cgraph * cgraph) {
         }
     }
 
+    // Annotate token-scaling after the whole graph has been traced. The prompt
+    // backbone scales with n_tok. After llama's output-row selection
+    // GET_ROWS(hidden, inp_out_ids), the remaining tail scales with n_out
+    // instead. Treating that tail as runtime-sized keeps the n_out=1 and
+    // n_out=N server prompt variants on the same generated source hash.
+    bool in_output_tail = false;
+    if (n_tok_baked_ > 1) {
+        for (auto & op : traced_ops_) {
+            const bool output_select =
+                op.type == OpType::GET_ROWS && op.src0_kind != BufferKind::WEIGHT;
+            if (output_select) in_output_tail = true;
+
+            const bool graph_scaled =
+                op.ne[1] == n_tok_baked_ || op.ne[2] == n_tok_baked_;
+            if (in_output_tail) {
+                op.scales_output_n = true;
+                op.scale_baked = op.ne[1] > 1 ? op.ne[1] :
+                                 op.ne[2] > 1 ? op.ne[2] : 1;
+            } else if (graph_scaled) {
+                op.scales_graph_n = true;
+                op.scale_baked = n_tok_baked_;
+            }
+        }
+    }
+
     if (debug_enabled()) {
         fprintf(stderr, "[VE-GC] traced %zu ops (%zu weights, %zu kv, %zu intermediates)\n",
                 traced_ops_.size(), weight_tensors_.size(),
@@ -715,27 +742,28 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
     const int64_t NB = (n_tok_baked_ > 0) ? n_tok_baked_ : 1;
     int64_t full = op.ne[0] * op.ne[1] * op.ne[2] * op.ne[3];
     if (full == 0) full = op.ne[0];
-    // Does this op scale with the graph token count? The prompt graph has a
-    // last-token slice (GET_ROWS inp_out_ids) after which the tail (final norm,
-    // lm_head) is n_out(=1)-shaped, NOT N. An op scales with N iff a token dim
-    // equals NB; the n_out tail keeps its own (baked) count. SET_ROWS / ROPE /
-    // FA always loop n_tok directly (handled in their cases).
-    const bool scales_n = (NB > 1) && (op.ne[1] == NB || op.ne[2] == NB);
-    const int64_t pt = scales_n ? (full / NB) : full;  // per-token elem count
-    // Loop count for the token dim: runtime n_tok when the op scales with N,
-    // else the op's literal column count (1 for the lm_head tail).
-    const std::string col_n = scales_n ? std::string("n_tok")
-                                       : std::to_string(op.ne[1] > 0 ? op.ne[1] : 1);
-    // Element range for element-wise ops: pt*n_tok when scaling, else full.
-    const std::string elem_n = scales_n ? (std::to_string(pt) + "LL * n_tok")
-                                        : (std::to_string(full) + "LL");
+    // Does this op scale with a runtime token count? The prompt backbone uses
+    // n_tok; the graph tail after GET_ROWS(hidden, inp_out_ids) uses n_out so
+    // last-token and all-output prompt variants share byte-identical source.
+    const bool scales_n   = op.scales_graph_n;
+    const bool scales_out = op.scales_output_n;
+    const bool scales_any = scales_n || scales_out;
+    const int64_t scale_baked =
+        (op.scale_baked > 0) ? op.scale_baked : (scales_n ? NB : 1);
+    const int64_t pt = scales_any ? (full / scale_baked) : full;
+    const std::string tok_expr = scales_out ? std::string("n_out") :
+                                 scales_n   ? std::string("n_tok") :
+                                              std::to_string(op.ne[1] > 0 ? op.ne[1] : 1);
+    const std::string col_n = tok_expr;
+    const std::string elem_n = scales_any ? (std::to_string(pt) + "LL * " + tok_expr)
+                                          : (std::to_string(full) + "LL");
 
-    // NOTE: keep this comment free of N-dependent values (n, NB) — the JIT
-    // cache key is the source hash, so baking the token count here would force
-    // a separate compile per prompt length. pt is per-token (N-independent).
+    // NOTE: keep this comment free of shape-derived values. The JIT cache key
+    // is the source hash, so even a skipped op's changing mask size in a
+    // comment would force a separate compile for identical executable code.
     (void) n;
     ss << "    // op " << idx << ": " << op_type_name(op.type)
-       << "  '" << op.name << "'  pt=" << pt << "\n";
+       << "  '" << op.name << "'\n";
 
     switch (op.type) {
         case OpType::GET_ROWS: {
@@ -755,10 +783,13 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 // row 0. (Arbitrary inp_out_ids would need the index array;
                 // those configs are not used by llama-completion.)
                 int64_t n_out = op.ne[1] > 0 ? op.ne[1] : 1;
-                ss << "        long n_out = " << n_out << "LL;\n";
+                ss << "        long n_sel = "
+                   << (scales_out ? std::string("n_out")
+                                   : std::to_string(n_out) + "LL")
+                   << ";\n";
                 ss << "        memcpy(" << dst << ", (const char*)" << src0
-                   << " + (n_tok - n_out) * " << (op.ne[0] * sizeof(float)) << "LL, "
-                   << "n_out * " << (op.ne[0] * sizeof(float)) << "LL);\n";
+                   << " + (n_tok - n_sel) * " << (op.ne[0] * sizeof(float)) << "LL, "
+                   << "n_sel * " << (op.ne[0] * sizeof(float)) << "LL);\n";
                 ss << "    }\n";
                 break;
             }
@@ -789,14 +820,14 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             int64_t cols  = op.ne[0];
             // rows-per-token (baked): total rows / n_tok_baked_. For Q/K-norm
             // this is n_heads; for the residual norms it is 1.
-            int64_t rpt   = (cols > 0) ? (full / NB) / cols : 1;
+            int64_t rpt   = (cols > 0) ? (full / scale_baked) / cols : 1;
             if (rpt < 1) rpt = 1;
             int64_t lit_rows = (cols > 0) ? (full / cols) : 1;   // op's own row count
             if (lit_rows < 1) lit_rows = 1;
             // Row count: rpt*n_tok when the op scales with N, else the op's own
             // baked row count (the n_out=1 final-norm tail).
-            const std::string rows_expr = scales_n
-                ? (std::to_string(rpt) + "LL * n_tok")
+            const std::string rows_expr = scales_any
+                ? (std::to_string(rpt) + "LL * " + tok_expr)
                 : (std::to_string(lit_rows) + "LL");
             // Small-cols (per-head Q/K-norm, and any multi-row case): each row
             // is an independent scalar reduction shared across the team. For
@@ -817,7 +848,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                 ss << "            for (int j = 0; j < cols; j++) y[j] = inv * x[j];\n";
                 ss << "        }\n";
                 ss << "    }\n";
-            } else if (scales_n) {
+            } else if (scales_any) {
                 // Big-cols, prompt eval (scales with N): rows = rpt * n_tok rows,
                 // each a scalar reduction over cols, distributed across the team.
                 // (At prompt eval there are plenty of rows to keep 8 threads busy.)
@@ -1002,7 +1033,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             std::string ws_p  = "p[" + std::to_string(op.vebp_ws_idx)  + "]";
             std::string wn_p  = "p[" + std::to_string(op.vebp_wn_idx)  + "]";
             std::string wsc_p = "p[" + std::to_string(op.vebp_wsc_idx) + "]";
-            if (scales_n) {
+            if (scales_any) {
                 // N>1: one batched call — the rowblock weight is read once and
                 // reused across all n_tok columns (vs the col-loop re-traversing
                 // the whole weight from HBM per column).
@@ -1011,7 +1042,7 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
                    << ", (const unsigned long*)" << wn_p
                    << ", (const float*)" << wsc_p
                    << ", (const float*)" << src1
-                   << ", " << M << ", " << K << ", (int)n_tok);\n";
+                   << ", " << M << ", " << K << ", (int)" << tok_expr << ");\n";
             } else {
                 // decode / n_out tail: per-column matvec (col_n is 1).
                 ss << "    for (int64_t col = 0; col < " << col_n << "; col++)\n";
@@ -1237,11 +1268,9 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
             int elem_bytes = (op.dst_type == GGML_TYPE_F32  ? 4
                              : op.dst_type == GGML_TYPE_BF16 ? 2
                              : op.dst_type == GGML_TYPE_F16  ? 2 : 4);
-            int64_t total_elems = op.ne[0] * op.ne[1] * op.ne[2] * op.ne[3];
-            if (total_elems == 0) total_elems = op.ne[0];
             ss << "    #pragma omp single\n";
             ss << "    memcpy(" << dst << ", " << src0 << ", "
-               << (size_t) (total_elems * elem_bytes) << "u);\n";
+               << "(size_t)((" << elem_n << ") * " << elem_bytes << "LL));\n";
             break;
         }
 
@@ -1271,12 +1300,14 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
         }
 
         case OpType::SOFT_MAX: {
-            int rows = (op.ne[1] > 1) ? (int) op.ne[1] : 1;
             int cols = (int) op.ne[0];
+            const std::string rows_expr = scales_any
+                ? tok_expr
+                : std::to_string(op.ne[1] > 1 ? op.ne[1] : 1);
             ss << "    #pragma omp single\n";
             ss << "    {\n";
-            ss << "        int rows = " << rows << ", cols = " << cols << ";\n";
-            ss << "        for (int r = 0; r < rows; r++) {\n";
+            ss << "        int64_t rows = " << rows_expr << "; int cols = " << cols << ";\n";
+            ss << "        for (int64_t r = 0; r < rows; r++) {\n";
             ss << "            float* x = (float*)" << src0 << " + r * cols;\n";
             ss << "            float* y = (float*)" << dst  << " + r * cols;\n";
             ss << "            float m = x[0];\n";
@@ -1357,8 +1388,8 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     const int  n_chunks = (n_ops + CHUNK - 1) / CHUNK;
     for (int c = 0; c < n_chunks; ++c) {
         ss << "static void gc_chunk_" << c
-           << "(void** p, void* input, void* output, int64_t pos, int64_t n_tok, const int* positions) {\n";
-        ss << "    (void)p; (void)input; (void)output; (void)pos; (void)n_tok; (void)positions;\n";
+           << "(void** p, void* input, void* output, int64_t pos, int64_t n_tok, const int* positions, int64_t n_out) {\n";
+        ss << "    (void)p; (void)input; (void)output; (void)pos; (void)n_tok; (void)positions; (void)n_out;\n";
         const int lo = c * CHUNK, hi = std::min(lo + CHUNK, n_ops);
         for (int i = lo; i < hi; ++i) {
             if (ktrace) {
@@ -1391,7 +1422,8 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     ss << "    void* output,             // HMEM logits out (f32)\n";
     ss << "    int64_t pos,               // positions[0] (back-comp)\n";
     ss << "    int64_t n_tok,             // number of tokens (1=decode, N=prompt)\n";
-    ss << "    const int* positions) {    // HMEM: n_tok token positions (i32)\n";
+    ss << "    const int* positions,      // HMEM: n_tok token positions (i32)\n";
+    ss << "    int64_t n_out) {           // output-selected rows after inp_out_ids\n";
 
     // Convert all tensor HBM pointers to raw VE addresses. We re-resolve
     // every call (cheap: just translates an opaque handle to a flat VE
@@ -1402,7 +1434,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     // module path vs in our op generators or in vedaMemPtr() on the slots.
     bool gen_noop = (std::getenv("GGML_VE_COMPILE_NOOP") != nullptr);
     if (gen_noop) {
-        ss << "    (void)tptr_hbm; (void)input; (void)output; (void)pos;\n";
+        ss << "    (void)tptr_hbm; (void)input; (void)output; (void)pos; (void)n_tok; (void)positions; (void)n_out;\n";
         ss << "    /* truly empty body */\n";
         ss << "    return 0;\n";
         ss << "}\n";
@@ -1477,7 +1509,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     ss << "    #pragma omp parallel num_threads(8)\n";
     ss << "    {\n";
     for (int c = 0; c < n_chunks; ++c) {
-        ss << "        gc_chunk_" << c << "(p, input, output, pos, n_tok, positions);\n";
+        ss << "        gc_chunk_" << c << "(p, input, output, pos, n_tok, positions, n_out);\n";
     }
     ss << "    }\n";   // end #pragma omp parallel
 
@@ -1612,6 +1644,21 @@ CompiledGraph * GraphCompiler::compile() {
     std::string source = generate_source(placeholder);
     std::string hash   = compute_hash(source);
 
+    // The cgraph signature used by the frontend is intentionally conservative:
+    // it can differ for prompt-length shapes that generate byte-identical code.
+    // Keep one loaded module per emitted-source hash so those misses never pay
+    // another vedaModuleLoad or NCC compile.
+    static std::mutex compiled_mu;
+    static std::unordered_map<std::string, CompiledGraph *> compiled_by_hash;
+    std::lock_guard<std::mutex> compiled_lk(compiled_mu);
+    auto hit = compiled_by_hash.find(hash);
+    if (hit != compiled_by_hash.end()) {
+        if (debug_enabled()) {
+            fprintf(stderr, "[VE-GC] reusing loaded %s\n", hit->second->so_path.c_str());
+        }
+        return hit->second;
+    }
+
     // Substitute the real, hash-derived function name into the source
     // before handing it off to NCC. The symbol name in the .so must
     // match what load_compiled() looks up.
@@ -1625,15 +1672,20 @@ CompiledGraph * GraphCompiler::compile() {
     std::string so  = dir + "/graph_" + hash + ".so";
 
     struct stat st;
+    CompiledGraph * cg = nullptr;
     if (stat(so.c_str(), &st) == 0) {
         if (debug_enabled()) {
             fprintf(stderr, "[VE-GC] loading cached %s\n", so.c_str());
         }
-        return load_compiled(so, hash);
+        cg = load_compiled(so, hash);
+        if (cg) compiled_by_hash.emplace(hash, cg);
+        return cg;
     }
 
     if (!compile_source(source, so)) return nullptr;
-    return load_compiled(so, hash);
+    cg = load_compiled(so, hash);
+    if (cg) compiled_by_hash.emplace(hash, cg);
+    return cg;
 }
 
 // -------------------------------------------------------------------------
@@ -2114,6 +2166,16 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     if ((int64_t) token_ids.size() > n_tok && pos_leaf == nullptr) {
         n_tok = (int64_t) token_ids.size();
     }
+    int64_t n_out = 1;
+    for (int i = 0; i < current_graph->n_nodes; ++i) {
+        const ggml_tensor * n = current_graph->nodes[i];
+        if (n && n->op == GGML_OP_GET_ROWS && n->src[0] && n->src[1] &&
+            !is_weight(n->src[0])) {
+            n_out = n->src[1]->ne[0] > 0 ? n->src[1]->ne[0] : 1;
+            break;
+        }
+    }
+    if (n_out > n_tok) n_out = n_tok;
 
     // HMEM in/out — sized once, reused across every execute() of the same
     // compiled graph. Most layer subgraphs use neither (their data flows
@@ -2200,6 +2262,7 @@ bool GraphCompiler::execute(CompiledGraph * graph,
     vedaArgsSetI64  (args, 3, position);
     vedaArgsSetI64  (args, 4, n_tok);
     vedaArgsSetHMEM (args, 5, pos_hmem);
+    vedaArgsSetI64  (args, 6, n_out);
 
     // vedaLaunchKernel (without Ex) auto-destroys args on success. We sync
     // after to surface VE-side errors at the right point.

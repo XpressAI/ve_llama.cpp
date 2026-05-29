@@ -345,12 +345,13 @@ ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) 
     // self-containment check (see graph_compiler.cpp), not a node count:
     // whole self-contained decode graphs fuse, scheduler-split middle
     // fragments fall back to the interpreter. GGML_VE_COMPILE_MIN_NODES is
-    // an optional perf knob (default 1 = no threshold) to also skip
-    // JIT-compiling small graphs not worth the ~30 s ncc cost. Documented
-    // in README.md.
+    // an optional perf knob (default 32) to also skip
+    // JIT-compiling small scheduler fragments not worth the ~30 s ncc cost
+    // and not always self-contained enough to execute safely. Documented in
+    // the VE KB / README.md.
     static const int gc_min_nodes = []{
         const char * env = std::getenv("GGML_VE_COMPILE_MIN_NODES");
-        return env ? std::atoi(env) : 1;
+        return env ? std::atoi(env) : 32;
     }();
     static const bool gc_verbose = []() {
         const char * env = std::getenv("GGML_VE_COMPILE_DEBUG");
