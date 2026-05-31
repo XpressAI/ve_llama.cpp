@@ -420,32 +420,12 @@ bool GraphCompiler::trace_one(ggml_tensor * node) {
             return false;   // unsupported by the compiler — fall back
     }
 
-    // Colmajor companion for BF16 MUL_MAT: allocate a new slot (no tensor
-    // backing it; populated at execute time via
-    // colmajor_weight_cache::get_or_create). The codegen emits a CBLAS
-    // sgemv against the F32 col-major copy instead of the hand-tuned BF16
-    // matvec. Cost: 4x weight memory in HBM, one-time transpose per
-    // weight (~25ms for 3072x3072), and ~2x memory traffic per matvec
-    // (F32 weights vs BF16). Benefit: CBLAS sgemv when N > 1 (no current
-    // compiled-graph caller yet, since we only fuse decode) and a
-    // platform for future GEMM-style fusion.
-    //
-    // Opt-IN with GGML_VE_COMPILE_COLMAJOR=1 — the default off because at
-    // decode-shape N=1 the BF16 _inner matvec (sgemv_packed_bf16_unr) is
-    // ~2-3% faster than colmajor sgemv. The path is wired up so we have
-    // somewhere to land prompt-eval fusion later.
-    static const bool use_colmajor =
-        (std::getenv("GGML_VE_COMPILE_COLMAJOR") != nullptr);
-    if (use_colmajor && op.type == OpType::MUL_MAT_BF16 && op.src0_idx >= 0) {
-        ColmajorSpec sp;
-        sp.src0_slot      = op.src0_idx;
-        sp.M              = op.src0_ne[1];
-        sp.K              = op.src0_ne[0];
-        sp.companion_slot = (int) tensor_slot_order_.size();
-        tensor_slot_order_.push_back({nullptr, BufferKind::WEIGHT_COLMAJOR});
-        colmajor_specs_.push_back(sp);
-        op.colmajor_idx = sp.companion_slot;
-    }
+    // (Removed) F32-colmajor companion + NLC cblas_sgemm path for BF16 MUL_MAT.
+    // Measured slower end-to-end than the batched BF16 tile in every regime
+    // (prompt -22%, decode -13%): colmajor needs F32 weights — 2x the bytes, and
+    // decode is bandwidth-bound on the weight stream — plus the F32 copies rebuild
+    // per process. The codegen now always uses ve_bf16_matmat_rowmajor_ptr_inner
+    // (batched 8/4-col tile). See kb/performance/current-investigation.md.
 
     // Q4_K MUL_MAT: register two companion slots (qs + decoded hdr).
     // The original Q4_K weight slot stays in the table but isn't actually
@@ -1001,56 +981,16 @@ std::string GraphCompiler::gen_op_code(const TracedOp & op, int idx) const {
 
         case OpType::MUL_MAT_BF16: {
             int64_t M = op.src0_ne[1], K = op.src0_ne[0];
-            if (op.colmajor_idx >= 0) {
-                // Colmajor + CBLAS fast path. W_colmajor is M-by-K stored
-                // column-major (lda=M), so column k is at &W[k*M]. CBLAS
-                // sgemv with CblasColMajor / CblasNoTrans computes
-                //   y[i] = sum_k W[i + k*M] * x[k]   (i in [imin, imax)).
-                // We partition rows ourselves with #pragma omp for so the
-                // outer omp team does the work; otherwise cblas_sgemv runs
-                // single-threaded per-call.
-                std::string cm = "p[" + std::to_string(op.colmajor_idx) + "]";
-                ss << "    {\n";
-                ss << "        int M = " << M << ", K = " << K << ";\n";
-                ss << "        const float* W = (const float*)" << cm << ";\n";
-                ss << "        float* yv0 = (float*)" << dst << ";\n";
-                ss << "        const float* xv0 = (const float*)" << src1 << ";\n";
-                ss << "        int64_t ncol = " << col_n << ";\n";
-                // For ncol>1 do one column-major GEMM (W[M,K] @ X[K,ncol]); for
-                // ncol==1 (decode, or the n_out=1 lm_head tail) the row-
-                // partitioned SGEMV keeps the 8-thread team busy (cblas_sgemv
-                // is single-threaded).
-                ss << "        if (ncol > 1) {\n";
-                ss << "            #pragma omp single\n";
-                ss << "            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,\n";
-                ss << "                        M, (int)ncol, K, 1.0f, W, M, xv0, K, 0.0f, yv0, M);\n";
-                ss << "        } else {\n";
-                ss << "            int nt = omp_get_num_threads();\n";
-                ss << "            int chunk = (M + nt - 1) / nt;\n";
-                ss << "            #pragma omp for\n";
-                ss << "            for (int g = 0; g < nt; g++) {\n";
-                ss << "                int imin = g * chunk;\n";
-                ss << "                int imax = imin + chunk;\n";
-                ss << "                if (imax > M) imax = M;\n";
-                ss << "                if (imin < imax) {\n";
-                ss << "                    cblas_sgemv(CblasColMajor, CblasNoTrans,\n";
-                ss << "                                imax - imin, K, 1.0f,\n";
-                ss << "                                W + imin, M, xv0, 1, 0.0f,\n";
-                ss << "                                yv0 + imin, 1);\n";
-                ss << "                }\n";
-                ss << "            }\n";
-                ss << "        }\n";
-                ss << "    }\n";
-            } else {
-                // _inner variant uses `#pragma omp for` internally — the
-                // implicit barrier at end-of-for synchronises the team. Loop
-                // n_tok activation columns (n_tok==1 -> decode); each column is
-                // y[:,col] = W @ x[:,col].
-                ss << "    for (int64_t col = 0; col < " << col_n << "; col++)\n";
-                ss << "        ve_bf16_matvec_rowmajor_ptr_inner((float*)" << dst << " + col*" << M
-                   << ", (const uint16_t*)" << src0 << ", (const float*)" << src1 << " + col*" << K
-                   << ", " << M << ", " << K << ");\n";
-            }
+            // Batched BF16 GEMM over all n_tok activation columns. The matmat
+            // wrapper tiles widest-first (8/4 cols) so each BF16 weight row is
+            // unpacked once and reused across columns: ~1.9x the per-column matvec
+            // for prompt eval, bit-identical, and no extra weight memory. For
+            // col_n==1 (decode / n_out=1 lm_head tail) it falls to the per-column
+            // matvec internally, so decode is unchanged. Its `#pragma omp for`
+            // barrier synchronises the team like the old matvec loop.
+            ss << "    ve_bf16_matmat_rowmajor_ptr_inner((float*)" << dst
+               << ", (const uint16_t*)" << src0 << ", (const float*)" << src1
+               << ", " << M << ", " << K << ", (int)(" << col_n << "));\n";
             break;
         }
 
@@ -1432,6 +1372,7 @@ std::string GraphCompiler::generate_source(const std::string & func_name) const 
     // The "_omp" variants spawn their own region and are used only by the
     // OpType::FLASH_ATTN F32 fallback (kept until we add an _inner there).
     ss << "extern void ve_bf16_matvec_rowmajor_ptr_inner(float* y, const uint16_t* W, const float* x, int M, int K);\n";
+    ss << "extern void ve_bf16_matmat_rowmajor_ptr_inner(float* Y, const uint16_t* W, const float* X, int M, int K, int N);\n";
     ss << "extern void ve_q4k_matvec_rowmajor_ptr_inner(float* y, const unsigned char* qs, const unsigned char* hdr, const float* x, int M, int K);\n";
     ss << "extern void ve_vebp_matvec_ptr_inner(float* y, const unsigned long* ws, const unsigned long* wn, const float* wsc, const float* x, int M, int K);\n";
     ss << "extern void ve_vebp_matmul_ptr_inner(float* y, const unsigned long* ws, const unsigned long* wn, const float* wsc, const float* x, int M, int K, int N);\n";

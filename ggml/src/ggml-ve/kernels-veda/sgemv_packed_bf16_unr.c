@@ -22,6 +22,154 @@ typedef unsigned short bf16;
     } while(0)
 
 
+/* 4-column tile: y0..y3[d] = w[d,n] @ (x0..x3)[n], one weight row UNPACKED ONCE
+ * per j-chunk and FMA'd against all 4 columns. The matvec is compute-bound on
+ * the BF16->packed-FP32 unpack (load_bf16_to_packed_fp32 = 4 vector ops vs 1
+ * FMA), so amortizing the unpack across 4 columns is the win — cache-blocking
+ * the col-loop does NOT help because each per-column matvec re-unpacks. Keeps
+ * the same BF16 x-truncation as the matvec (bit-identical per column). */
+#define UNPACK_W(dst, wp) do { \
+        __vr _wr; \
+        dst = _vel_vldunc_vssl(4, (void *)(wp), vl); \
+        _wr = _vel_vsrl_vvsl(dst, 16, vl); \
+        _wr = _vel_vand_vvvl(_wr, bf16mskl, vl); \
+        dst = _vel_vor_vvvl(dst, _wr, vl); \
+    } while (0)
+#define LOADX_TRUNC(dst, xp) do { \
+        if ((unsigned long)((xp)) & 0x7) { \
+            dst = _vel_vldu_vssl(8, (void *)((xp)+1), vl); \
+            __vr _xl = _vel_vldlzx_vssl(8, (void *)((xp)), vl); \
+            dst = _vel_pvor_vvvl(dst, _xl, vl); \
+        } else { dst = _vel_vld_vssl(8, (void *)((xp)), vl); } \
+        dst = _vel_vand_vvvl(dst, bf16inputmsk, vl); \
+    } while (0)
+
+void sgemm4_packed_bf16(float *y0, float *y1, float *y2, float *y3,
+                        const float *x0, const float *x1, const float *x2, const float *x3,
+                        bf16 *w, int n, int d) {
+    float zero[2] = {0.0f, 0.0f};
+    __vr bf16mskl = _vel_vbrdl_vsl(0x00000000ffff0000, VLEN);
+    __vr low32msk = _vel_vbrdl_vsl(0x00000000ffffffff, VLEN);
+    __vr bf16inputmsk = _vel_vbrdl_vsl(0xffff0000ffff0000UL, VLEN);
+    int i = 0;
+
+    /* 4 rows x 4 cols: 16-way ILP (like the matvec's 16-row unroll) AND the
+     * weight row is unpacked ONCE per row and reused across all 4 columns. */
+    for (; i + 4 <= d; i += 4) {
+        __vr t00 = _vel_vld_vssl(0,&zero[0],VLEN), t01 = t00, t02 = t00, t03 = t00;
+        __vr t10 = t00, t11 = t00, t12 = t00, t13 = t00;
+        __vr t20 = t00, t21 = t00, t22 = t00, t23 = t00;
+        __vr t30 = t00, t31 = t00, t32 = t00, t33 = t00;
+        bf16 *wp0 = w + (long)(i+0)*n, *wp1 = w + (long)(i+1)*n;
+        bf16 *wp2 = w + (long)(i+2)*n, *wp3 = w + (long)(i+3)*n;
+        for (int j = 0; j < n; j += 2 * VLEN) {
+            const int vl = n - j < 2 * VLEN ? (n - j) >> 1 : VLEN;
+            __vr xv0, xv1, xv2, xv3, w0, w1, w2, w3;
+            LOADX_TRUNC(xv0, x0 + j); LOADX_TRUNC(xv1, x1 + j);
+            LOADX_TRUNC(xv2, x2 + j); LOADX_TRUNC(xv3, x3 + j);
+            UNPACK_W(w0, wp0 + j); UNPACK_W(w1, wp1 + j);
+            UNPACK_W(w2, wp2 + j); UNPACK_W(w3, wp3 + j);
+            t00 = _vel_pvfmad_vvvvl(t00,xv0,w0,vl); t01 = _vel_pvfmad_vvvvl(t01,xv1,w0,vl);
+            t02 = _vel_pvfmad_vvvvl(t02,xv2,w0,vl); t03 = _vel_pvfmad_vvvvl(t03,xv3,w0,vl);
+            t10 = _vel_pvfmad_vvvvl(t10,xv0,w1,vl); t11 = _vel_pvfmad_vvvvl(t11,xv1,w1,vl);
+            t12 = _vel_pvfmad_vvvvl(t12,xv2,w1,vl); t13 = _vel_pvfmad_vvvvl(t13,xv3,w1,vl);
+            t20 = _vel_pvfmad_vvvvl(t20,xv0,w2,vl); t21 = _vel_pvfmad_vvvvl(t21,xv1,w2,vl);
+            t22 = _vel_pvfmad_vvvvl(t22,xv2,w2,vl); t23 = _vel_pvfmad_vvvvl(t23,xv3,w2,vl);
+            t30 = _vel_pvfmad_vvvvl(t30,xv0,w3,vl); t31 = _vel_pvfmad_vvvvl(t31,xv1,w3,vl);
+            t32 = _vel_pvfmad_vvvvl(t32,xv2,w3,vl); t33 = _vel_pvfmad_vvvvl(t33,xv3,w3,vl);
+        }
+        sumup_packed_fp32_store(t00,y0[i+0],VLEN); sumup_packed_fp32_store(t01,y1[i+0],VLEN);
+        sumup_packed_fp32_store(t02,y2[i+0],VLEN); sumup_packed_fp32_store(t03,y3[i+0],VLEN);
+        sumup_packed_fp32_store(t10,y0[i+1],VLEN); sumup_packed_fp32_store(t11,y1[i+1],VLEN);
+        sumup_packed_fp32_store(t12,y2[i+1],VLEN); sumup_packed_fp32_store(t13,y3[i+1],VLEN);
+        sumup_packed_fp32_store(t20,y0[i+2],VLEN); sumup_packed_fp32_store(t21,y1[i+2],VLEN);
+        sumup_packed_fp32_store(t22,y2[i+2],VLEN); sumup_packed_fp32_store(t23,y3[i+2],VLEN);
+        sumup_packed_fp32_store(t30,y0[i+3],VLEN); sumup_packed_fp32_store(t31,y1[i+3],VLEN);
+        sumup_packed_fp32_store(t32,y2[i+3],VLEN); sumup_packed_fp32_store(t33,y3[i+3],VLEN);
+    }
+    /* row remainder (<4): one row x 4 cols */
+    for (; i < d; i++) {
+        __vr t0 = _vel_vld_vssl(0,&zero[0],VLEN), t1 = t0, t2 = t0, t3 = t0;
+        bf16 *wp = w + (long)i*n;
+        for (int j = 0; j < n; j += 2 * VLEN) {
+            const int vl = n - j < 2 * VLEN ? (n - j) >> 1 : VLEN;
+            __vr xv0, xv1, xv2, xv3, wv;
+            LOADX_TRUNC(xv0, x0 + j); LOADX_TRUNC(xv1, x1 + j);
+            LOADX_TRUNC(xv2, x2 + j); LOADX_TRUNC(xv3, x3 + j);
+            UNPACK_W(wv, wp + j);
+            t0 = _vel_pvfmad_vvvvl(t0,xv0,wv,vl); t1 = _vel_pvfmad_vvvvl(t1,xv1,wv,vl);
+            t2 = _vel_pvfmad_vvvvl(t2,xv2,wv,vl); t3 = _vel_pvfmad_vvvvl(t3,xv3,wv,vl);
+        }
+        sumup_packed_fp32_store(t0,y0[i],VLEN); sumup_packed_fp32_store(t1,y1[i],VLEN);
+        sumup_packed_fp32_store(t2,y2[i],VLEN); sumup_packed_fp32_store(t3,y3[i],VLEN);
+    }
+}
+
+/* 8-column tile, 4 rows x 8 cols = 32-way ILP, weight unpacked once per row and
+ * reused across 8 columns (HALF the unpacks of the 4-col tile). Uses ~50 of the
+ * 64 vector registers. For large-N prompt eval; small N (e.g. MTP verify N=5)
+ * stays on the 4-col tile since C can't exceed N. */
+void sgemm8_packed_bf16(float *y0, float *y1, float *y2, float *y3,
+                        float *y4, float *y5, float *y6, float *y7,
+                        const float *x0, const float *x1, const float *x2, const float *x3,
+                        const float *x4, const float *x5, const float *x6, const float *x7,
+                        bf16 *w, int n, int d) {
+    float zero[2] = {0.0f, 0.0f};
+    __vr bf16mskl = _vel_vbrdl_vsl(0x00000000ffff0000, VLEN);
+    __vr low32msk = _vel_vbrdl_vsl(0x00000000ffffffff, VLEN);
+    __vr bf16inputmsk = _vel_vbrdl_vsl(0xffff0000ffff0000UL, VLEN);
+    int i = 0;
+    const float *xp[8] = {x0,x1,x2,x3,x4,x5,x6,x7};
+    float *yp[8] = {y0,y1,y2,y3,y4,y5,y6,y7};
+    #define FMA8(R,W) do { \
+        t##R##0=_vel_pvfmad_vvvvl(t##R##0,xv0,W,vl); t##R##1=_vel_pvfmad_vvvvl(t##R##1,xv1,W,vl); \
+        t##R##2=_vel_pvfmad_vvvvl(t##R##2,xv2,W,vl); t##R##3=_vel_pvfmad_vvvvl(t##R##3,xv3,W,vl); \
+        t##R##4=_vel_pvfmad_vvvvl(t##R##4,xv4,W,vl); t##R##5=_vel_pvfmad_vvvvl(t##R##5,xv5,W,vl); \
+        t##R##6=_vel_pvfmad_vvvvl(t##R##6,xv6,W,vl); t##R##7=_vel_pvfmad_vvvvl(t##R##7,xv7,W,vl); } while(0)
+    for (; i + 4 <= d; i += 4) {
+        __vr t00=_vel_vld_vssl(0,&zero[0],VLEN),t01=t00,t02=t00,t03=t00,t04=t00,t05=t00,t06=t00,t07=t00;
+        __vr t10=t00,t11=t00,t12=t00,t13=t00,t14=t00,t15=t00,t16=t00,t17=t00;
+        __vr t20=t00,t21=t00,t22=t00,t23=t00,t24=t00,t25=t00,t26=t00,t27=t00;
+        __vr t30=t00,t31=t00,t32=t00,t33=t00,t34=t00,t35=t00,t36=t00,t37=t00;
+        bf16 *wp0=w+(long)(i+0)*n,*wp1=w+(long)(i+1)*n,*wp2=w+(long)(i+2)*n,*wp3=w+(long)(i+3)*n;
+        for (int j = 0; j < n; j += 2*VLEN) {
+            const int vl = n - j < 2*VLEN ? (n - j) >> 1 : VLEN;
+            __vr xv0,xv1,xv2,xv3,xv4,xv5,xv6,xv7,w0,w1,w2,w3;
+            LOADX_TRUNC(xv0,x0+j);LOADX_TRUNC(xv1,x1+j);LOADX_TRUNC(xv2,x2+j);LOADX_TRUNC(xv3,x3+j);
+            LOADX_TRUNC(xv4,x4+j);LOADX_TRUNC(xv5,x5+j);LOADX_TRUNC(xv6,x6+j);LOADX_TRUNC(xv7,x7+j);
+            UNPACK_W(w0,wp0+j);FMA8(0,w0); UNPACK_W(w1,wp1+j);FMA8(1,w1);
+            UNPACK_W(w2,wp2+j);FMA8(2,w2); UNPACK_W(w3,wp3+j);FMA8(3,w3);
+        }
+        #define ST(R) do { sumup_packed_fp32_store(t##R##0,y0[i+R],VLEN);sumup_packed_fp32_store(t##R##1,y1[i+R],VLEN); \
+            sumup_packed_fp32_store(t##R##2,y2[i+R],VLEN);sumup_packed_fp32_store(t##R##3,y3[i+R],VLEN); \
+            sumup_packed_fp32_store(t##R##4,y4[i+R],VLEN);sumup_packed_fp32_store(t##R##5,y5[i+R],VLEN); \
+            sumup_packed_fp32_store(t##R##6,y6[i+R],VLEN);sumup_packed_fp32_store(t##R##7,y7[i+R],VLEN); } while(0)
+        ST(0); ST(1); ST(2); ST(3);
+        #undef ST
+    }
+    for (; i < d; i++) {  /* row remainder: 1 row x 8 cols */
+        __vr a0=_vel_vld_vssl(0,&zero[0],VLEN),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+        bf16 *wp = w + (long)i*n;
+        for (int j = 0; j < n; j += 2*VLEN) {
+            const int vl = n - j < 2*VLEN ? (n - j) >> 1 : VLEN;
+            __vr xv0,xv1,xv2,xv3,xv4,xv5,xv6,xv7,wv;
+            LOADX_TRUNC(xv0,x0+j);LOADX_TRUNC(xv1,x1+j);LOADX_TRUNC(xv2,x2+j);LOADX_TRUNC(xv3,x3+j);
+            LOADX_TRUNC(xv4,x4+j);LOADX_TRUNC(xv5,x5+j);LOADX_TRUNC(xv6,x6+j);LOADX_TRUNC(xv7,x7+j);
+            UNPACK_W(wv,wp+j);
+            a0=_vel_pvfmad_vvvvl(a0,xv0,wv,vl);a1=_vel_pvfmad_vvvvl(a1,xv1,wv,vl);
+            a2=_vel_pvfmad_vvvvl(a2,xv2,wv,vl);a3=_vel_pvfmad_vvvvl(a3,xv3,wv,vl);
+            a4=_vel_pvfmad_vvvvl(a4,xv4,wv,vl);a5=_vel_pvfmad_vvvvl(a5,xv5,wv,vl);
+            a6=_vel_pvfmad_vvvvl(a6,xv6,wv,vl);a7=_vel_pvfmad_vvvvl(a7,xv7,wv,vl);
+        }
+        sumup_packed_fp32_store(a0,y0[i],VLEN);sumup_packed_fp32_store(a1,y1[i],VLEN);
+        sumup_packed_fp32_store(a2,y2[i],VLEN);sumup_packed_fp32_store(a3,y3[i],VLEN);
+        sumup_packed_fp32_store(a4,y4[i],VLEN);sumup_packed_fp32_store(a5,y5[i],VLEN);
+        sumup_packed_fp32_store(a6,y6[i],VLEN);sumup_packed_fp32_store(a7,y7[i],VLEN);
+    }
+    #undef FMA8
+    (void)xp; (void)yp;
+}
+
 void sgemv_packed_bf16_unr(float *y, float *x, bf16 *w, int n, int d) {
     int i;
     float zero[2] = {0.0f, 0.0f};

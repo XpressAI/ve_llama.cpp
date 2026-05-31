@@ -1264,6 +1264,65 @@ void ve_bf16_matvec_rowmajor_ptr_inner(float* y,
     }
 }
 
+/* Batched BF16 GEMM: Y[M,N] = W[M,K] @ X[K,N], W row-major BF16, X/Y column-major
+ * F32. Tiles widest-first (4 rows x 8 cols, then 4x4, then per-column matvec). A
+ * wider column tile unpacks each BF16 weight row once and reuses it across more
+ * result columns; the matvec's bottleneck is the BF16->FP32 unpack, so the 8-col
+ * tile is ~1.94x the per-column loop for large N (prompt eval). Bit-identical to
+ * the per-column matvec. Uses `#pragma omp for` internally like the matvec wrapper,
+ * so the graph compiler amortizes one OMP fork/join across the whole cgraph. */
+extern void sgemm4_packed_bf16(float* y0, float* y1, float* y2, float* y3,
+                               const float* x0, const float* x1, const float* x2, const float* x3,
+                               bf16* w, int n, int d);
+extern void sgemm8_packed_bf16(float* y0, float* y1, float* y2, float* y3,
+                               float* y4, float* y5, float* y6, float* y7,
+                               const float* x0, const float* x1, const float* x2, const float* x3,
+                               const float* x4, const float* x5, const float* x6, const float* x7,
+                               bf16* w, int n, int d);
+void ve_bf16_matmat_rowmajor_ptr_inner(float* Y,
+                                        const bf16* W,
+                                        const float* X,
+                                        int M,
+                                        int K,
+                                        int N) {
+    if (N <= 0) return;
+    int nthr = omp_get_num_threads();
+    if (nthr <= 0) nthr = 1;
+    int chunk = (M + nthr - 1) / nthr;
+    #pragma omp for
+    for (int g = 0; g < nthr; g++) {
+        int imin = g * chunk;
+        int imax = imin + chunk;
+        if (imax > M) imax = M;
+        int rows = imax - imin;
+        if (rows <= 0) continue;
+        bf16* Wg = (bf16*) (W + (int64_t) imin * K);
+        int c = 0;
+        for (; c + 8 <= N; c += 8) {
+            sgemm8_packed_bf16(Y + (int64_t)(c+0)*M+imin, Y + (int64_t)(c+1)*M+imin,
+                               Y + (int64_t)(c+2)*M+imin, Y + (int64_t)(c+3)*M+imin,
+                               Y + (int64_t)(c+4)*M+imin, Y + (int64_t)(c+5)*M+imin,
+                               Y + (int64_t)(c+6)*M+imin, Y + (int64_t)(c+7)*M+imin,
+                               X + (int64_t)(c+0)*K, X + (int64_t)(c+1)*K,
+                               X + (int64_t)(c+2)*K, X + (int64_t)(c+3)*K,
+                               X + (int64_t)(c+4)*K, X + (int64_t)(c+5)*K,
+                               X + (int64_t)(c+6)*K, X + (int64_t)(c+7)*K,
+                               Wg, K, rows);
+        }
+        for (; c + 4 <= N; c += 4) {
+            sgemm4_packed_bf16(Y + (int64_t)(c + 0) * M + imin, Y + (int64_t)(c + 1) * M + imin,
+                               Y + (int64_t)(c + 2) * M + imin, Y + (int64_t)(c + 3) * M + imin,
+                               X + (int64_t)(c + 0) * K, X + (int64_t)(c + 1) * K,
+                               X + (int64_t)(c + 2) * K, X + (int64_t)(c + 3) * K,
+                               Wg, K, rows);
+        }
+        for (; c < N; c++) {
+            sgemv_packed_bf16_unr(Y + (int64_t) c * M + imin,
+                                  (float*) &X[(int64_t) c * K], Wg, K, rows);
+        }
+    }
+}
+
 
 /*
  * VEDA kernel: FP32 matrix-vector multiply with RAW POINTERS
