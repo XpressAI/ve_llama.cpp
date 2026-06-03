@@ -2041,7 +2041,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // GGML_VE_FA_MAX_NQ caps the query count for which flash-attn is used.
+    // The VE's flash tile kernel collapses at prefill (N>1) — ~5x slower than
+    // the unfused GEMM (cblas) path at pp256, ~12x at pp1024 — so set this to 1
+    // on the VE: decode (N=1) keeps the fast flash path, prefill (N>1) falls to
+    // the unfused mul_mat GEMM. Default INT64_MAX = upstream behaviour.
+    static const int64_t fa_max_nq = []() {
+        const char * e = std::getenv("GGML_VE_FA_MAX_NQ");
+        return e ? (int64_t) std::atoll(e) : INT64_MAX;
+    }();
+    // q has been permuted to [head_dim, n_q, n_head, n_stream] above, so q->ne[1]
+    // is the per-stream query count (1 = decode, prompt length = prefill) — the
+    // same N the VE flash-attn handler keys on.
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && q->ne[1] <= fa_max_nq;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
