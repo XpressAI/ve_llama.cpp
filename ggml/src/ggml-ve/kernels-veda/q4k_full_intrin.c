@@ -586,6 +586,79 @@ void q4k_full_8rows_decoded_extern(const uint8_t * const qs_r[8],
     for (int r = 0; r < 8; r++) *y_out[r] = ay[r];
 }
 
+/* BLACK MAGIC: vectorise the dlane/mlane expansion on the VPU. The scalar
+ * build was 71% of the kernel time. Lane i needs scale d_sub[(i%16)/2] of
+ * block (i/16) -> a fixed permutation of the 16-float decoded header. We
+ * GATHER it from the L1-resident header (vsfa to form per-lane addresses,
+ * vgtlzx to pull the 32-bit float, vsll<<32 to land it in the FP32 upper
+ * half) instead of 4096 scalar writes/chunk. Offsets are constant -> built
+ * once. d at hdr float idx (i/16)*16 + (i%16)/2; m at +8. */
+static uint64_t g_off_d[256] __attribute__((aligned(64)));
+static uint64_t g_off_m[256] __attribute__((aligned(64)));
+static int g_off_dm_init = 0;
+static void q4k_full_init_dm_offsets(void) {
+    for (int i = 0; i < 256; i++) {
+        int s = (i % 16) / 2;
+        int blk = (i / 16) * 16;
+        g_off_d[i] = (uint64_t)((blk + s)     * 4);   /* byte offset of d_sub */
+        g_off_m[i] = (uint64_t)((blk + 8 + s) * 4);   /* byte offset of m_sub */
+    }
+    g_off_dm_init = 1;
+}
+void q4k_full_8rows_gather_extern(const uint8_t * const qs_r[8],
+                                   const uint8_t * const hdr_r[8],
+                                   const float *x_perm, const float *sx_full,
+                                   float *y_out[8], int nb);
+void q4k_full_8rows_gather_extern(const uint8_t * const qs_r[8],
+                                   const uint8_t * const hdr_r[8],
+                                   const float *x_perm, const float *sx_full,
+                                   float *y_out[8], int nb) {
+    if (!g_off_dm_init) q4k_full_init_dm_offsets();
+    float ay[8] = {0};
+    const int n_lanes_total = nb * 16;
+    int blk_offset = 0;
+    while (blk_offset < nb) {
+        int chunk_nb = nb - blk_offset;
+        if (chunk_nb > MAX_CHUNK_BLOCKS) chunk_nb = MAX_CHUNK_BLOCKS;
+        const int VL = chunk_nb * 16;
+        const int lane_off = blk_offset * 16;
+        __vr qs_v[8];
+        for (int r = 0; r < 8; r++)
+            qs_v[r] = _vel_vld_vssl(8, (void *)(qs_r[r] + blk_offset * 128), VL);
+        __vr mask_f = _vel_vbrdl_vsl(0x0FUL, VL);
+        __vr sum[8];
+        for (int r = 0; r < 8; r++) sum[r] = _vel_vbrds_vsl(0.0f, VL);
+        for (int k = 0; k < 16; k++) {
+            __vr xv = _vel_vldu_vssl(4, (void *)(x_perm + k * n_lanes_total + lane_off), VL);
+            for (int r = 0; r < 8; r++) {
+                __vr nib = _vel_vand_vvvl(_vel_vsrl_vvsl(qs_v[r], 4 * k, VL), mask_f, VL);
+                __vr nf  = _vel_vcvtsw_vvl(nib, VL);
+                sum[r] = _vel_vfmads_vvvvl(sum[r], nf, xv, VL);
+            }
+        }
+        __vr off_d_v   = _vel_vld_vssl(8, (void *) g_off_d, VL);
+        __vr off_m_v   = _vel_vld_vssl(8, (void *) g_off_m, VL);
+        __vr sx_lane_v = _vel_vldu_vssl(4, (void *)(sx_full + lane_off), VL);
+        for (int r = 0; r < 8; r++) {
+            const uint64_t hb = (uint64_t)(uintptr_t)(hdr_r[r] + (size_t) blk_offset * 64);
+            /* dlane = float at hb + off_d, moved to FP32 upper half. */
+            __vr dlane_v = _vel_vsll_vvsl(
+                _vel_vgtlzx_vvssl(_vel_vsfa_vvssl(off_d_v, 0, hb, VL), 0, 0, VL), 32, VL);
+            /* mlane (then negate for the -m*Σx correction). */
+            __vr mlane_v = _vel_vsll_vvsl(
+                _vel_vgtlzx_vvssl(_vel_vsfa_vvssl(off_m_v, 0, hb, VL), 0, 0, VL), 32, VL);
+            __vr nmsx = _vel_vfmuls_vvvl(  /* (-m) * sx  =  -(m * sx) */
+                            _vel_vfmuls_vvvl(mlane_v, sx_lane_v, VL),
+                            _vel_vbrds_vsl(-1.0f, VL), VL);
+            __vr y_lane = _vel_vfmads_vvvvl(nmsx, dlane_v, sum[r], VL);
+            y_lane = _vel_vfsums_vvl(y_lane, VL);
+            ay[r] += _vel_lvss_svs(y_lane, 0);
+        }
+        blk_offset += chunk_nb;
+    }
+    for (int r = 0; r < 8; r++) *y_out[r] = ay[r];
+}
+
 /* PACKED-FP32 variant. Processes 2 nibble positions per FMA via VE's
  * packed-fp32 ops (pvfmad). Halves the inner-loop count from 16 to 8.
  *

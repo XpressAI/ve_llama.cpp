@@ -304,3 +304,49 @@ uint64_t ve_q4k_matvec_full_hbm(uint64_t y_vptr, uint64_t qs_vptr,
     /* don't free x_perm -- reused across calls */
     return 0;
 }
+
+
+/* BLACK-MAGIC entry: vectorised-dlane (gather) canon 8-row. */
+extern void q4k_full_8rows_gather_extern(const uint8_t * const qs_r[8],
+                                          const uint8_t * const hdr_r[8],
+                                          const float *x_perm, const float *sx_full,
+                                          float *y_out[8], int nb);
+uint64_t ve_q4k_matvec_full_gather_hbm(uint64_t y_vptr, uint64_t qs_vptr,
+                                        uint64_t hdr_vptr, uint64_t x_vptr,
+                                        uint64_t M, uint64_t K) {
+    void *p;
+    if (vedaMemPtr(&p, y_vptr)   != 0) return 1; float         *y   = (float *)p;
+    if (vedaMemPtr(&p, qs_vptr)  != 0) return 2; const uint8_t *qs  = (const uint8_t *)p;
+    if (vedaMemPtr(&p, hdr_vptr) != 0) return 3; const uint8_t *hdr = (const uint8_t *)p;
+    if (vedaMemPtr(&p, x_vptr)   != 0) return 4; const float   *x   = (const float *)p;
+    const int nb = (int) K / 256;
+    const int row_qs_bytes  = nb * 128;
+    const int row_hdr_bytes = nb * 64;
+    int nthr = omp_get_max_threads(); if (nthr < 1) nthr = 1; if (nthr > 8) nthr = 8;
+    const size_t xp_need = (size_t) K * sizeof(float);
+    if (xp_need > g_x_perm_cap) { if (g_x_perm_buf) free(g_x_perm_buf);
+        g_x_perm_buf = (float*) aligned_alloc(64, xp_need); g_x_perm_cap = xp_need; }
+    const size_t sx_need = (size_t)(K/16) * sizeof(float);
+    if (sx_need > g_sx_full_cap) { if (g_sx_full_buf) free(g_sx_full_buf);
+        g_sx_full_buf = (float*) aligned_alloc(64, sx_need); g_sx_full_cap = sx_need; }
+    float *x_perm = g_x_perm_buf, *sx_full = g_sx_full_buf;
+    q4k_build_x_perm_extern(x, x_perm, K);
+    q4k_build_sx_full_extern(x, sx_full, K);
+    const int M8 = M & ~7;
+    #pragma omp parallel num_threads(nthr)
+    {
+        #pragma omp for
+        for (int m = 0; m < M8; m += 8) {
+            const uint8_t *qs_r[8] = { qs+(m+0)*row_qs_bytes,qs+(m+1)*row_qs_bytes,qs+(m+2)*row_qs_bytes,qs+(m+3)*row_qs_bytes,
+                                       qs+(m+4)*row_qs_bytes,qs+(m+5)*row_qs_bytes,qs+(m+6)*row_qs_bytes,qs+(m+7)*row_qs_bytes };
+            const uint8_t *hdr_r[8] = { hdr+(m+0)*row_hdr_bytes,hdr+(m+1)*row_hdr_bytes,hdr+(m+2)*row_hdr_bytes,hdr+(m+3)*row_hdr_bytes,
+                                        hdr+(m+4)*row_hdr_bytes,hdr+(m+5)*row_hdr_bytes,hdr+(m+6)*row_hdr_bytes,hdr+(m+7)*row_hdr_bytes };
+            float *y_out[8] = { &y[m+0],&y[m+1],&y[m+2],&y[m+3],&y[m+4],&y[m+5],&y[m+6],&y[m+7] };
+            q4k_full_8rows_gather_extern(qs_r, hdr_r, x_perm, sx_full, y_out, nb);
+        }
+        #pragma omp for
+        for (int m = M8; m < M; m++)
+            y[m] = q4k_full_row_dot_xperm_extern(qs + (size_t)m*row_qs_bytes, hdr + (size_t)m*row_hdr_bytes, x_perm, sx_full, nb);
+    }
+    return 0;
+}

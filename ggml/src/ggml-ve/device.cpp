@@ -71,7 +71,7 @@ const kernel_meta & meta(kernel_id id) {
         /* K_Q8_0_FUSED_SGEMM_HBM                     */ { "ve_q8_0_fused_sgemm_hbm",                  KMOD_SGEMV  },
         /* K_Q2K_BF16_MATVEC_HBM                      */ { "ve_q2k_bf16_matvec_hbm",                   KMOD_SGEMV  },
         /* K_Q4K_MATVEC_F32_HBM                       */ { "ve_q4k_matvec_f32_hbm",                    KMOD_SGEMV  },
-        /* K_Q4K_MATVEC_FULL_HBM                      */ { "ve_q4k_matvec_full_hbm",                   KMOD_SGEMV  },
+        /* K_Q4K_MATVEC_FULL_HBM (gather-dlane: 2.83x vs scalar build) */ { "ve_q4k_matvec_full_gather_hbm",            KMOD_SGEMV  },
         /* K_Q4K_MATMUL_FULL_HBM                      */ { "ve_q4k_matmul_full_hbm",                   KMOD_SGEMV  },
         /* K_Q4K_MATVEC_STD_HBM                       */ { "ve_q4k_matvec_std_hbm",                    KMOD_SGEMV  },
         /* K_Q4K_MATVEC_STD_HDR_HBM                   */ { "ve_q4k_matvec_std_hdr_hbm",                KMOD_SGEMV  },
