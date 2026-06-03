@@ -528,35 +528,20 @@ void backend_synchronize(ggml_backend_t backend) {
     }
 }
 
-// Cross-device tensor copy VE_src -> VE_dst, direct device-to-device (no host
-// bounce). The scheduler uses this at split boundaries (layer-split: 1/token;
-// row-split: ~1/layer). Falls back (return false) for anything non-trivial, so
-// the synchronous host-bounce path still covers those. Correctness-first: we
-// flush the producer (src) and sync after the DtoD rather than relying on
-// async ordering across two VEDA contexts.
-bool backend_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
-                              const ggml_tensor * src, ggml_tensor * dst) {
-    if (!tensor_is_hbm(src) || !tensor_is_hbm(dst))            return false;
-    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst))  return false;
-    if (ggml_nbytes(src) != ggml_nbytes(dst))                  return false;
-    auto * cs = (backend_context *) backend_src->context;
-    auto * cd = (backend_context *) backend_dst->context;
-    if (!cs || !cd || !cs->dev() || !cd->dev())                return false;
-
-    // Make sure the producer's writes to src HBM have landed.
-    { VEDAContextGuard gs(cs->dev()->context); if (gs.is_valid()) cs->flush("cpy_tensor src"); }
-
-    const VEDAdeviceptr s = tensor_hbm_ptr(src);
-    const VEDAdeviceptr d = tensor_hbm_ptr(dst);
-    VEDAContextGuard gd(cd->dev()->context);
-    if (!gd.is_valid())                                        return false;
-    // Issue on stream 0; the consumer kernel runs on stream 0 in the same
-    // (dst) context, so the stream serialises the copy before the consumer --
-    // no explicit dst sync needed (that was ~40 redundant ctx syncs/token for
-    // row-split). The src flush above guarantees the producer's data is ready.
-    if (vedaMemcpyDtoDAsync(d, s, ggml_nbytes(src), 0) != VEDA_SUCCESS) return false;
-    return true;
-}
+// Cross-device tensor copy (VE_src -> VE_dst) is intentionally NOT implemented
+// as a direct VEDA DtoD. Per the VEDA docs (AVEO_VEDA_INTRO §2: "VEDA only
+// supports a single device context at a time"; VEDA_BEST_PRACTICES §4.3:
+// device-to-DIFFERENT-device must go D2H+H2D, or via HMEM), a VEDAdeviceptr is
+// only valid inside its own device's context. A vedaMemcpyDtoD(d_VE1, s_VE0)
+// issued with VE1's context current dereferences a VE0 address that is not
+// mapped there -> a DMA memory-protection exception that WEDGES the whole VE
+// (observed: 27B BF16 layer-split, 2026-06-03).
+//
+// Leaving .cpy_tensor_async = nullptr makes the scheduler fall back to the
+// synchronous get/set host-bounce (tensor_get = DtoH in the src context, then
+// tensor_set = HtoD in the dst context) -- the correct, VEDA-sanctioned
+// cross-device path. A faster HMEM-based cross-device copy is future work
+// (task #79); correctness first.
 
 const ggml_backend_i backend_iface = {
     /* .get_name                = */ backend_get_name,
@@ -565,7 +550,7 @@ const ggml_backend_i backend_iface = {
     /* .get_tensor_async        = */ nullptr,
     /* .set_tensor_2d_async     = */ nullptr,
     /* .get_tensor_2d_async     = */ nullptr,
-    /* .cpy_tensor_async        = */ backend_cpy_tensor_async,
+    /* .cpy_tensor_async        = */ nullptr,  // see note above: no cross-device DtoD on VEDA
     /* .synchronize             = */ backend_synchronize,
     /* .graph_plan_create       = */ nullptr,
     /* .graph_plan_free         = */ nullptr,

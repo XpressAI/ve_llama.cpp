@@ -72,6 +72,48 @@ public:
                     (int) entries_.size(), (long) M, (long) K, f32_bytes,
                     (total_bytes_ + f32_bytes) / (1024 * 1024));
         }
+
+        // Memory-aware guard. The F32 colmajor copies cost 2x the BF16 weight
+        // bytes and ACCUMULATE (cached until shutdown). On a big model — above
+        // all one split across cards, where a single card can hold tens of GB
+        // of weights — building a colmajor copy for every weight overruns HBM.
+        // The async alloc below does not reliably report OOM up front (it hands
+        // back a virtual ptr; the backing fails later and the CBLAS GEMM then
+        // SIGSEGVs — observed on a 27B BF16 layer-split, OOM at ~layer 13,
+        // 2026-06-03). So check free HBM first: if it is tight, skip the
+        // colmajor copy and return 0. The caller (ops/mul_mat.cpp) treats 0 as
+        // "use the packed-BF16 GEMM" — slower prompt-eval, but correct, no OOM.
+        // vedaMemGetInfo reports the CURRENT context's device, which is the
+        // device this weight lives on (caller has pushed it).
+        {
+            size_t free_b = 0, total_b = 0;
+            VEDAresult mr = vedaMemGetInfo(&free_b, &total_b);
+            if (dbg) {
+                fprintf(stderr, "[ve-colmajor-cache] memcheck rc=%d free=%zuMB total=%zuMB need=%zuMB self-cached=%zuMB\n",
+                        (int) mr, free_b >> 20, total_b >> 20, f32_bytes >> 20, total_bytes_ >> 20);
+            }
+            if (mr == VEDA_SUCCESS) {
+                // Headroom must cover the REST of the graph's peak transient
+                // working set after this colmajor copy lands: the CBLAS GEMM's
+                // internal workspace, prefill activations, KV growth. 2 GB
+                // proved 3 MB too tight on the 27B split — colmajor filled to
+                // ~2 GB free and the next CBLAS GEMM SIGSEGV'd. Default 6 GB;
+                // env-tunable for cards/models that need more or less.
+                static const size_t headroom = []() {
+                    const char * e = std::getenv("GGML_VE_COLMAJOR_HEADROOM_MB");
+                    return e ? ((size_t) strtoull(e, nullptr, 10) << 20)
+                             : ((size_t) 6 << 30);
+                }();
+                if (free_b < f32_bytes + headroom) {
+                    if (dbg) {
+                        fprintf(stderr, "[ve-colmajor-cache] skip (low HBM): free=%zuMB need=%zuMB+2GB -> packed-BF16\n",
+                                free_b >> 20, f32_bytes >> 20);
+                    }
+                    return 0;
+                }
+            }
+        }
+
         VEDAdeviceptr f32_colmajor = 0;
         err = vedaMemAllocAsync(&f32_colmajor, f32_bytes, 0);
         if (err != VEDA_SUCCESS) {
