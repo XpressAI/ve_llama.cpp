@@ -108,9 +108,17 @@ public:
     // kernels — this is what lets VEBP's F16 token_embd run GET_ROWS and the
     // tied lm_head MUL_MAT on the VE instead of fragmenting onto the CPU.
     // Keyed by name with a distinct format so it never aliases a raw entry.
+    // `src_is_hbm` = the F16 source pointer is a VEDAdeviceptr (the weight
+    // lives in a VE_HBM buffer under -ngl 99), NOT a host pointer. In that
+    // case w->data is device memory and the host-side ggml_fp16_to_fp32_row
+    // below would segfault reading it, so stage it down via DtoH once first.
+    // (The graph-compiler path stages externally; this makes the interpreter
+    // MUL_MAT / GET_ROWS F16 paths equally HBM-safe. The VE has no F16 kernel
+    // — F16 is converted to BF16 at the boundary and never reaches a kernel.)
     VEDAdeviceptr get_or_upload_f16_as_bf16(const char * tensor_name,
                                             const void * host_f16,
-                                            size_t size_bytes) {
+                                            size_t size_bytes,
+                                            bool src_is_hbm = false) {
         if (tensor_name != nullptr) {
             for (auto & e : entries_) {
                 if (e.format == GGML_VE_HBM_BF16_FROM_F16 &&
@@ -129,6 +137,21 @@ public:
         }
         const size_t n = size_bytes / sizeof(uint16_t);
         std::vector<uint16_t> bf16(n);
+
+        // Stage HBM-resident F16 down to host once before the host conversion.
+        std::vector<uint16_t> hbm_staging;
+        if (src_is_hbm) {
+            hbm_staging.resize(n);
+            VEDAdeviceptr dptr = reinterpret_cast<VEDAdeviceptr>(
+                                     reinterpret_cast<uintptr_t>(host_f16));
+            VEDAresult err = vedaMemcpyDtoH(hbm_staging.data(), dptr, size_bytes);
+            if (err != VEDA_SUCCESS) {
+                fprintf(stderr, "hbm_weight_cache: vedaMemcpyDtoH (f16 stage, size=%zu) failed: %s\n",
+                        size_bytes, ggml_ve_err_str(err));
+                return 0;
+            }
+            host_f16 = hbm_staging.data();
+        }
         const ggml_fp16_t * src = (const ggml_fp16_t *) host_f16;
         // Convert via ggml's row helpers (F16C-accelerated F16->F32, then a
         // shift+round F32->BF16) in chunks. A per-element ggml_fp16_to_fp32 /

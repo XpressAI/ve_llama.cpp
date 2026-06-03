@@ -117,7 +117,8 @@ bool mul_mat(backend_context * ctx, ggml_tensor * dst) {
     const bool w_is_bf16 = (w->type == GGML_TYPE_BF16 || w->type == GGML_TYPE_F16);
     const VEDAdeviceptr w_vptr =
         (w->type == GGML_TYPE_F16)
-            ? ctx->cache().get_or_upload_f16_as_bf16(w->name, w->data, ggml_nbytes(w))
+            ? ctx->cache().get_or_upload_f16_as_bf16(w->name, w->data, ggml_nbytes(w),
+                                                     tensor_is_hbm(w))
             : ctx->resolve_in(w);
     const VEDAdeviceptr x_vptr = ctx->resolve_in(x);
     const VEDAdeviceptr y_vptr = ctx->resolve_out(dst);

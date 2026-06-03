@@ -44,7 +44,8 @@ bool get_rows(backend_context * ctx, ggml_tensor * dst) {
     // upload (same byte size) and served by the BF16 kernel below.
     const VEDAdeviceptr src_hbm =
         (src->type == GGML_TYPE_F16)
-            ? ctx->cache().get_or_upload_f16_as_bf16(src->name, src->data, ggml_nbytes(src))
+            ? ctx->cache().get_or_upload_f16_as_bf16(src->name, src->data, ggml_nbytes(src),
+                                                     tensor_is_hbm(src))
             : ctx->resolve_in(src);
     const VEDAdeviceptr dst_hbm = ctx->resolve_out(dst);
     if (src_hbm == 0 || dst_hbm == 0) return false;
