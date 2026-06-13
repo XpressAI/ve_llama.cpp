@@ -8,7 +8,8 @@
 //   src[2] v     : F32 [S_v, H,    n_tokens, n_seqs]   (defines S_v, H, T, B)
 //   src[3] g     : F32 [neg0, neg1, n_tokens, n_seqs]   neg0 in {1, S_v}
 //   src[4] beta  : F32 [1,    neb1, n_tokens, n_seqs]
-//   src[5] state : F32 [S_v*S_v*H, K, n_seqs]
+//   src[5] state : F32 [S_v, S_v, H, n_seqs] -- initial recurrent state s0
+//   op_params[0] : int32 K -- snapshot slot count (was state->ne[1] pre-#24086)
 // Output dst: F32 4D [S_v*H, n_tokens*n_seqs + state_rows, 1, 1]
 //   (logically: attn region followed by snapshot states region)
 
@@ -41,9 +42,16 @@ bool gated_delta_net_supports(const ggml_tensor * op) {
     if (S_v <= 0 || S_v > 256) return false;          // GDN_MAX_SV in kernel
     if (g->ne[0] != 1 && g->ne[0] != S_v) return false;
     if (beta->ne[0] != 1) return false;
-    if (state->ne[0] != S_v * S_v * v->ne[1])  return false;
-    if (state->ne[2] != v->ne[3])              return false;
-    if (state->ne[3] != 1)                      return false;
+    // Accept BOTH the pre- and post-#24086 state layouts so this works on
+    // branches that have not yet synced upstream master:
+    //   new (post-#24086): 4D s0 [S_v, S_v, H, n_seqs], K from op_params[0]
+    //   old (pre -#24086): 3D    [S_v*S_v*H, K, n_seqs] with ne[3]==1, K=ne[1]
+    const int64_t H = v->ne[1];
+    const bool new_ct = (state->ne[0] == S_v && state->ne[1] == S_v &&
+                         state->ne[2] == H   && state->ne[3] == v->ne[3]);
+    const bool old_ct = (state->ne[0] == S_v * S_v * H &&
+                         state->ne[2] == v->ne[3] && state->ne[3] == 1);
+    if (!new_ct && !old_ct) return false;
 
     // Stride-1 innermost on every input.
     if (q->nb[0]    != sizeof(float)) return false;
@@ -81,7 +89,11 @@ bool gated_delta_net_f32(backend_context * ctx, ggml_tensor * dst) {
     const uint64_t H        = (uint64_t) v->ne[1];
     const uint64_t n_tokens = (uint64_t) v->ne[2];
     const uint64_t n_seqs   = (uint64_t) v->ne[3];
-    const uint64_t Kslots   = (uint64_t) state->ne[1];
+    // Contract detect (see supports): new 4D s0 vs old 3D [S_v*S_v*H,K,n_seqs].
+    const bool new_ct = (state->ne[0] == (int64_t) S_v);
+    // K: op_params[0] (new) vs state->ne[1] (old). Seq stride: nb[3] vs nb[2].
+    const uint64_t Kslots   = new_ct ? (uint64_t) ggml_get_op_params_i32(dst, 0)
+                                     : (uint64_t) state->ne[1];
     const uint64_t kda_flag = (uint64_t) (g->ne[0] == (int64_t) S_v ? 1 : 0);
 
     auto f = [](size_t b) { return (uint64_t)(b / sizeof(float)); };
@@ -127,8 +139,11 @@ bool gated_delta_net_f32(backend_context * ctx, ggml_tensor * dst) {
     vedaArgsSetU64 (args, idx++, f(beta->nb[1]));
     vedaArgsSetU64 (args, idx++, f(beta->nb[2]));
     vedaArgsSetU64 (args, idx++, f(beta->nb[3]));
-    /* state */
-    vedaArgsSetU64 (args, idx++, f(state->nb[2]));
+    /* state: per-seq stride. New 4D s0 [S_v,S_v,H,n_seqs] -> seq axis nb[3];
+     * old 3D [S_v*S_v*H,K,n_seqs] -> seq axis nb[2]. */
+    vedaArgsSetU64 (args, idx++, f(new_ct ? state->nb[3] : state->nb[2]));
+    /* snapshot ordering flag (K>1 only): 1 = new (slot 0 = most recent). */
+    vedaArgsSetU64 (args, idx++, new_ct ? 1u : 0u);
 
     uint64_t result = 0;
     if (!ggml_ve_ok(vedaLaunchKernelEx(fn, 0, args, /*destroyArgs=*/1, nullptr),

@@ -212,6 +212,7 @@ static void gated_delta_net_one_head(
     int           n_tokens,
     int           K,
     int           shift,
+    int           new_contract,        /* 1 = #24086 snapshot order (slot 0 = newest) */
     int           state_size_per_snap, /* S_v*S_v*H*n_seqs floats */
     int           h_idx_in_seq,        /* iv1 (head index inside seq) */
     int           seq_in_dst,          /* iv3 */
@@ -284,7 +285,7 @@ static void gated_delta_net_one_head(
 
         /* (e) per-token snapshot when K>1 and slot in range. */
         if (K > 1) {
-            const int target_slot = t - shift;
+            const int target_slot = new_contract ? (n_tokens - 1 - t) : (t - shift);
             if (target_slot >= 0 && target_slot < K) {
                 float * snap = state_out_h + target_slot * state_size_per_snap;
                 /* state_out_h already includes the (iv3*H+iv1)*S_v*S_v offset,
@@ -335,7 +336,9 @@ uint64_t ve_gated_delta_net_f32_hbm(
     /* beta strides */
     uint64_t bnb1_f, uint64_t bnb2_f, uint64_t bnb3_f,
     /* state per-seq stride */
-    uint64_t state_seq_stride_f) {
+    uint64_t state_seq_stride_f,
+    /* snapshot ordering: 1 = #24086 (slot 0 = newest), 0 = legacy */
+    uint64_t new_contract) {
 
     float * dst;
     const float * q;  const float * k;  const float * v;
@@ -415,7 +418,7 @@ uint64_t ve_gated_delta_net_f32_hbm(
                 state_in_h,
                 work, delta,
                 Sv, kda,
-                nt, Ki, shift, state_size_per_snap,
+                nt, Ki, shift, (int) new_contract, state_size_per_snap,
                 iv1, iv3, Hi,
                 (int) qnb1_f, (int) qnb2_f,
                 (int) knb1_f, (int) knb2_f,
