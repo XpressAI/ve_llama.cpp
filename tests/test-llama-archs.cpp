@@ -357,6 +357,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
+        case LLM_ARCH_MELLUM:
             return true;
         default:
             return false;
@@ -391,7 +392,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
         return false; // FIXME CUDA backend crashes.
     }
-    if (arch == LLM_ARCH_GEMMA4) {
+    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         return false; // FIXME @ngxson
     }
     if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_T5ENCODER) {
@@ -446,8 +447,11 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4) {
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+        if (arch == LLM_ARCH_EAGLE3) {
+            continue;
         }
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
@@ -526,8 +530,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
-    const std::string template_row    = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s %10s|%20s|\n";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
+    const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
+    const std::string template_row_res = "%15s %10s|%20s|\n";
 
     bool all_ok = true;
     common_log_flush(common_log_main());
@@ -548,8 +553,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4) {
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+        if (arch == LLM_ARCH_EAGLE3) {
+            continue;
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
@@ -565,6 +573,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
+                // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
+                printf(template_row_cfg.c_str(),
+                    llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
+                fflush(stdout);
+
                 std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_dev;
                 std::vector<float> logits_dev;
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
@@ -617,8 +630,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     }
                 }
 
-                printf(template_row.c_str(), llm_arch_name(arch), dc.label.c_str(),
-                    config_name.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+                // log the results for this test case
+                printf(template_row_res.c_str(),
+                    status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
             }
         }
     }
